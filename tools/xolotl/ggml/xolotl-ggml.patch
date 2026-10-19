@@ -284,7 +284,7 @@ index 24115da09..3f7bf1fbd 100644
 +        unsigned long long m = best;
 +#pragma unroll
 +        for (int off = 16; off > 0; off >>= 1) {
-+            const unsigned long long o = __shfl_xor_sync(0xFFFFFFFFu, m, off);
++            const unsigned long long o = __shfl_xor_sync(0xFFFFFFFFu, m, off, 32);
 +            m = o < m ? o : m;
 +        }
 +        const int col = (int) (m & 0xFFFFFFFFull);

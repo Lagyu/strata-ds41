@@ -1553,7 +1553,13 @@ if(STRATA_NATIVE_EXPERTS)
   # the bit-exact fp4 KV packers, deterministic MMQ, the two upstream CUDA fixes, GLM's no-graph batches: 19 files).
   # Pinned commit + the patch == the tree every published number was measured on (checked with diff -r).
   set(_xolotl_ggml_patch ${CMAKE_CURRENT_SOURCE_DIR}/tools/xolotl/ggml/xolotl-ggml.patch)
-  if(STRATA_GGML_DIR)
+  # STRATA_GGML_PREBUILT: link the ggml that STRATA_GGML_DIR has ALREADY built (tools/v41/cmake/ggml_prebuilt.cmake;
+  # tools/v41/build-ggml-hip.sh makes one).  On HIP the backend's flash-attention instances take most of an hour per
+  # architecture, and the engine's own sources minutes: the ggml build is kept out of this configure.
+  set(STRATA_GGML_PREBUILT "" CACHE PATH "an existing ggml build directory of STRATA_GGML_DIR: link its ggml")
+  if(STRATA_GGML_PREBUILT)
+    include(${CMAKE_CURRENT_SOURCE_DIR}/tools/v41/cmake/ggml_prebuilt.cmake)
+  elseif(STRATA_GGML_DIR)
     # GIT_CEILING_DIRECTORIES: a STRATA_GGML_DIR without its own .git (a copied tree under this repo) must not be
     # resolved against the enclosing repository - git apply then works as a plain patch tool there
     get_filename_component(_xolotl_ggml_parent ${STRATA_GGML_DIR} DIRECTORY)
@@ -1980,7 +1986,14 @@ if(STRATA_NATIVE_EXPERTS)
       # the same K-quant instances as the CUDA branch: on HIP they serve the dense GGUF projections
       # of Gemm::native (STRATA_DENSE_MMQ=1), the mixed-quant packs' attention/PLE tensors
       list(APPEND _strata_mmq_types q4_k q5_k q5_1 q6_k)
+      # the DeepSeek-V4.1 expert formats (Q2_K / Q3_K: the GSQ and 2-bit files, MXFP4: the lossless Q4-class
+      # file), as the CUDA branch has them
+      list(APPEND _strata_mmq_types q2_k q3_k mxfp4)
     endif()
+    # the same generated type list as the CUDA branch: moe_mmq.cu's supported() / dispatch and the compiled
+    # instances come from one list (cmake/mmq_types.cmake)
+    include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/mmq_types.cmake)
+    strata_gen_mmq_types(${CMAKE_CURRENT_BINARY_DIR}/generated/strata/prefill/mmq_types.inc "${_strata_mmq_types}")
     foreach(_t IN LISTS _strata_mmq_types)
       list(APPEND _strata_mmq_sources "${_strata_mmq}/template-instances/mmq-instance-${_t}.cu")
     endforeach()
@@ -1995,7 +2008,7 @@ if(STRATA_NATIVE_EXPERTS)
                                 PROPERTIES INCLUDE_DIRECTORIES "${STRATA_HIP_COMPAT_INCLUDE_DIR}")
     add_library(strata_mmq STATIC ${_strata_mmq_sources})
     target_include_directories(strata_mmq
-      PRIVATE "${_strata_gg}/include" "${_strata_gg}/src" "${_strata_mmq}"
+      PRIVATE "${_strata_gg}/include" "${_strata_gg}/src" "${_strata_mmq}" ${CMAKE_CURRENT_BINARY_DIR}/generated
       PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
     if(_strata_mmq_tq_overlay)
       target_include_directories(strata_mmq BEFORE PRIVATE ${_strata_tq_overlay_dir} ${_strata_tq_overlay_dir}/include)

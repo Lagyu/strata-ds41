@@ -399,6 +399,8 @@ Ds41DSpark::Impl::G & Ds41DSpark::Impl::graph(int k, bool draft) {
         tok = ggml_argmax(c, li);                                                                 // I32 [1]
         ggml_tensor * hc = ggml_concat(c, ggml_view_2d(c, hn, D, 1, hn->nb[1], (size_t) i * hn->nb[1]), e, 0);
         ggml_tensor * cf = ggml_mul_mat(c, W("mtp.2.confidence_head.proj.weight"), hc);           // [1, 1]
+        if (auto cb = w.find("mtp.2.confidence_head.proj.bias"); cb != w.end())                    // the head's bias, when the
+            cf = ggml_add(c, cf, cb->second);                                                    // sidecar carries one
         ggml_set_output(tok);
         ggml_set_output(cf);
         gr.ids.push_back(tok);
