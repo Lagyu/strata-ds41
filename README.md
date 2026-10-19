@@ -17,9 +17,13 @@
   <a href="https://github.com/Niko1221/Strata/stargazers"><img src="https://img.shields.io/github/stars/Niko1221/Strata?style=flat" alt="GitHub stars"></a>
 </p>
 
-<p align="center"><a href="https://github.com/Niko1221/Strata/releases/download/v0.1.10/Pagoda.mp4"><img src="docs/media/pagoda-preview.webp" width="720" alt="A voxel pagoda garden that Strata's model wrote, running in the browser"></a><br>
-<sub>A voxel pagoda garden, 1 shot prompt running on an RTX 5070 with Strata (IQ3_S, 128K context) ·
-<a href="https://github.com/Niko1221/Strata/releases/download/v0.1.10/Pagoda.mp4">full video (49 s)</a></sub></p>
+> **A Strata fork.** Xolotl keeps [Strata](https://github.com/Niko1221/Strata)'s engine, server and kernels at its
+> core (merged at 0.1.44.1) and adds ~71,000 lines on top: the DeepSeek-V4.1 and V4-Flash engines, the GLM-5.3-Flash
+> engine and the Qwen3.8-27B dense port, each with its own quantisation and expert-tiering work.
+>
+> **Starred this as Strata-DSV4.1?** You are in the right place. Strata-DSV4.1 grew into **Xolotl**: the same
+> DeepSeek-V4.1 engine (faster now), plus GLM-5.3-Flash and the Qwen3.8 models, in one tree. Old links and clones
+> redirect here; nothing DeepSeek-V4.1 was removed.
 
 Strata runs **[Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next)**, a 125-billion-parameter model that
 normally needs a server, on a normal PC. It chats, writes code, reads pictures and works with your apps and coding
@@ -35,7 +39,36 @@ agents. Your chats and files stay on your PC.
 
 Version 0.2.0-beta · engine 0.1.45.3
 
-## What you need
+Then point any OpenAI- or Anthropic-compatible client at `http://127.0.0.1:<port>/v1`.
+
+### Will it run on my machine? (DeepSeek-V4.1)
+
+What I've measured is one setup: **RTX 4090 (24 GB), 90 GB DDR4, Linux, NVMe**. Beyond that:
+
+- **OS:** Linux only for the DeepSeek engine for now (the launcher and the expert/Engram disk reads are Linux-specific).
+  The Strata core runs on Windows, but the DeepSeek side doesn't yet. WSL2 might work but is untested; keep the model
+  files inside WSL's own filesystem, not on a Windows drive.
+- **GPU:** NVIDIA, compute capability 7.5 or newer (RTX 20/30/40/50). Build with your card's architecture:
+  `-DCMAKE_CUDA_ARCHITECTURES=86` for RTX 30, `89` for RTX 40, `120` for RTX 50 (use CUDA 13.x for RTX 50; 12.8 builds
+  had prompt-path crashes).
+- **VRAM:** 24 GB is what I run. 16 GB should load but is untested, and prompts get processed in smaller batches, so
+  prefill will be slower. Below 16 GB won't work.
+- **RAM:** 90 GB here, with a 64 GB expert cache in RAM. Less RAM means a smaller cache, so more experts come off the
+  NVMe each token and decode is slower. More RAM helps: around 256 GB holds every expert.
+- **Disks:** about 152 GiB for the quant plus ~200 GB for the Engram tables. Both want a fast NVMe on ext4 or NTFS.
+  **Not exFAT** (Linux's exFAT driver serialises parallel reads; expert reads were 5x slower here) and not a hard
+  drive (the Engram lookups are ~48 small random reads per token).
+
+## How it works, in one paragraph
+
+A mixture-of-experts model only uses a few experts per token. Xolotl keeps every expert somewhere - the hottest in
+VRAM, tens of GiB in a pinned RAM arena the GPU reads by DMA, the rest on NVMe read at the drive's ceiling - and
+moves the ones each token's router asks for, a layer ahead. Each model adds its own tricks: DeepSeek-V4.1 gets a
+calibrated mixed-precision quantisation, speculative decoding with exact sampling, a bit-exact 4-bit KV cache for 512K
+context and an arena that adapts to the conversation; GLM-5.3-Flash gets its abliteration LoRA on every path and soft
+pruning; the Qwen models get MTP speculative decoding. **[Read the full write-up](docs/xolotl/HOW_IT_WORKS.md).**
+
+## Read more
 
 **You need at least 32 GB of RAM and graphics memory (VRAM) together.** On a Mac or a Ryzen AI Max, that is the unified
 memory. More memory gives a bigger model or a faster one.
@@ -61,7 +94,7 @@ Also needed:
 Two or three cards of the same make can share a model ([multi-GPU](docs/MULTI_GPU.md)). Strata never splits a model across
 NVIDIA and AMD cards. Full list: [docs/INSTALL.md](docs/INSTALL.md#what-you-need).
 
-## Install
+## Support
 
 Pick one option. They all start the same engine and use the same models.
 
