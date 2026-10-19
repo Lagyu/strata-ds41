@@ -5,9 +5,9 @@
 //
 //   ds41_generate -m V41-GSQ.gguf (--ids 1,2,3 | --ids-file f.i32) [-n 64] [--backend cuda|cpu] [--experts gpu|cpu]
 //                 [--engram DIR:DIR:DIR] [--slots auto|N] [--vram-margin GiB] [--arena-gib 60] [--rank r.bin]
-//                 [--vram-lru] [--arena-adapt] [--pcie 0.25] [--tier-batch-pcie 1.0] [--prefill-chunk N] [--prompt-batch B] [--chunk-mmq] [--ctx N]
+//                 [--vram-lru] [--arena-adapt] [--arena-skip-vram] [--pcie 0.25] [--tier-batch-pcie 1.0] [--prefill-chunk N] [--prompt-batch B] [--chunk-mmq] [--ctx N]
 //                 [--temp 0] [--seed 1] [--stop id,id] [--ppl] [--no-actquant] [--kv-fp4] [--serve] [--quiet]
-//                 [--enc-skip|--no-enc-skip] [--enc-replay N] [--dump-last F]
+//                 [--enc-skip|--no-enc-skip] [--enc-replay N] [--dump-last F] [--dump-routes DIR]
 // --enc-skip (layer-major batches only; DEFAULT for one-shot runs, --no-enc-skip = full path): prompt tokens before the last --enc-replay (default 2560 = 128 * 20) stop
 // after layer 20's persistent-KV writes; only the last 2560 tokens run layers 21-39.  Same last-token logits / decode.
 //
@@ -41,7 +41,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <functional>
 #include <memory>
 #include <iostream>
@@ -52,13 +54,101 @@
 #include <thread>
 #include <vector>
 
+// ---- repetition penalties: the state has to be declared before the argument parsing that sets it ----------
+struct PenaltyState {
+    float repeat  = 1.0f;   // penalty_repeat: positive logits divided, negative multiplied (llama.cpp rule)
+    float freq    = 0.0f;   // penalty_freq: subtract freq * occurrences
+    float present = 0.0f;   // penalty_present: subtract once if the token is in the window
+    int   last_n  = 0;      // penalty_last_n: window over the last N emitted tokens (0 = off)
+    int   cap     = 4096;   // like the platform's kPenaltyWindowCap
+    std::vector<int> hist;  // emitted tokens, oldest first
+};
+static PenaltyState g_pen;
+
+// ---- routing counts (--dump-routes DIR): how many tokens selected each (layer, expert), in the format
+// tools/v41/engine/v41_rank.py reads (DIR/LNN.json, experts[e].n = tokens routed to e).  The router's `ids` are
+// already a graph output (Ds41Dense::Impl::o_ids) and already copied host-ward per layer for the expert tier
+// (attn_router's readback, batch_ids() after attn_router_span), so counting here changes no arithmetic.
+struct RouteCounts {
+    std::string dir;
+    int n_layer = 0, n_experts = 0, top_k = 0;
+    std::vector<uint64_t> cnt;   // [n_layer][n_experts]
+    bool on() const { return !dir.empty(); }
+    void init(const std::string & d, int nl, int ne, int tk) {
+        dir = d; n_layer = nl; n_experts = ne; top_k = tk;
+        if (on()) cnt.assign((size_t) nl * (size_t) ne, 0);
+    }
+    /// --serve: start from the counts already in `dir` (a previous server's), so the counts add up across restarts.
+    /// Reads the format write() produces ("\"e\": {\"n\": N}"); a missing or unreadable file is just zeros.
+    uint64_t load() {
+        if (!on()) return 0;
+        uint64_t total = 0;
+        for (int l = 0; l < n_layer; ++l) {
+            char name[64];
+            std::snprintf(name, sizeof(name), "L%02d.json", l);
+            std::ifstream f(dir + "/" + name);
+            if (!f) continue;
+            const std::string txt((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+            const size_t ex = txt.find("\"experts\"");
+            if (ex == std::string::npos) continue;
+            for (size_t at = ex; (at = txt.find("{\"n\": ", at)) != std::string::npos;) {
+                size_t q1 = txt.rfind('"', at);          // the closing quote of the expert's key
+                size_t q0 = q1 == std::string::npos ? q1 : txt.rfind('"', q1 - 1);
+                at += 7;
+                if (q0 == std::string::npos) continue;
+                const int e = std::atoi(txt.c_str() + q0 + 1);
+                const uint64_t n = std::strtoull(txt.c_str() + at, nullptr, 10);
+                if (e >= 0 && e < n_experts) { cnt[(size_t) l * (size_t) n_experts + (size_t) e] += n; total += n; }
+            }
+        }
+        return total;
+    }
+    /// Count n tokens' routing for layer l (ids: n * top_k ints, token-major).
+    void add(int l, const int * ids, int n) {
+        if (!on() || !ids || l < 0 || l >= n_layer || n <= 0) return;
+        uint64_t * row = cnt.data() + (size_t) l * (size_t) n_experts;
+        for (int t = 0; t < n; ++t)
+            for (int j = 0; j < top_k; ++j) {
+                const int e = ids[(size_t) t * top_k + j];
+                if (e >= 0 && e < n_experts) ++row[e];
+            }
+    }
+    bool write(std::string & err) const;
+};
+static RouteCounts g_routes;
+
+bool RouteCounts::write(std::string & err) const {
+    if (!on()) return true;
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    if (ec) { err = "cannot create " + dir + ": " + ec.message(); return false; }
+    uint64_t total = 0;
+    for (int l = 0; l < n_layer; ++l) {
+        char name[64];
+        std::snprintf(name, sizeof(name), "L%02d.json", l);
+        std::ofstream f(dir + "/" + name);
+        if (!f) { err = "cannot write " + dir + "/" + name; return false; }
+        const uint64_t * row = cnt.data() + (size_t) l * (size_t) n_experts;
+        f << "{\"layer\": " << l << ", \"top_k\": " << top_k << ", \"experts\": {";
+        for (int e = 0; e < n_experts; ++e) {
+            f << (e ? ", " : "") << "\"" << e << "\": {\"n\": " << row[e] << "}";
+            total += row[e];
+        }
+        f << "}}\n";
+    }
+    const double tokens = (double) total / std::max(1, n_layer * top_k);
+    std::fprintf(stderr, "routes: %d layers x %d experts, %.0f tokens routed (%.1f selections/expert) -> %s\n",
+                 n_layer, n_experts, tokens, (double) total / (double) std::max<size_t>(1, (size_t) n_layer * n_experts), dir.c_str());
+    return true;
+}
+
 using namespace strata;
 using namespace strata::v41;
 
 namespace {
 
 struct Args {
-    std::string model, ids_csv, ids_file, rank, dump_logits, dump_last;
+    std::string model, ids_csv, ids_file, rank, dump_logits, dump_last, dump_routes;
     std::string build_mirror;      // --build-mirror F [--mirror-gib N]: write the blob mirror (coldest experts by --rank) and exit
     double mirror_gib = 85.0;
     std::string prune;            // --prune F: "layer expert" lines (coldest first - v41_prune_list.py), soft or hard pruned
@@ -82,7 +172,13 @@ struct Args {
     uint64_t seed = 1;
     std::vector<int> stop;
     bool ppl = false, serve = false, quiet = false, vram_lru = true, arena_adapt = false, chunk_mmq = true;
-    bool act_quant = true, chunk_prefetch = true, kv_fp4 = false;
+    bool act_quant = true, chunk_prefetch = true, kv_fp4 = false, arena_skip_vram = false;
+    /// --peer-device N / STRATA_PEER_DEVICE=N: the SECOND GPU's expert tier (docs/ds4/V41_AMD_PEER_TIER.md); -1 =
+    /// off, in which case nothing about the tier changes.  N >= 0 must be a CUDA/HIP device index that is not the
+    /// dense half's (0 on this box): its memory holds the ranked experts after card 0's VRAM head, and a decode
+    /// token's misses that it holds are computed there (no blob moves), in parallel with the primary's kernels.
+    int peer_device = std::getenv("STRATA_PEER_DEVICE") ? std::atoi(std::getenv("STRATA_PEER_DEVICE")) : -1;
+    int  kv_type = -1;            // --kv-q8 / --kv-type N: the compressed KV + indexer keys' ggml type (-1 = BF16 with act_quant, else F32)
     int  enc_skip = -1;           // -1 = default (on for one-shot layer-major runs), 1 = --enc-skip, 0 = --no-enc-skip; only run the tokens before the replay window through layers 21-39
     int  enc_replay = 2560;       // --enc-replay N: the replay window (window_size * (n_layer - cand_layer) = 128*20)
     float skip_miss = 0.0f, skip_file = 0.0f;
@@ -164,6 +260,7 @@ bool parse(int argc, char ** argv, Args & a) {
         else if (k == "-n" || k == "--n-predict") a.n_predict = std::atoi(next().c_str());
         else if (k == "--backend") a.backend = next();
         else if (k == "--experts") a.experts = next();
+        else if (k == "--peer-device") a.peer_device = std::atoi(next().c_str());
 #ifdef _WIN32
         // the Windows path-list separator: a drive letter's ':' must not split "D:\a;E:\b"
         else if (k == "--engram") { std::stringstream ss(next()); std::string d; while (std::getline(ss, d, ';')) a.engram.push_back(d); }
@@ -174,12 +271,16 @@ bool parse(int argc, char ** argv, Args & a) {
         else if (k == "--vram-margin") a.vram_margin_gib = std::atof(next().c_str());
         else if (k == "--arena-gib") a.arena_gib = std::atof(next().c_str());
         else if (k == "--rank") a.rank = next();
+        else if (k == "--dump-routes") a.dump_routes = next();   // calibration: per (layer, expert) routing counts
         else if (k == "--build-mirror") a.build_mirror = next();
         else if (k == "--check-mirror") { a.build_mirror = next(); a.mirror_gib = -1; }
         else if (k == "--mirror-gib") a.mirror_gib = std::atof(next().c_str());
         else if (k == "--vram-lru") a.vram_lru = true;
         else if (k == "--no-vram-lru") a.vram_lru = false;
         else if (k == "--arena-adapt") a.arena_adapt = true;
+        // --arena-skip-vram: the arena holds the ranking PAST the VRAM cache's head instead of duplicating it (see
+        // Ds41MoeConfig::arena_skip_resident): with a rank this buys ~1.9 GiB of distinct experts per 1.5 GiB of slots
+        else if (k == "--arena-skip-vram") a.arena_skip_vram = true;
         else if (k == "--pcie") a.pcie = std::atof(next().c_str());
         else if (k == "--tier-batch-pcie") a.tier_batch_pcie = std::atof(next().c_str());
         else if (k == "--pf-b") a.pf_b = std::atof(next().c_str());
@@ -197,11 +298,21 @@ bool parse(int argc, char ** argv, Args & a) {
         else if (k == "--threads") a.threads = std::atoi(next().c_str());
         else if (k == "--ctx") a.ctx = std::atoll(next().c_str());
         else if (k == "--temp") a.temp = (float) std::atof(next().c_str());
+        else if (k == "--penalty-repeat") g_pen.repeat = (float) std::atof(next().c_str());
+        else if (k == "--penalty-freq") g_pen.freq = (float) std::atof(next().c_str());
+        else if (k == "--penalty-present") g_pen.present = (float) std::atof(next().c_str());
+        else if (k == "--penalty-last-n") g_pen.last_n = std::max(0, std::atoi(next().c_str()));
         else if (k == "--seed") a.seed = (uint64_t) std::atoll(next().c_str());
         else if (k == "--stop") a.stop = parse_csv(next());
         else if (k == "--ppl") a.ppl = true;
         else if (k == "--no-actquant") a.act_quant = false;
         else if (k == "--kv-fp4") a.kv_fp4 = true;
+        // 8-bit cache: the same compressed-KV / indexer-key tensors as Q8_0 instead of the default BF16 (act_quant).
+        // ggml's flash-attn takes Q8_0 K/V (its kv-type list), set_rows quantizes on the way in and the ring's
+        // ggml_cast dequantizes on the way out, so this halves the state's bytes at 8 bits a weight - the 4-bit
+        // grids (--kv-fp4) are the aggressive ones and need the packers of tools/v41/ggml/kv-fp4.patch.
+        else if (k == "--kv-q8") a.kv_type = (int) GGML_TYPE_Q8_0;
+        else if (k == "--kv-type") a.kv_type = std::atoi(next().c_str());
         else if (k == "--serve") a.serve = true;
         else if (k == "--prune") a.prune = next();
         else if (k == "--prune-penalty") a.prune_penalty = (float) std::atof(next().c_str());
@@ -225,8 +336,45 @@ double now_ms() {
     return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 
+// ---- repetition penalties (design: docs/ds4/V41_SAMPLER_PENALTIES.md) -----------------------------------------
+// This engine had no penalty stage; every other stack has one (the platform this fork comes from:
+// penalty_repeat/freq/present/last_n, generate.cpp:10648; llama.cpp: --repeat-penalty/--frequency-penalty/
+// --presence-penalty).  The defaults below are the platform's and make this a no-op: the logits are then untouched
+// and the generated tokens are bit-identical to before.  Applied inside both samplers, so the speculative path's
+// draft (sample_dist) and verify (sample_p) sample the same penalised row.
+
+static void pen_record(int tok) {
+    if (g_pen.last_n <= 0) return;
+    g_pen.hist.push_back(tok);
+    if ((int) g_pen.hist.size() > g_pen.cap) g_pen.hist.erase(g_pen.hist.begin());
+}
+
+// The buffer to sample from: the input itself when there is nothing to do, else a penalised copy in scratch.
+static const float * pen_apply(const float * logits, int n_vocab, std::vector<float> & scratch) {
+    if (g_pen.last_n <= 0) return logits;
+    if (g_pen.repeat == 1.0f && g_pen.freq == 0.0f && g_pen.present == 0.0f) return logits;
+    const int n = (int) g_pen.hist.size();
+    const int from = n > g_pen.last_n ? n - g_pen.last_n : 0;
+    if (from >= n) return logits;
+    scratch.assign(logits, logits + n_vocab);
+    std::vector<int> count((size_t) n_vocab, 0);
+    for (int i = from; i < n; ++i) {
+        const int t = g_pen.hist[(size_t) i];
+        if (t >= 0 && t < n_vocab) count[(size_t) t]++;
+    }
+    for (int t = 0; t < n_vocab; ++t) {
+        const int c = count[(size_t) t];
+        if (c == 0) continue;
+        float & l = scratch[(size_t) t];
+        if (g_pen.repeat != 1.0f) l = l > 0.0f ? l / g_pen.repeat : l * g_pen.repeat;
+        if (g_pen.freq != 0.0f) l -= g_pen.freq * (float) c;
+        if (g_pen.present != 0.0f) l -= g_pen.present;
+    }
+    return scratch.data();
+}
+
 // temperature + top-k / min-p / top-p over the top candidates (top_k 0 = the 256 best); temp 0 = argmax
-int sample_p(const float * logits, int n_vocab, float temp, int top_k, float top_p, float min_p, std::mt19937_64 & rng) {
+static int sample_p_raw(const float * logits, int n_vocab, float temp, int top_k, float top_p, float min_p, std::mt19937_64 & rng) {
     if (temp <= 0.0f) return (int) (std::max_element(logits, logits + n_vocab) - logits);
     const int K = std::min(n_vocab, top_k > 0 ? top_k : 256);
     std::vector<int> idx((size_t) n_vocab);
@@ -250,10 +398,21 @@ int sample_p(const float * logits, int n_vocab, float temp, int top_k, float top
     return idx[(size_t) n - 1];
 }
 
+// records the emitted token, so the window is the sequence actually produced
+static int sample_p(const float * logits, int n_vocab, float temp, int top_k, float top_p, float min_p, std::mt19937_64 & rng) {
+    std::vector<float> scratch;
+    // pen_record belongs where the sequence grows, not here: a draft the verify accepts never passes through
+    // sample_p, and recording here would count every other token twice.
+    return sample_p_raw(pen_apply(logits, n_vocab, scratch), n_vocab, temp, top_k, top_p, min_p, rng);
+}
+
 // the distribution sample_p draws from, as (token, probability) pairs summing to 1 (temp 0: the argmax alone) - the
-// trunk's p for --serve's speculative sampling (same candidates, same weights as sample_p)
-void sample_dist(const float * logits, int n_vocab, float temp, int top_k, float top_p, float min_p,
+// trunk's p for --serve's speculative sampling (same candidates, same weights as sample_p, and the same penalised
+// row: a draft is not an emitted token, so nothing is recorded here)
+void sample_dist(const float * logits_in, int n_vocab, float temp, int top_k, float top_p, float min_p,
                  std::vector<std::pair<int, double>> & out) {
+    std::vector<float> scratch;
+    const float * logits = pen_apply(logits_in, n_vocab, scratch);   // shadows the parameter: the body is unchanged
     out.clear();
     if (temp <= 0.0f) { out.push_back({ (int) (std::max_element(logits, logits + n_vocab) - logits), 1.0 }); return; }
     const int K = std::min(n_vocab, top_k > 0 ? top_k : 256);
@@ -387,6 +546,9 @@ int main(int argc, char ** argv) {
     // --kv-fp4 / STRATA_KV_FP4=1: the compressed KV + indexer keys packed to their exact FP4 grids (Ds41DenseConfig::kv_fp4)
     dc.kv_fp4 = a.kv_fp4 || (std::getenv("STRATA_KV_FP4") && std::getenv("STRATA_KV_FP4")[0] == '1');
     if (dc.kv_fp4) std::fprintf(stderr, "kv: compressed KV NVFP4 + indexer keys MXFP4 (--kv-fp4, exact)\n");
+    dc.kv_type = a.kv_type;
+    if (a.kv_type >= 0) std::fprintf(stderr, "kv: compressed KV + indexer keys as %s (--kv-q8/--kv-type)\n",
+                                     ggml_type_name((ggml_type) a.kv_type));
     Ds41Dense dense;
     std::string err;
     const double t_load = now_ms();
@@ -412,6 +574,12 @@ int main(int argc, char ** argv) {
     Ds41FileBlobs src(a.model);
     if (!src.open(err)) { std::fprintf(stderr, "ds41_generate: experts: %s\n", err.c_str()); return 1; }
     const Ds41MoeGeom & TG = src.geom();
+    g_routes.init(a.dump_routes, (int) TG.n_layers, (int) TG.n_experts, (int) TG.top_k);
+    if (g_routes.on()) std::fprintf(stderr, "routes: counting every (layer, expert) selection -> %s\n", a.dump_routes.c_str());
+    if (g_routes.on() && a.serve) {   // the server's counts accumulate across restarts, and are written after each request
+        const uint64_t prev = g_routes.load();
+        std::fprintf(stderr, "routes: %llu earlier selections loaded from %s\n", (unsigned long long) prev, a.dump_routes.c_str());
+    }
     double slot_gib = 0;
     if (a.experts != "cpu" && !ggml_backend_is_cpu(be)) {
         size_t fr = 0, tot = 0;
@@ -423,6 +591,16 @@ int main(int argc, char ** argv) {
     Ds41MoeTier tier;
     Ds41MoeConfig mc;
     mc.cpu_only = a.experts == "cpu" || ggml_backend_is_cpu(be);
+    mc.peer_device = a.peer_device;   // the second card's expert tier: -1 = off, the default path is untouched
+    // defer the VRAM cache: the prompt's chunk + graph buffers (~4 GiB) use that VRAM first, then the cache opens into
+    // it (measured) - the old fixed --vram-margin had to cover prefill and starved decode of slots.  --serve does this
+    // per request: a multi-token prompt closes the cache (release_cache), the decode after it re-seeds (~0.6 s).
+    // This is the ds4 engine's `defer_seed`, and for a UNIFORM geometry (DS4/DS4.1: every expert one format, one blob
+    // size) it is what makes the reopen happen at all: opened at init the cache holds ~14 GiB, the serve path then
+    // measures 0.87 GiB free, releases it - and a uniform geometry has no other seed that opens it again, so the
+    // decode ran with no VRAM slots (measured on the Q2 model, 2026-10-17: 6.2 tok/s instead of ~7.9).
+    const bool defer_vram = !mc.cpu_only && (a.prefill_chunk > 1 || a.prompt_batch > 1);
+    mc.defer_cache = defer_vram;
     mc.slots = a.slots > 0 ? a.slots : TG.n_layers * TG.n_experts;
     mc.slot_gib = a.slots > 0 ? 0.0 : slot_gib;
     mc.pcie_frac = a.pcie;
@@ -433,6 +611,7 @@ int main(int argc, char ** argv) {
     mc.max_arena_gib = a.arena_gib;
     mc.vram_lru = a.vram_lru;
     mc.arena_adapt = a.arena_adapt;
+    mc.arena_skip_resident = a.arena_skip_vram;   // --arena-skip-vram: no duplicate head in the arena
     mc.chunk_mmq = a.chunk_mmq;
     mc.chunk_prefetch = a.chunk_prefetch;
     mc.chunk_prefetch_gib = a.chunk_prefetch_gib;
@@ -460,10 +639,6 @@ int main(int argc, char ** argv) {
     }
     if (!tier.init(TG, &src, mc, err)) { std::fprintf(stderr, "ds41_generate: tier init: %s\n", err.c_str()); return 1; }
     dense.set_oom_hook([&]() { return tier.release_prestage(); });   // a prompt pass that does not fit: prestage gives way
-    // defer the VRAM cache: the prompt's chunk + graph buffers (~4 GiB) use that VRAM first, then the cache opens into
-    // it (measured) - the old fixed --vram-margin had to cover prefill and starved decode of slots.  --serve does this
-    // per request: a multi-token prompt closes the cache (release_cache), the decode after it re-seeds (~0.6 s)
-    const bool defer_vram = !mc.cpu_only && (a.prefill_chunk > 1 || a.prompt_batch > 1);
     std::vector<std::pair<int32_t, int32_t>> ranked;
     if (!mc.cpu_only) {
         if (!a.rank.empty()) {
@@ -603,6 +778,7 @@ int main(int argc, char ** argv) {
             if (dprof) { const double t = now_ms(); dp[1] += t - ta; ta = t; }
             const float * fn = nullptr;
             if (!dense.attn_router(l, ids1.data(), w1.data(), &fn)) { ferr = dense.last_error(); return false; }
+            g_routes.add(l, ids1.data(), 1);
             if (dprof) { const double t = now_ms(); dp[2] += t - ta; ta = t; }
             if (file_pred) {
                 for (int j = 0; j < top_k; ++j) {
@@ -671,6 +847,23 @@ int main(int argc, char ** argv) {
         for (int l = 0; l < n_layer; ++l) {
             const float * fn = nullptr;
             if (!dense.attn_router(l, mids.data(), mw.data(), &fn)) { ferr = dense.last_error(); return false; }
+            g_routes.add(l, mids.data(), m);
+            // STRATA_SERVE_PASS_BATCH=1 (opt-in): the pass's tokens go to the tier as the verify pass's do - one
+            // run_multi_to_dev per kMaxMulti tokens, the union of their experts served once (a miss is read / DMA'd /
+            // computed once for every token routing it) - instead of one run_to_dev per token
+            static const bool pass_batch = std::getenv("STRATA_SERVE_PASS_BATCH") && std::getenv("STRATA_SERVE_PASS_BATCH")[0] == '1';
+            if (pass_batch && rdev1) {
+                constexpr int kMM = Ds41MoeTier::kMaxMulti;
+                for (int off = 0; off < m; off += kMM) {
+                    const int nn = std::min(kMM, m - off);
+                    if (!tier.run_multi_to_dev(l, nn, mids.data() + (size_t) off * top_k, mw.data() + (size_t) off * top_k,
+                                               fn + (size_t) off * n_embd, rdev1 + (size_t) off * n_embd)) {
+                        ferr = "tier.run_multi_to_dev failed"; return false;
+                    }
+                }
+                if (!dense.finish(l, nullptr)) { ferr = dense.last_error(); return false; }
+                continue;
+            }
             for (int t = 0; t < m; ++t) {
                 const bool ok = rdev1 ? tier.run_to_dev(l, mids.data() + (size_t) t * top_k, mw.data() + (size_t) t * top_k,
                                                         fn + (size_t) t * n_embd, rdev1 + (size_t) t * n_embd)
@@ -757,6 +950,7 @@ int main(int argc, char ** argv) {
             }
             const float * fn = nullptr;
             if (!dense.attn_router(l, mids.data(), mw.data(), &fn)) { ferr = dense.last_error(); return false; }
+            g_routes.add(l, mids.data(), m);
             lap(0);
             if (rdev1 && !no_tier_batch) {
                 // D3: ONE batched per-class tier call for the pass's m tokens (the union of their experts is served
@@ -832,6 +1026,13 @@ int main(int argc, char ** argv) {
 #if defined(DS41_HAVE_DSPARK)
     std::unique_ptr<Ds41DSpark> dsp;
 #endif
+    // --serve: the VRAM expert cache's size for the server's Monitor tab ("Experts in VRAM"), each time it opens or
+    // shuts (the deferred seed opens it only after the first prompt; a layer-major batch shuts it for the prompt)
+    auto info_vram = [&]() {
+        std::printf("INFO expert_slots=%lld expert_cache_mib=%lld\n", (long long) tier.vram_experts(),
+                    (long long) (tier.vram_bytes() >> 20));
+        std::fflush(stdout);
+    };
     auto open_cache = [&]() -> bool {
         dense.release_pass();
 #if defined(DS41_HAVE_DSPARK)
@@ -879,6 +1080,7 @@ int main(int argc, char ** argv) {
         proxy_res.clear();   // the real VRAM set from here on
         bias_now = true;     // decode: route bias + file penalty on
         apply_bias();
+        if (a.serve) info_vram();
         return true;
     };
     double fd_dense = 0, fd_tier = 0, fd_logits = 0;   // prompt wall split (printed with the prompt line)
@@ -978,6 +1180,7 @@ int main(int argc, char ** argv) {
                         const int sn = std::min(SB, B - s);
                         if (!dense.attn_router_span(l, s, sn)) { ferr = dense.last_error(); return false; }
                     }
+                    if (B > d0) g_routes.add(l, dense.batch_ids() + (size_t) d0 * top_k, B - d0);
                     const double t1 = now_ms();
                     fd_dense += t1 - t0;
                     // GPU: the tier writes the routed sums straight into the dense half's routed tensor (no 2 x n*D*4
@@ -1044,6 +1247,7 @@ int main(int argc, char ** argv) {
                 for (int l = 0; l < n_layer; ++l) {
                     const float * fn = nullptr;
                     if (!dense.attn_router(l, cids.data(), cw.data(), &fn)) { ferr = dense.last_error(); return false; }
+                    g_routes.add(l, cids.data(), m);
                     if (dump_dir) {
                         char nb[64];
                         std::snprintf(nb, sizeof(nb), "L%02d_fn.f32", l);
@@ -1209,6 +1413,10 @@ int main(int argc, char ** argv) {
                 else if (k == "top_p") top_p = (float) std::atof(v.c_str());
                 else if (k == "top_k") tk = std::atoi(v.c_str());
                 else if (k == "min_p") min_p = (float) std::atof(v.c_str());
+                else if (k == "penalty_repeat") g_pen.repeat = (float) std::atof(v.c_str());
+                else if (k == "penalty_freq") g_pen.freq = (float) std::atof(v.c_str());
+                else if (k == "penalty_present") g_pen.present = (float) std::atof(v.c_str());
+                else if (k == "penalty_last_n") g_pen.last_n = std::max(0, std::atoi(v.c_str()));
                 else if (k == "seed") rng.seed((uint64_t) std::atoll(v.c_str()));
                 else if (k == "route_bias") req_rb = std::max(0.0f, (float) std::atof(v.c_str()));
                 else if (k == "route_bias_file") req_rbf = std::max(0.0f, (float) std::atof(v.c_str()));
@@ -1412,6 +1620,7 @@ int main(int argc, char ** argv) {
                 if (!kept) {
                     tier.release_cache();
                     cache_open = false;
+                    info_vram();
 #if defined(DS41_HAVE_DSPARK)
                     // STRATA_SERVE_DSPARK_EVICT=N (s6, opt-in until measured; 0 = off): a batch of >= N new tokens also
                     // frees DSpark's ~2.9 GB of weights for its duration - the prompt batch is sized from free VRAM
@@ -1477,7 +1686,10 @@ int main(int argc, char ** argv) {
                 // a column" is a mis-derivation (1424/8192) and the decomposition is really ~5.7 GiB fixed + 0.78 a
                 // column.  Same line, same fit - but it matters: a wide batch's per-column STATE is what starves the
                 // fixed graph buffer (16384 = 5.14 GiB of state, 1.03 GiB short), not the graph itself.
-                const double room = (double) frb - a.vram_margin_gib * 1073741824.0 - 4.3 * 1073741824.0;
+                // the fit above was calibrated with the default 1 GiB margin: a smaller --vram-margin (more decode
+                // slots) must not widen the batch past it (a 22K prompt at --vram-margin 0.5 took B=11914 and its
+                // 2.28 GiB graph buffer did not fit, 2026-10-18)
+                const double room = (double) frb - std::max(1.0, a.vram_margin_gib) * 1073741824.0 - 4.3 * 1073741824.0;
                 const int fit = (int) std::max<int64_t>(2, (int64_t) (room / (0.95 * 1048576.0)));
                 pb_cap = std::min(PB, std::max(SB, fit));
                 if (vram_trace) std::fprintf(stderr, "vram trace: cap free %.2f GiB room %.2f GiB fit %d -> pb_cap %d\n",
@@ -1753,9 +1965,9 @@ int main(int argc, char ** argv) {
                     if (!dsp->step(vh.data() + (size_t) r0 * 3 * n_embd, spos, acc + 1, tn, sp_ids, sp_conf)) {
                         ferr = "DSpark step: " + dsp->last_error(); finish = "error"; break;
                     }
-                    hist.push_back(t);
+                    hist.push_back(t); pen_record(t);
                     bool more = true;
-                    for (int i = 0; i < acc && more; ++i) { hist.push_back(drafts[i]); more = emit(drafts[i]); }
+                    for (int i = 0; i < acc && more; ++i) { hist.push_back(drafts[i]); pen_record(drafts[i]); more = emit(drafts[i]); }
                     prev = acc == 0 ? t : drafts[acc - 1];
                     dirty = acc < k;
                     P += 1 + acc;
@@ -1779,7 +1991,7 @@ int main(int argc, char ** argv) {
                 if (is_stop(tok)) { finish = "stop"; break; }
                 if ((max_new > 0 && gen >= max_new) || pos + 1 >= ctxv) break;
                 if (!step(tok, pos) || !dense.logits(0, 1, lg.data())) { finish = "error"; break; }
-                hist.push_back(tok);
+                hist.push_back(tok); pen_record(tok);
                 ++pos;
                 tier.rebalance_tick();
             }
@@ -1806,6 +2018,10 @@ int main(int argc, char ** argv) {
             std::printf("DONE %d %d %.1f %.1f %s 0 0 %d %lld %lld 0 %lld 0 %d\n", gen, total, prompt_ms, dec_ms, finish, reused,
                         (long long) st.hits, (long long) st.lookups(), (long long) st.file_tier, total - reused);
             std::fflush(stdout);
+            if (g_routes.on()) {   // after DONE: the client already has its answer
+                std::string rerr;
+                if (!g_routes.write(rerr)) std::fprintf(stderr, "routes: %s\n", rerr.c_str());
+            }
         }
         tier.close();
         // the stdin reader thread (detached) sits in getline holding cin's lock: a normal exit's stream teardown waits
@@ -2052,6 +2268,9 @@ int main(int argc, char ** argv) {
                  100.0 * st.hits / std::max<int64_t>(1, st.lookups()), st.cpu_ms, st.file_ms,
                  (long long) st.spec_issued, (long long) st.spec_hits, (long long) st.prefetch_issued,
                  (long long) st.prefetch_dummy, (long long) st.prefetched_useful);
+    if (a.peer_device >= 0)
+        std::fprintf(stderr, "peer: device %d holds %lld experts, computed %lld decode rows\n", a.peer_device,
+                     (long long) tier.peer_experts(), (long long) tier.peer_rows());
     if (spec)
         std::fprintf(stderr, "DSpark: %ld verify passes, %.3f accepted drafts/pass = %.3f tokens/pass, %.1f%% full, %ld re-fed; "
                      "verify %.1f ms/pass, draft %.2f ms/pass (depth %d)\n", sp_pass, (double) sp_acc / std::max(1L, sp_pass),
@@ -2061,6 +2280,10 @@ int main(int argc, char ** argv) {
         std::fprintf(stderr, "pass_v split (all %ld passes, %.2f tokens each): dense %.1f ms, tier %.1f ms, taps %.1f ms, "
                      "logits %.1f ms per pass\n", pv_n, (double) pv_tok / std::max(1L, pv_n), pv_ms[0] / std::max(1L, pv_n),
                      pv_ms[1] / std::max(1L, pv_n), pv_ms[2] / std::max(1L, pv_n), pv_ms[3] / std::max(1L, pv_n));
+    if (g_routes.on()) {   // calibration: the routing counts (v41_rank.py's stats/LNN.json) after the decode
+        std::string rerr;
+        if (!g_routes.write(rerr)) std::fprintf(stderr, "routes: %s\n", rerr.c_str());
+    }
     if (dump_main) std::fclose(dump_main);
     if (file_pred) {
         std::fprintf(stderr, "file-pred: %lld file-tier routes", fp_miss[0]);

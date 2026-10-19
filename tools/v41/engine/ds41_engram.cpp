@@ -8,6 +8,8 @@
 #ifndef _WIN32
 #include <linux/fiemap.h>
 #include <linux/fs.h>
+#include <memory>
+#include <random>
 #include <sys/ioctl.h>
 #include <sys/sysmacros.h>
 #endif
@@ -206,6 +208,45 @@ bool Ds41Engram::open(const Ds41Geometry & g, const std::vector<std::string> & d
             acc += g.engram_primes[(size_t) (e * cols_ + c)];
         }
     }
+    std::string gguf;
+    for (const auto & d : dirs) if (d.size() > 5 && d.compare(d.size() - 5, 5, ".gguf") == 0 && exists(d)) { gguf = d; break; }
+    if (!gguf.empty()) {
+        // The tables embedded in a GGUF (see the header): blk.<L>.engram_embd.weight, I8 [dim + dim/32, rows], a row's
+        // codes then its scales.  Only the tensor directory is parsed; the rows are pread in place like the shards'.
+        std::unique_ptr<GgufFile> gf;
+        try { gf = std::make_unique<GgufFile>(gguf); }
+        catch (const std::exception & ex) { err = "engram: " + gguf + ": " + ex.what(); return false; }
+        if (const MetaValue * enc = gf->get("deepseek41.engram.encoding"); enc && enc->s != "e4m3_e8m0_32_row264") {
+            err = "engram: " + gguf + ": unsupported engram encoding " + enc->s;
+            return false;
+        }
+        const uint64_t rowb = (uint64_t) dim_ + (uint64_t) dim_ / 32;
+        for (int64_t e = 0; e < nel; ++e) {
+            const std::string name = "blk." + std::to_string(g.engram_layers[(size_t) e]) + ".engram_embd.weight";
+            const TensorInfo * ti = gf->find(name);
+            const int64_t rows = g.engram_rows[(size_t) e];
+            if (!ti) { err = "engram: " + gguf + " has no " + name; return false; }
+            if (ti->type != 24 /* GGML_TYPE_I8 */ || ti->shape.size() != 2 || ti->shape[0] != rowb ||
+                (int64_t) ti->shape[1] != rows) {
+                err = "engram: " + name + " is not I8 [" + std::to_string(rowb) + ", " + std::to_string(rows) + "]";
+                return false;
+            }
+            Table t;
+            t.fd_w = ds41_sys::open(gguf.c_str(), O_RDONLY);
+            if (t.fd_w < 0) { err = "engram: cannot open " + gguf; return false; }
+            t.fd_s = ::dup(t.fd_w);
+            ::posix_fadvise(t.fd_w, 0, 0, POSIX_FADV_RANDOM);
+            t.off_w = gf->data_start() + ti->offset;
+            t.off_s = t.off_w + (uint64_t) dim_;
+            t.stride_w = t.stride_s = rowb;
+            t.inter = true;
+            t.rows = rows;
+            tables_.push_back(t);
+            std::fprintf(stderr, "engram: layer %lld: %lld rows x %llu B read in place from %s at byte %llu\n",
+                         (long long) g.engram_layers[(size_t) e], (long long) rows, (unsigned long long) rowb,
+                         gguf.c_str(), (unsigned long long) t.off_w);
+        }
+    } else {
     std::string index;
     for (const auto & d : dirs) {
         index = slurp(d + "/model.safetensors.index.json");
@@ -239,7 +280,10 @@ bool Ds41Engram::open(const Ds41Geometry & g, const std::vector<std::string> & d
             (k ? t.rm_s : t.rm_w) = raw_map(path, fd);
             t.rows = rows;
         }
+        t.stride_w = (uint64_t) dim_;
+        t.stride_s = (uint64_t) dim_ / 32;
         tables_.push_back(t);
+    }
     }
     for (int i = 0; i < std::max(1, threads); ++i)       // the pool is the disk's queue depth
         workers_.emplace_back([this] { pump(); });
@@ -313,8 +357,8 @@ bool Ds41Engram::rows_reference(int64_t pos0, int n, std::vector<std::vector<flo
             const Table & T = tables_[(size_t) e];
             const int64_t r = ids[(size_t) j];
             if (r < 0 || r >= T.rows ||
-                ds41_sys::pread(T.fd_w, w, (size_t) dim_, (int64_t) (T.off_w + (uint64_t) r * (uint64_t) dim_)) != (ssize_t) dim_ ||
-                ds41_sys::pread(T.fd_s, s, (size_t) (dim_ / 32), (int64_t) (T.off_s + (uint64_t) r * (uint64_t) (dim_ / 32))) != (ssize_t) (dim_ / 32)) {
+                ds41_sys::pread(T.fd_w, w, (size_t) dim_, (int64_t) (T.off_w + (uint64_t) r * T.stride_w)) != (ssize_t) dim_ ||
+                ds41_sys::pread(T.fd_s, s, (size_t) (dim_ / 32), (int64_t) (T.off_s + (uint64_t) r * T.stride_s)) != (ssize_t) (dim_ / 32)) {
                 bad.fetch_add(1);
                 continue;
             }
@@ -362,8 +406,11 @@ void Ds41Engram::drop_cache() {
         ds41_sys::Stat st;
         if (fd < 0 || ds41_sys::fstat(fd, &st) != 0) continue;
         const uint64_t win = 4ull << 30;
-        for (uint64_t o = 0; o < (uint64_t) st.st_size; o += win)
-            ds41_sys::posix_fadvise(fd, (int64_t) o, (int64_t) win, POSIX_FADV_DONTNEED);
+        // a GGUF-embedded table: only its own byte range, not the model around it
+        const uint64_t lo = t.inter ? t.off_w : 0;
+        const uint64_t hi = t.inter ? t.off_w + (uint64_t) t.rows * t.stride_w : (uint64_t) st.st_size;
+        for (uint64_t o = lo; o < hi; o += win)
+            ds41_sys::posix_fadvise(fd, (int64_t) o, (int64_t) std::min<uint64_t>(win, hi - o), POSIX_FADV_DONTNEED);
         ds41_sys::Stat s2;
         if (t.fd_s >= 0 && ds41_sys::fstat(t.fd_s, &s2) == 0 && s2.st_ino != st.st_ino)   // scale in another shard
             for (uint64_t o = 0; o < (uint64_t) s2.st_size; o += win)
@@ -430,15 +477,17 @@ std::shared_ptr<Ds41Engram::Batch> Ds41Engram::start(int64_t pos0, int n, std::v
         size_t i = 0;
         while (i < u) {
             if ((uint64_t) uq[i] >= (uint64_t) T.rows || hit[i]) { ++i; continue; }   // out of range (bad set) / cached
-            const uint64_t pw = bw + (uint64_t) uq[i] * (uint64_t) dim;
+            const uint64_t sw = T.stride_w, ss = T.stride_s;
+            const uint64_t pw = bw + (uint64_t) uq[i] * sw;
             const uint64_t page = pw & ~(uint64_t) 4095;
             size_t j = i + 1;
             while (j < u && (uint64_t) uq[j] < (uint64_t) T.rows && !hit[j] &&
-                   ((bw + (uint64_t) uq[j] * (uint64_t) dim) & ~(uint64_t) 4095) == page) ++j;
-            const uint64_t w0 = bw + (uint64_t) uq[i] * (uint64_t) dim;
-            const uint64_t w1 = bw + (uint64_t) uq[j - 1] * (uint64_t) dim + (uint64_t) dim;
-            const uint64_t s0 = bs + (uint64_t) uq[i] * (uint64_t) srsz;
-            const uint64_t s1 = bs + (uint64_t) uq[j - 1] * (uint64_t) srsz + (uint64_t) srsz;
+                   ((bw + (uint64_t) uq[j] * sw) & ~(uint64_t) 4095) == page) ++j;
+            const uint64_t w0 = bw + (uint64_t) uq[i] * sw;
+            // an interleaved row's scales follow its codes: the one span covers both, no scale read
+            const uint64_t w1 = bw + (uint64_t) uq[j - 1] * sw + (T.inter ? sw : (uint64_t) dim);
+            const uint64_t s0 = T.inter ? 0 : bs + (uint64_t) uq[i] * ss;
+            const uint64_t s1 = T.inter ? 0 : bs + (uint64_t) uq[j - 1] * ss + (uint64_t) srsz;
             b->groups.push_back(ReadGroup{ e, w0, s0, (uint32_t) (w1 - w0), (uint32_t) (s1 - s0), (uint32_t) i, (uint32_t) (j - i) });
             i = j;
         }
@@ -455,7 +504,7 @@ std::shared_ptr<Ds41Engram::Batch> Ds41Engram::start(int64_t pos0, int n, std::v
                 const Table & T = tables_[(size_t) G.e];
                 if (G.len_w > sizeof bw || G.len_s > sizeof bs ||
                     tread(T.fd_w, T.rm_w, bw, G.len_w, G.off_w) != (ssize_t) G.len_w ||
-                    tread(T.fd_s, T.rm_s, bs, G.len_s, G.off_s) != (ssize_t) G.len_s) { bp->bad.fetch_add(1); continue; }
+                    (G.len_s > 0 && tread(T.fd_s, T.rm_s, bs, G.len_s, G.off_s) != (ssize_t) G.len_s)) { bp->bad.fetch_add(1); continue; }
                 bp->bytes.fetch_add((uint64_t) G.len_w + G.len_s);
                 const auto & uq = bp->uniq[(size_t) G.e];
                 const auto & pk = bp->packed[(size_t) G.e];
@@ -465,8 +514,8 @@ std::shared_ptr<Ds41Engram::Batch> Ds41Engram::start(int64_t pos0, int n, std::v
                 for (uint32_t k = 0; k < G.count; ++k) {
                     const uint32_t uu = G.u0 + k;
                     const uint32_t row = uq[uu];
-                    const uint8_t * w = bw + (uint64_t) (row - r0) * (uint64_t) dim;
-                    const uint8_t * s = bs + (uint64_t) (row - r0) * (uint64_t) srsz;
+                    const uint8_t * w = bw + (uint64_t) (row - r0) * T.stride_w;
+                    const uint8_t * s = T.inter ? w + dim : bs + (uint64_t) (row - r0) * T.stride_s;
                     if (cache_cap_ && cache_used_ < cache_cap_) {   // keep the raw row (fill-until-full)
                         std::lock_guard<std::mutex> lk(cache_mu_);
                         if (cache_used_ < cache_cap_ && cache_idx_.emplace(((uint64_t) G.e << 32) | row, (uint32_t) cache_used_).second) {

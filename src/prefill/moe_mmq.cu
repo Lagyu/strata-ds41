@@ -28,7 +28,11 @@
 
 // One expansion per supported type, for the two switches that must agree.
 #define STRATA_MMQ_SUPPORTED_CASE(T) case GGML_TYPE_##T:
+#if defined(STRATA_MMQ_PREC_SRC1)   // a newer ggml: prec_src1 is a template argument of mul_mat_q_case
+#define STRATA_MMQ_DISPATCH(T) case GGML_TYPE_##T: mul_mat_q_case<GGML_TYPE_##T, GGML_PREC_Q8>(ctx, a, s); break;
+#else
 #define STRATA_MMQ_DISPATCH(T) case GGML_TYPE_##T: mul_mat_q_case<GGML_TYPE_##T>(ctx, a, s); break;
+#endif
 
 namespace strata::prefill::mmq {
 namespace {
@@ -330,7 +334,13 @@ bool fits(int t, int64_t w_rows) {
         const size_t smpbo = info.devices[id].smpbo;
         bool any = false;
         for (int J = 8; J <= 128 && !any; J += 8) {
+#if defined(STRATA_MMQ_PREC_SRC1)
+            // ggml's newer host API takes the src1 precision explicitly (the tree this was written against defaulted
+            // it to Q8_1); Q8 is what the fork's MMQ always used
+            const ggml_cuda_mmq_config c = ggml_cuda_mmq_get_config((ggml_type) t, J, fallback, cc, GGML_PREC_Q8);
+#else
             const ggml_cuda_mmq_config c = ggml_cuda_mmq_get_config((ggml_type) t, J, fallback, cc);
+#endif
             any = c.type != GGML_TYPE_COUNT && mmq_get_nbytes_shared(c, cc) <= smpbo;
         }
         if (!any) {
@@ -459,7 +469,11 @@ void Context::run(const Product& p, void* stream) {
         const bool fallback = ggml_cuda_mmq_needs_fallback(p.w_rows);
         int64_t ntiles_best = INT64_MAX;
         for (int J = 8; J <= 128 && ntiles_best > 1; J += 8) {
+#if defined(STRATA_MMQ_PREC_SRC1)
+            const ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config(t, J, fallback, cc, GGML_PREC_Q8);
+#else
             const ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config(t, J, fallback, cc);
+#endif
             if (config.type == GGML_TYPE_COUNT || mmq_get_nbytes_shared(config, cc) > smpbo) continue;
             const int64_t nt = (p.max_rows + config.J - 1) / config.J;
             if (nt < ntiles_best) { J_best = J; ntiles_best = nt; }
@@ -473,7 +487,7 @@ void Context::run(const Product& p, void* stream) {
                         p.w_cols, p.w_rows, p.total_rows, bpr, p.total_rows, p.ld_dst,
                         p.n, p.n, p.tab ? 0 : (int64_t) (p.expert_bytes / type_bytes((int) t)), 0, 0,
                         1, 1, 0, 0, 0,
-                        p.max_rows, J_best};
+                        p.max_rows, (int) J_best};
     auto& ctx = *(ggml_backend_cuda_context*) ctx_;
     const cudaStream_t s = (cudaStream_t) stream;
     if (p.tab) {
@@ -511,6 +525,7 @@ void Context::run(const Product& p, void* stream) {
             std::fprintf(stderr, "prefill mmq: type %d is not covered\n", (int) t);
             std::exit(1);
     }
+#undef STRATA_MMQ_CASE
     ck(cudaGetLastError(), "mul_mat_q");
 }
 

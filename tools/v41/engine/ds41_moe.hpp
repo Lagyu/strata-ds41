@@ -289,14 +289,23 @@ struct Ds41MoeConfig {
     bool dither = true;           ///< error-diffused rounding for both the PCIe share and the prefetch budget
     bool cpu_only = false;        ///< no CUDA at all: the pool computes every expert
     bool no_cache = false;        ///< GPU tier without a VRAM cache (every miss is CPU or PCIe)
+    /// A SECOND card's expert tier (docs/ds4/V41_AMD_PEER_TIER.md), DECODE only.  -1 = off, the default path is then
+    /// byte-identical.  >= 0: that device's memory gets a copy of the host arena's ranked head that this card's VRAM
+    /// cache does NOT hold (up to STRATA_PEER_GIB, default 18 GiB), and a decode token's routed experts that the
+    /// peer holds are computed there - the same kernels and q8_1 activations, so the rows are bit-identical - while
+    /// the primary's stream runs its own kernels; the peer's row is deposited into the routing index's slot of
+    /// `d_parts` exactly like the CPU share's, and `decode_rows_sum` sums everything, unchanged.
+    int peer_device = -1;
     /// Uniform blobs (DS4): open the VRAM cache at the seed instead of at init, so prompt chunks (run_chunk) can use
     /// that VRAM first (build_arena_from_routes -> chunks -> release_chunk -> seed_from_routes).
     bool defer_cache = false;
     double mem_floor_gib = 3.0;   ///< refuse an arena that would leave less than this much MemAvailable
     double max_arena_gib = 60.0;  ///< hard ceiling on the arena, whatever `arena_gib` says
-    /// VRAM budget for the expert cache in GiB, for geometries whose blob size varies per layer (MiMo): the seed
-    /// takes the ranked profile's head until `slots` experts OR this many bytes, sizing each slot to its expert.
-    /// 0 = `slots` x the largest blob.  Ignored for uniform geometries (DS4: `slots` alone, as before).
+    /// VRAM budget for the expert cache in GiB: the seed takes the ranked profile's head until `slots` experts OR
+    /// this many bytes, sizing each slot to its expert (a per-layer/per-class geometry) or to the one blob size
+    /// (a uniform one, where it caps the slot COUNT: 15360 DS4 experts x 9.5 MiB is 142 GiB).  0 = `slots` x the
+    /// largest blob, i.e. what ds41_generate passes with an explicit `--slots N`; an automatic size passes the free
+    /// VRAM after the dense half, so a uniform geometry must honour it too.
     double slot_gib = 0.0;
     /// Leave the experts the VRAM seed takes OUT of the host arena: a cache that never evicts never reads their arena
     /// copies again, so the bytes go to the next-ranked experts (fewer file-tier reads); with `vram_lru` an evicted
@@ -459,6 +468,14 @@ public:
     const Ds41MoeConfig& config() const;
     const char* mode() const;          ///< "cpu-only" | "gpu" | "uninitialised"
     int64_t resident() const;          ///< experts admitted to the VRAM cache
+    /// The VRAM expert cache now: experts it holds and the bytes of its live slots (0 / 0 while it is shut, e.g. during
+    /// a layer-major prompt batch).  Report-only (the server's Monitor tab).
+    int64_t vram_experts() const;
+    int64_t vram_bytes() const;
+    /// The peer device's tier (Ds41MoeConfig::peer_device >= 0; 0 otherwise): experts its store holds and decode
+    /// rows it has computed.  Report-only.
+    int64_t peer_experts() const;
+    int64_t peer_rows() const;
     int64_t arena_experts() const;     ///< blobs the host arena holds
     int64_t file_tier() const;         ///< blobs the arena could not take
     double arena_gib() const;
@@ -494,7 +511,9 @@ public:
     bool build_arena_from_routes(const std::string& routes_bin, int batch_tokens, std::string& err);
     /// Frees run_chunk's device and pinned buffers (the next run_chunk allocates them again).
     void release_chunk();
-    /// The conversation-adaptive arena (on by default; STRATA_ARENA_REBAL=0 turns it off) - routed-token counts per expert, a swap
+    /// The conversation-adaptive arena (STRATA_ARENA_REBAL=1 on, 0 off; off by default: measured on with one RTX 4090 + a
+    /// 64 GiB arena (Xolotl: -10% small-turn prefill) and off with one 7900 XTX + a 75 GiB arena, where the agent replay's
+    /// short follow-ups read more file-tier experts with it) - routed-token counts per expert, a swap
     /// plan after each prompt (frequent file-tier experts in, rarely used arena experts out), executed by a reader thread
     /// in the idle NVMe time.  begin_prompt: before a prompt (pauses the reads, takes back every retired swap the reader
     /// has not started - the victim gets its slot back - and publishes finished ones); plan: after it (plans, resumes);

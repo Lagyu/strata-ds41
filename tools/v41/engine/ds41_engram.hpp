@@ -1,7 +1,8 @@
 // tools/v41/engine/ds41_engram.hpp - DeepSeek-V4.1 Engram: the n-gram hash (model.py / engram.py NgramHashState)
 // and the row reader.  The tables are NOT copied anywhere: rows are read straight from the HF safetensors shards
 // (layers.{1,14}.engram.embed.weight F8_E4M3 [rows, 256] + .scale F8_E8M0 [rows, 8]), two small preads per row,
-// in parallel.  A row dequantizes to 256 floats = fp8 * 2^(e8m0 - 127) per 32 (model.py ParallelEngramEmbedding;
+// in parallel.  A `.gguf` among the --engram entries is a GGUF that embeds the tables instead (Lucebox's DeepSeek-V4.1
+// files: blk.<L>.engram_embd.weight, I8 [264, rows], each row its 256 codes then its 8 scales): read in place too.  A row dequantizes to 256 floats = fp8 * 2^(e8m0 - 127) per 32 (model.py ParallelEngramEmbedding;
 // exactly representable in bf16, so model.py's bf16 cast is a no-op on them).
 //
 // rows()/start() are the fast batch reader: hashes are deduped and sorted by row id, so per row the two preads come out
@@ -64,7 +65,11 @@ public:
     uint64_t cache_misses() const { return cache_miss_; }
 
 private:
+    // Row r's weight bytes are at off_w + r * stride_w (dim of them), its scales at off_s + r * stride_s (dim/32).
+    // Safetensors planes: strides dim and dim/32.  A GGUF-embedded table (`inter`) keeps a row's codes and scales
+    // together (stride 264 = dim + dim/32, off_s = off_w + dim), so one read of the row span covers both.
     struct Table { int fd_w = -1, fd_s = -1; uint64_t off_w = 0, off_s = 0; int64_t rows = 0;
+                   uint64_t stride_w = 0, stride_s = 0; bool inter = false;
                    std::shared_ptr<RawMap> rm_w, rm_s; };
     struct ReadGroup;               // one coalesced pread (defined in the .cpp)
     const Ds41Geometry * g_ = nullptr;
