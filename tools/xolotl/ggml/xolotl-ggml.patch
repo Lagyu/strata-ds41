@@ -529,10 +529,10 @@ index 651524b..57c5b8a 100644
  
 diff --git a/ggml/src/ggml-cuda/ds41-fused.cu b/ggml/src/ggml-cuda/ds41-fused.cu
 new file mode 100644
-index 0000000..48dd450
+index 0000000..fd741e1
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/ds41-fused.cu
-@@ -0,0 +1,657 @@
+@@ -0,0 +1,660 @@
 +// Strata-DS4.1 fused decode-layer glue (GGML_OP_DS41_FUSED).  Each sub-op repeats, step for step and in the same
 +// reduction order, the stock-op composite tools/v41/engine/ds41_dense.cpp built before it (the kernels it replaces are
 +// named at each one), so the values are the same bits.  The gate: ds41_generate --dense-bench rows compared with cmp,
@@ -706,6 +706,9 @@ index 0000000..48dd450
 +    const int64_t ir     = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
 +    const int64_t nr     = n_embd * DS41F_HC * n_tokens;
 +    const int64_t it_blk = ((int64_t) blockIdx.x * blockDim.x) / (n_embd * DS41F_HC);
++    // thread 0 alone, as dsv4_hc_comb_f32 (a 4-lane version with the same operation order measured 33 -> 21 us but
++    // not the same bits: the single-thread code lets the compiler fuse `comb *= inv_sum` into the next phase's
++    // `sum += comb` across statements, which values passing through shuffles cannot reproduce; ~0.2% of a decode)
 +    if (threadIdx.x == 0 && it_blk < n_tokens) {
 +        for (int h = 0; h < DS41F_HC; ++h) {
 +            s_post[h] = ds41f_mix_post(mixes, sm1, scale, base, it_blk, h);
