@@ -4346,6 +4346,7 @@ bool gpu_run_n_ex(Ds41MoeImpl& im, int64_t layer, int nt, const int32_t* ids, co
         }
     };
     launch_site(HIT);
+    xmark(7);   // the hit site's launches (DS41_PROF_X: "hits"); the rest of the launch phase is the PCIe / FILEG site
     // vram_lru, as gpu_run: a prefetched expert the pass used is copied device-to-device into a victim slot (the
     // hits kernel above read the staging copy; this copy only reads it too, and the next prefetch waits for the sync)
     if (lru && npf > 0) {
@@ -4600,9 +4601,9 @@ bool gpu_run_n_ex(Ds41MoeImpl& im, int64_t layer, int nt, const int32_t* ids, co
         ++xp_n; xp_nu += nu;
         for (int u = 0; u < nu; ++u) if (cls[u] == CPU) { ++xp_cpu; if (!gp.arena.ptr(layer, ue[u])) ++xp_file; }
         if (xp_n % 640 == 0) {
-            std::fprintf(stderr, "[prof_x] %ld calls, ms/call: classify %.3f xq %.3f launch %.3f jobs+reads %.3f pool %.3f "
+            std::fprintf(stderr, "[prof_x] %ld calls, ms/call: classify %.3f xq+peers %.3f hits %.3f pcie+file launch %.3f jobs+reads %.3f pool %.3f "
                          "sum+sync %.3f admit %.3f | distinct %.2f/call, cpu %.2f, file %.2f\n", xp_n, xp[0] / xp_n,
-                         xp[1] / xp_n, xp[2] / xp_n, xp[3] / xp_n, xp[4] / xp_n, xp[5] / xp_n, xp[6] / xp_n,
+                         xp[1] / xp_n, xp[7] / xp_n, xp[2] / xp_n, xp[3] / xp_n, xp[4] / xp_n, xp[5] / xp_n, xp[6] / xp_n,
                          (double) xp_nu / xp_n, (double) xp_cpu / xp_n, (double) xp_file / xp_n);
             // the pool's own phases since the last print: gate/up, the ff quant, down, and its weight-read rate
             const cpu::ExpertPool& pl = *im.pool;
