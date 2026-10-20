@@ -456,12 +456,11 @@ void Context::run(const Product& p, void* stream) {
     if (p.n <= 0 || p.max_rows <= 0) return;
     const ggml_type t = (ggml_type) p.type;
     const int64_t qk = type_blck((int) t), bpr = p.w_cols / qk;
-#if defined(STRATA_MMQ_J_BEST)
     // The tile width J_best, chosen as ggml's mmq.cu host code does since upstream #29953 (mmq_args' last field was
     // ncols_opt - the per-expert row count - and is now J_best: passing max_rows there launched an invalid tile,
     // GGML_ABORT "J_best=75").  Smallest tile count over J = 8..128 among the configs that fit shared memory.  The
     // kernels read up to J_best - 1 columns / ids past the end: xq carries 128 blocks of slack (q8_1_bytes) and the
-    // identity id buffers 128 ints (prefill.cpp).  STRATA_MMQ_J_BEST: CMake found #29953's mmq_args in this ggml.
+    // identity id buffers 128 ints (prefill.cpp).
     int64_t J_best = 0;
     {
         const int dev = ggml_cuda_get_device(), cc = ggml_cuda_info().devices[dev].cc;
@@ -480,9 +479,6 @@ void Context::run(const Product& p, void* stream) {
         }
         if (J_best <= 0) throw std::runtime_error("moe_mmq: no MMQ tile fits");
     }
-#else
-    const int64_t J_best = p.max_rows;   // the pinned ggml's mmq_args: ncols_opt, the per-expert row count
-#endif
     const mmq_args a = {(const char*) p.w, t, (const int*) p.xq, p.ids, p.bounds, p.dst, p.y_scale,
                         p.w_cols, p.w_rows, p.total_rows, bpr, p.total_rows, p.ld_dst,
                         p.n, p.n, p.tab ? 0 : (int64_t) (p.expert_bytes / type_bytes((int) t)), 0, 0,

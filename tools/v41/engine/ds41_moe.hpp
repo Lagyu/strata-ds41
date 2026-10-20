@@ -296,6 +296,10 @@ struct Ds41MoeConfig {
     /// the primary's stream runs its own kernels; the peer's row is deposited into the routing index's slot of
     /// `d_parts` exactly like the CPU share's, and `decode_rows_sum` sums everything, unchanged.
     int peer_device = -1;
+    /// More than one peer card: every device's expert tier, in this order (the ranked walk fills the stores one after
+    /// the other).  Empty = `peer_device` alone.  STRATA_PEER_GIB takes one budget per peer (a comma list) and
+    /// STRATA_PEER_FILL=file fills the stores from the file tier (the experts neither VRAM nor the arena holds).
+    std::vector<int> peer_devices;
     /// Uniform blobs (DS4): open the VRAM cache at the seed instead of at init, so prompt chunks (run_chunk) can use
     /// that VRAM first (build_arena_from_routes -> chunks -> release_chunk -> seed_from_routes).
     bool defer_cache = false;

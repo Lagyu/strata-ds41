@@ -177,7 +177,12 @@ struct Args {
     /// off, in which case nothing about the tier changes.  N >= 0 must be a CUDA/HIP device index that is not the
     /// dense half's (0 on this box): its memory holds the ranked experts after card 0's VRAM head, and a decode
     /// token's misses that it holds are computed there (no blob moves), in parallel with the primary's kernels.
-    int peer_device = std::getenv("STRATA_PEER_DEVICE") ? std::atoi(std::getenv("STRATA_PEER_DEVICE")) : -1;
+    std::vector<int> peer_devices = [] {   // --peer-device 1[,2,...] / STRATA_PEER_DEVICE: the other cards' expert tiers
+        std::vector<int> v;
+        if (const char* e = std::getenv("STRATA_PEER_DEVICE"))
+            for (const char* q = e; *q;) { v.push_back(std::atoi(q)); while (*q && *q != ',') ++q; if (*q) ++q; }
+        return v;
+    }();
     int  kv_type = -1;            // --kv-q8 / --kv-type N: the compressed KV + indexer keys' ggml type (-1 = BF16 with act_quant, else F32)
     int  enc_skip = -1;           // -1 = default (on for one-shot layer-major runs), 1 = --enc-skip, 0 = --no-enc-skip; only run the tokens before the replay window through layers 21-39
     int  enc_replay = 2560;       // --enc-replay N: the replay window (window_size * (n_layer - cand_layer) = 128*20)
@@ -260,7 +265,11 @@ bool parse(int argc, char ** argv, Args & a) {
         else if (k == "-n" || k == "--n-predict") a.n_predict = std::atoi(next().c_str());
         else if (k == "--backend") a.backend = next();
         else if (k == "--experts") a.experts = next();
-        else if (k == "--peer-device") a.peer_device = std::atoi(next().c_str());
+        else if (k == "--peer-device") {
+            a.peer_devices.clear();
+            const std::string v = next();
+            for (const char* q = v.c_str(); *q;) { a.peer_devices.push_back(std::atoi(q)); while (*q && *q != ',') ++q; if (*q) ++q; }
+        }
 #ifdef _WIN32
         // the Windows path-list separator: a drive letter's ':' must not split "D:\a;E:\b"
         else if (k == "--engram") { std::stringstream ss(next()); std::string d; while (std::getline(ss, d, ';')) a.engram.push_back(d); }
@@ -591,7 +600,7 @@ int main(int argc, char ** argv) {
     Ds41MoeTier tier;
     Ds41MoeConfig mc;
     mc.cpu_only = a.experts == "cpu" || ggml_backend_is_cpu(be);
-    mc.peer_device = a.peer_device;   // the second card's expert tier: -1 = off, the default path is untouched
+    mc.peer_devices = a.peer_devices;   // the other cards' expert tiers: none = off, the default path is untouched
     // defer the VRAM cache: the prompt's chunk + graph buffers (~4 GiB) use that VRAM first, then the cache opens into
     // it (measured) - the old fixed --vram-margin had to cover prefill and starved decode of slots.  --serve does this
     // per request: a multi-token prompt closes the cache (release_cache), the decode after it re-seeds (~0.6 s).
@@ -2268,8 +2277,8 @@ int main(int argc, char ** argv) {
                  100.0 * st.hits / std::max<int64_t>(1, st.lookups()), st.cpu_ms, st.file_ms,
                  (long long) st.spec_issued, (long long) st.spec_hits, (long long) st.prefetch_issued,
                  (long long) st.prefetch_dummy, (long long) st.prefetched_useful);
-    if (a.peer_device >= 0)
-        std::fprintf(stderr, "peer: device %d holds %lld experts, computed %lld decode rows\n", a.peer_device,
+    if (!a.peer_devices.empty())
+        std::fprintf(stderr, "peer: %zu device(s) hold %lld experts, computed %lld decode rows\n", a.peer_devices.size(),
                      (long long) tier.peer_experts(), (long long) tier.peer_rows());
     if (spec)
         std::fprintf(stderr, "DSpark: %ld verify passes, %.3f accepted drafts/pass = %.3f tokens/pass, %.1f%% full, %ld re-fed; "
