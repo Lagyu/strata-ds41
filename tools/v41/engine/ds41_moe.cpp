@@ -3937,7 +3937,7 @@ bool gpu_run_n_ex(Ds41MoeImpl& im, int64_t layer, int nt, const int32_t* ids, co
     // DS41_PROF_X=2: count only verify/decode-sized calls (nt <= 8) - a prompt's wide calls swamp the averages
     static const int xprof_mode = std::getenv("DS41_PROF_X") ? std::atoi(std::getenv("DS41_PROF_X")) : 0;
     const bool xprof = xprof_mode == 1 || (xprof_mode >= 2 && nt <= 8);
-    static double xp[8] = {};
+    static double xp[12] = {};   // 8: the PCIe site's DMA calls, 9: its kernel launches (inside phase 2)
     static double xpool0[3] = {};
     static int64_t xpool_b0 = 0;
     static long xp_n = 0, xp_nu = 0, xp_cpu = 0, xp_file = 0;
@@ -4314,7 +4314,9 @@ bool gpu_run_n_ex(Ds41MoeImpl& im, int64_t layer, int nt, const int32_t* ids, co
                             }
                         }
                         uint8_t* to = (uint8_t*) gp.d_stage + (size_t) (bank * bank_w + si) * (size_t) B;
+                        const double xd0 = xprof ? now_ms() : 0;
                         ck(cudaMemcpyAsync(to, src, (size_t) BL, cudaMemcpyHostToDevice, cs), "pcie dma");
+                        if (xprof) xp[8] += now_ms() - xd0;
                         dptr[u] = (unsigned long long) to;
                         ++si;
                     }
@@ -4328,7 +4330,9 @@ bool gpu_run_n_ex(Ds41MoeImpl& im, int64_t layer, int nt, const int32_t* ids, co
                                                cudaMemcpyDeviceToHost, cs), "lru demote");
                             ck(cudaMemcpyAsync(vs, (const void*) dptr[u], (size_t) BL, cudaMemcpyDeviceToDevice, cs), "lru stage copy");
                         } else {        // the DMA lands in the victim slot: the kernel reads it there, and it stays
+                            const double xd0 = xprof ? now_ms() : 0;
                             ck(cudaMemcpyAsync(vs, src, (size_t) BL, cudaMemcpyHostToDevice, cs), "pcie dma");
+                            if (xprof) xp[8] += now_ms() - xd0;
                             dptr[u] = (unsigned long long) vs;
                         }
                         lru_old[n_lru] = v;
@@ -4341,8 +4345,11 @@ bool gpu_run_n_ex(Ds41MoeImpl& im, int64_t layer, int nt, const int32_t* ids, co
                 for (int j = 0; j < NE; ++j)
                     if (ent_u[j] == u) { dst.push_back(j); tok.push_back(j / (int) K); }
             }
-            if (want == PCIE) pcie_launch(c, ptr, start, dst, tok);
-            else launch_group(c, ptr, start, dst, tok);
+            if (want == PCIE) {
+                const double xl0 = xprof ? now_ms() : 0;
+                pcie_launch(c, ptr, start, dst, tok);
+                if (xprof) xp[9] += now_ms() - xl0;
+            } else launch_group(c, ptr, start, dst, tok);
         }
     };
     launch_site(HIT);
@@ -4463,12 +4470,32 @@ bool gpu_run_n_ex(Ds41MoeImpl& im, int64_t layer, int nt, const int32_t* ids, co
                 }
                 ++pg.launches;
             }
-            for (int r = 0; r < npe; ++r) {
-                PeerGpu& pg = *pe_p[r];
-                ck(cudaMemcpyAsync((float*) gp.d_parts + (size_t) pe_j[r] * (size_t) H, pg.h_parts + (size_t) pe_r[r] * (size_t) H,
-                                   (size_t) H * 4, cudaMemcpyHostToDevice, gp.s), "peer row h2d");
-                ++pg.rows;
+            // every peer's pad up in ONE copy (its compact rows, in order) into the staging buffer the chunk helper
+            // also uses, then one scatter kernel into the routing-index rows of d_parts.  Before: one 20 KB
+            // cudaMemcpyAsync per row, ~25 a layer with two stores holding 70% of the entries - a quarter of the
+            // layer's time in HIP calls (DS41_PROF_X: "sum+sync").
+            if (gp.c_pbuf_rows < npe) {
+                for (void* q : {gp.c_pbuf, gp.c_pdst}) if (q) cudaFree(q);
+                ck(cudaMalloc(&gp.c_pbuf, (size_t) kMaxEnt * (size_t) H * 4), "c_pbuf");
+                ck(cudaMalloc(&gp.c_pdst, sizeof(int32_t) * (size_t) kMaxEnt), "c_pdst");
+                gp.c_pbuf_rows = kMaxEnt;
             }
+            int32_t pdst[kMaxEnt];
+            int at = 0;
+            for (auto& pp : gp.peers) {
+                PeerGpu& pg = *pp;
+                int n_p = 0;
+                for (int r = 0; r < npe; ++r)
+                    if (pe_p[r] == &pg) { pdst[at + pe_r[r]] = pe_j[r]; ++n_p; }
+                if (!n_p) continue;
+                ck(cudaMemcpyAsync((float*) gp.c_pbuf + (size_t) at * (size_t) H, pg.h_parts, (size_t) n_p * (size_t) H * 4,
+                                   cudaMemcpyHostToDevice, gp.s), "peer rows h2d");
+                pg.rows += n_p;
+                at += n_p;
+            }
+            // pageable: the driver stages it before returning (as the chunk helper's list)
+            ck(cudaMemcpyAsync(gp.c_pdst, pdst, sizeof(int32_t) * (size_t) at, cudaMemcpyHostToDevice, gp.s), "peer rows dst");
+            strata::kernels::rows_scatter((const float*) gp.c_pbuf, (const int32_t*) gp.c_pdst, at, H, (float*) gp.d_parts, gp.s);
         }
         const size_t o_w = 0;   // [0, kMetaW): the pass's weights (NE <= kMaxEnt floats); the launches' metadata sits above
         static_assert(sizeof(float) * kMaxEnt <= 1024, "the weights must fit below kMetaW");
@@ -4602,9 +4629,9 @@ bool gpu_run_n_ex(Ds41MoeImpl& im, int64_t layer, int nt, const int32_t* ids, co
         for (int u = 0; u < nu; ++u) if (cls[u] == CPU) { ++xp_cpu; if (!gp.arena.ptr(layer, ue[u])) ++xp_file; }
         if (xp_n % 640 == 0) {
             std::fprintf(stderr, "[prof_x] %ld calls, ms/call: classify %.3f xq+peers %.3f hits %.3f pcie+file launch %.3f jobs+reads %.3f pool %.3f "
-                         "sum+sync %.3f admit %.3f | distinct %.2f/call, cpu %.2f, file %.2f\n", xp_n, xp[0] / xp_n,
+                         "sum+sync %.3f admit %.3f | distinct %.2f/call, cpu %.2f, file %.2f | pcie dma calls %.3f, pcie launches %.3f\n", xp_n, xp[0] / xp_n,
                          xp[1] / xp_n, xp[7] / xp_n, xp[2] / xp_n, xp[3] / xp_n, xp[4] / xp_n, xp[5] / xp_n, xp[6] / xp_n,
-                         (double) xp_nu / xp_n, (double) xp_cpu / xp_n, (double) xp_file / xp_n);
+                         (double) xp_nu / xp_n, (double) xp_cpu / xp_n, (double) xp_file / xp_n, xp[8] / xp_n, xp[9] / xp_n);
             // the pool's own phases since the last print: gate/up, the ff quant, down, and its weight-read rate
             const cpu::ExpertPool& pl = *im.pool;
             const double g = pl.ms_multi_gu - xpool0[0], q = pl.ms_multi_q - xpool0[1], d = pl.ms_multi_down - xpool0[2];
