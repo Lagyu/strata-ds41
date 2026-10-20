@@ -682,7 +682,7 @@ int main(int argc, char ** argv) {
     };
     // bias_now: route-bias / file penalty are DECODE levers - before the VRAM seed (the prompt) only the prune part
     // applies, unless --bias-prompt measures them (the prompt's file tier is prefetched; a penalty there buys nothing)
-    bool bias_now = a.bias_prompt > 0 || !defer_vram;
+    bool bias_now = a.bias_prompt > 0 || !defer_vram || (std::getenv("STRATA_BIAS_NOW") && std::getenv("STRATA_BIAS_NOW")[0] == '1');
     bool bias_set = false;   // a nonzero bias is in the dense half now (--serve turns it off again for the next prompt)
     auto apply_bias = [&]() {
         const bool want = n_pruned > 0 || (bias_now && (a.route_bias != 0.0f || a.route_bias_file != 0.0f));
@@ -693,7 +693,7 @@ int main(int argc, char ** argv) {
             for (int64_t e = 0; e < TG.n_experts; ++e)
                 rb[(size_t) e] = (!pruned.empty() && pruned[(size_t) (l * TG.n_experts + e)]) ? (a.prune_penalty > 0 ? -a.prune_penalty : -1e30f)
                                : (bias_now && a.route_bias != 0.0f && !mc.cpu_only && resident_now(l, e)) ? a.route_bias
-                               : (bias_now && a.route_bias_file != 0.0f && !resident_now(l, e) && !tier.in_arena(l, e)) ? -a.route_bias_file : 0.0f;
+                               : (bias_now && a.route_bias_file != 0.0f && !resident_now(l, e) && !tier.in_arena(l, e) && !tier.on_peer(l, e)) ? -a.route_bias_file : 0.0f;
             dense.set_route_bias((int) l, rb.data());
         }
     };
@@ -890,6 +890,14 @@ int main(int argc, char ** argv) {
     // vlog = the pass's m rows of logits.
     std::vector<float> vh, vlog, vx, vpre;
     std::vector<int> pv_pred, pv_rank;                 // D3 prefetch: per-token predictions, the ranked union
+    // STRATA_D3_FILE_PRED=1 (measurement only, slower): at layer l of a pass, predict_multi(l+1) and (l+2); at layer l
+    // count, for every routed expert that is on NO tier but the file, whether the prediction made 1 / 2 layers earlier
+    // had it in the row's top 2 / 4 / 8 / 16 (row) or in any row's top-m (union), and how many file-tier experts those
+    // predictions would have read (issued) - recall and precision of a speculative read k layers ahead.
+    static const bool d3_fpred = std::getenv("STRATA_D3_FILE_PRED") != nullptr;
+    std::vector<int> fpv[2];            // [k-1]: n_layer x kMaxMulti x 16 predicted ids for each layer
+    std::vector<char> fpv_ok[2];        // [k-1][layer]: predicted in this pass
+    static long qfp_file = 0, qfp_hit[2][4] = {}, qfp_uhit[2][4] = {}, qfp_iss[2][4] = {}, qfp_calls = 0, qfp_pass = 0;
     std::vector<std::pair<int, int>> pv_score;
     double pv_ms[4] = {0, 0, 0, 0};   // pass_v split: dense (begin/attn_router/finish), tier, taps (read_state), logits
     long pv_n = 0, pv_tok = 0;
@@ -904,6 +912,13 @@ int main(int argc, char ** argv) {
         mw.resize((size_t) m * top_k);
         vh.assign((size_t) m * 3 * n_embd, 0.0f);
         if (!dense.begin(toks, m, pos)) { ferr = dense.last_error(); return false; }
+        if (d3_fpred) {
+            for (int k = 0; k < 2; ++k) {
+                fpv[k].assign((size_t) n_layer * Ds41MoeTier::kMaxMulti * 16, -1);
+                fpv_ok[k].assign((size_t) n_layer, 0);
+            }
+            ++qfp_pass;
+        }
         // D3 prefetch (STRATA_D3_PF = slots per layer, default 1, 0 = off): before each layer's attention, predict
         // every pass token's routing (predict_multi), rank the union (score 16 - rank, summed over tokens) and DMA the
         // likely misses into the prefetch slots on the prefetch stream - they land under the attention.  PCIe is the
@@ -957,9 +972,62 @@ int main(int argc, char ** argv) {
                     tier.spec_read(l + d3_spec_ahead, pv_rank.data(), std::min(d3_spec, (int) pv_rank.size()), true);
                 }
             }
+            if (d3_fpred && m <= Ds41MoeTier::kMaxMulti) {
+                for (int k = 1; k <= 2; ++k) {
+                    if (l + k >= n_layer) continue;
+                    int * dst = fpv[k - 1].data() + (size_t) (l + k) * Ds41MoeTier::kMaxMulti * 16;
+                    if (!dense.predict_multi(l + k, dst)) continue;
+                    fpv_ok[k - 1][(size_t) (l + k)] = 1;
+                    for (int c = 0; c < 4; ++c) {   // issued: distinct file-tier experts in the union of the rows' top-m
+                        const int mtop = 2 << c;
+                        std::vector<int> seen;
+                        for (int t = 0; t < m; ++t)
+                            for (int i = 0; i < mtop; ++i) {
+                                const int e = dst[(size_t) t * 16 + i];
+                                if (e < 0 || std::find(seen.begin(), seen.end(), e) != seen.end()) continue;
+                                seen.push_back(e);
+                                if (!tier.resident(l + k, e) && !tier.in_arena(l + k, e) && !tier.on_peer(l + k, e)) ++qfp_iss[k - 1][c];
+                            }
+                    }
+                }
+            }
             const float * fn = nullptr;
             if (!dense.attn_router(l, mids.data(), mw.data(), &fn)) { ferr = dense.last_error(); return false; }
             g_routes.add(l, mids.data(), m);
+            if (d3_fpred && m <= Ds41MoeTier::kMaxMulti) {
+                ++qfp_calls;
+                std::vector<int> seen;
+                for (int t = 0; t < m; ++t)
+                    for (int j = 0; j < top_k; ++j) {
+                        const int e = mids[(size_t) t * top_k + j];
+                        if (e < 0 || std::find(seen.begin(), seen.end(), e) != seen.end()) continue;
+                        seen.push_back(e);
+                        if (tier.resident(l, e) || tier.in_arena(l, e) || tier.on_peer(l, e)) continue;
+                        ++qfp_file;
+                        for (int k = 1; k <= 2; ++k) {
+                            if (!fpv_ok[k - 1][(size_t) l]) continue;
+                            const int * pr = fpv[k - 1].data() + (size_t) l * Ds41MoeTier::kMaxMulti * 16;
+                            int best_row = 16, best_any = 16;   // the expert's best rank in its own rows / in any row
+                            for (int t2 = 0; t2 < m; ++t2) {
+                                bool routes = false;
+                                for (int j2 = 0; j2 < top_k && !routes; ++j2) routes = mids[(size_t) t2 * top_k + j2] == e;
+                                for (int i = 0; i < 16; ++i)
+                                    if (pr[(size_t) t2 * 16 + i] == e) { best_any = std::min(best_any, i); if (routes) best_row = std::min(best_row, i); break; }
+                            }
+                            for (int c = 0; c < 4; ++c) { if (best_row < (2 << c)) ++qfp_hit[k - 1][c]; if (best_any < (2 << c)) ++qfp_uhit[k - 1][c]; }
+                        }
+                    }
+                if (qfp_calls % 1280 == 0)
+                    std::fprintf(stderr, "[fpred] %ld calls (%ld passes): %.2f file experts/call; recall row-top2/4/8/16 k1 %.2f/%.2f/%.2f/%.2f k2 %.2f/%.2f/%.2f/%.2f; "
+                                 "union k1 %.2f/%.2f/%.2f/%.2f k2 %.2f/%.2f/%.2f/%.2f; issued/call k1 %.2f/%.2f/%.2f/%.2f k2 %.2f/%.2f/%.2f/%.2f\n",
+                                 qfp_calls, qfp_pass, (double) qfp_file / qfp_calls,
+                                 (double) qfp_hit[0][0] / std::max(1L, qfp_file), (double) qfp_hit[0][1] / std::max(1L, qfp_file), (double) qfp_hit[0][2] / std::max(1L, qfp_file), (double) qfp_hit[0][3] / std::max(1L, qfp_file),
+                                 (double) qfp_hit[1][0] / std::max(1L, qfp_file), (double) qfp_hit[1][1] / std::max(1L, qfp_file), (double) qfp_hit[1][2] / std::max(1L, qfp_file), (double) qfp_hit[1][3] / std::max(1L, qfp_file),
+                                 (double) qfp_uhit[0][0] / std::max(1L, qfp_file), (double) qfp_uhit[0][1] / std::max(1L, qfp_file), (double) qfp_uhit[0][2] / std::max(1L, qfp_file), (double) qfp_uhit[0][3] / std::max(1L, qfp_file),
+                                 (double) qfp_uhit[1][0] / std::max(1L, qfp_file), (double) qfp_uhit[1][1] / std::max(1L, qfp_file), (double) qfp_uhit[1][2] / std::max(1L, qfp_file), (double) qfp_uhit[1][3] / std::max(1L, qfp_file),
+                                 (double) qfp_iss[0][0] / qfp_calls, (double) qfp_iss[0][1] / qfp_calls, (double) qfp_iss[0][2] / qfp_calls, (double) qfp_iss[0][3] / qfp_calls,
+                                 (double) qfp_iss[1][0] / qfp_calls, (double) qfp_iss[1][1] / qfp_calls, (double) qfp_iss[1][2] / qfp_calls, (double) qfp_iss[1][3] / qfp_calls);
+            }
             lap(0);
             if (rdev1 && !no_tier_batch) {
                 // D3: ONE batched per-class tier call for the pass's m tokens (the union of their experts is served
@@ -2012,14 +2080,16 @@ int main(int argc, char ** argv) {
                 snap_len = -1;
                 finish = "length";
             }
-            std::fprintf(stderr, "serve: %d tokens in %.2f s = %.2f tok/s (%s); experts: %lld hit, %lld cpu, %lld pcie, %lld file\n",
+            std::fprintf(stderr, "serve: %d tokens in %.2f s = %.2f tok/s (%s); experts: %lld hit, %lld cpu, %lld pcie, %lld file%s\n",
                          gen, dec_ms / 1000.0, 1000.0 * std::max(0, gen - 1) / std::max(dec_ms, 1e-9), finish,
-                         (long long) st.hits, (long long) st.cpu, (long long) st.pcie, (long long) st.file_tier);
+                         (long long) st.hits, (long long) st.cpu, (long long) st.pcie, (long long) st.file_tier,
+                         st.skipped > 0 ? (", skipped " + std::to_string(st.skipped)).c_str() : "");
             if (const Ds41Dense::RouteMeter rm = dense.route_meter(false); rm.on && rm.slots > 0)
                 std::fprintf(stderr, "serve: routing vs exact: %.2f%% of expert picks swapped, %.2f%% of router weight kept (%lld slots)\n",
                              100.0 * (double) rm.swaps / (double) rm.slots, 100.0 * rm.weight_kept, rm.slots);
 #if defined(DS41_HAVE_DSPARK)
             if (rq_pass > 0)
+                if (dsp) dsp->write_counts();
                 std::fprintf(stderr, "serve: DSpark %ld passes, %.2f tokens/pass (all requests %.2f)\n", rq_pass,
                              1.0 + (double) rq_acc / rq_pass, 1.0 + (double) sv_acc / std::max(1L, sv_pass));
 #endif
@@ -2105,9 +2175,10 @@ int main(int argc, char ** argv) {
                      seed_free, seed_gib, (long long) tier.resident(), seed_s);
     }
     const Ds41MoeStats pst = tier.stats();
-    std::fprintf(stderr, "\nprompt: %zu tokens in %.2f s = %.1f tok/s (experts %lld hit / %lld cpu / %lld pcie / %lld file)\n",
+    std::fprintf(stderr, "\nprompt: %zu tokens in %.2f s = %.1f tok/s (experts %lld hit / %lld cpu / %lld pcie / %lld file%s)\n",
                  prompt.size(), prompt_ms / 1000.0, 1000.0 * prompt.size() / prompt_ms, (long long) pst.hits,
-                 (long long) pst.cpu, (long long) pst.pcie, (long long) pst.file_tier);
+                 (long long) pst.cpu, (long long) pst.pcie, (long long) pst.file_tier,
+                 pst.skipped > 0 ? (", skipped " + std::to_string(pst.skipped)).c_str() : "");
     std::fprintf(stderr, "prompt split: dense %.1f s, experts %.1f s (file wait %.1f s), logits %.1f s\n", fd_dense / 1000.0,
                  fd_tier / 1000.0, pst.file_ms / 1000.0, fd_logits / 1000.0);
     if (a.ppl) {
@@ -2298,8 +2369,8 @@ int main(int argc, char ** argv) {
         std::fprintf(stderr, "file-pred: %lld file-tier routes", fp_miss[0]);
         for (int k = 1; k <= kFP; ++k)
             std::fprintf(stderr, " | k=%d: %lld scored, in top4 %.1f%% top8 %.1f%% top16 %.1f%%", k, fp_miss[k],
-                         100.0 * fp_hit[k][0] / std::max(1LL, fp_miss[k]), 100.0 * fp_hit[k][1] / std::max(1LL, fp_miss[k]),
-                         100.0 * fp_hit[k][2] / std::max(1LL, fp_miss[k]));
+                         100.0 * qfp_hit[k][0] / std::max(1LL, fp_miss[k]), 100.0 * qfp_hit[k][1] / std::max(1LL, fp_miss[k]),
+                         100.0 * qfp_hit[k][2] / std::max(1LL, fp_miss[k]));
         std::fprintf(stderr, "\nfile-pred candidates (file-tier experts in the top 4/8/16, all layers):");
         for (int k = 1; k <= kFP; ++k)
             std::fprintf(stderr, " k=%d %lld/%lld/%lld", k, fp_cand[k][0], fp_cand[k][1], fp_cand[k][2]);

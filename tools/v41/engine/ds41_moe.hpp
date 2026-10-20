@@ -491,6 +491,8 @@ public:
     bool resident(int64_t layer, int64_t expert) const;
     /// Whether `expert` of `layer` is in the host arena (false in CPU-only mode and for the file tier).
     bool in_arena(int64_t layer, int64_t expert) const;
+    /// Whether a peer card's store holds `expert` of `layer` (false without peers).
+    bool on_peer(int64_t layer, int64_t expert) const;
     /// `nt` (1..4) tokens of one layer at once - draft verification: `ids`/`w` are nt*top_k (token-major), `x` and
     /// `out` nt*n_embd.  Each distinct expert is read/fetched once and applied to every token that routed to it.
     bool run_multi(int64_t layer, int nt, const int32_t* ids, const float* w, const float* x, float* out);

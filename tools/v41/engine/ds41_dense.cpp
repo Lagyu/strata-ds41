@@ -1449,7 +1449,9 @@ bool Ds41Dense::Impl::upload_inputs(const int * tids, int n, int pos0) {
             if (!img.empty() && img[(size_t) t] > 0.0f) im.engram.set_dead(pos0 + t);   // an image span: n-grams never span it
             else im.engram.set_token(pos0 + t, tids[t]);
         }
-        if (n <= 64) {   // decode / verify: the rows are needed at layer 1 - read them now (synchronously)
+        static const bool eng_sync = std::getenv("STRATA_ENG_SYNC") && std::getenv("STRATA_ENG_SYNC")[0] == '1';
+        if (n <= 64 && eng_sync) {   // STRATA_ENG_SYNC=1: the old way - decode / verify rows read now, synchronously
+                                     // (default: started here, waited at the first Engram layer like a batch: 2.3 ms a pass hidden)
             static const bool eprof = std::getenv("STRATA_ENG_PROF") != nullptr;
             static double eng_ms = 0; static long eng_n = 0;
             const auto te = std::chrono::steady_clock::now();

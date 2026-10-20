@@ -49,6 +49,7 @@ public:
     /// Forget the window (a new conversation / a rewind past it).
     void reset();
     double last_ms() const;             ///< wall time of the last step's graph
+    void write_counts() const;          ///< STRATA_DSPARK_COUNT: write the routed-expert counts now (also at exit)
     size_t weight_bytes() const;        ///< device bytes of the stack's weights
     const std::string & last_error() const;
 private:

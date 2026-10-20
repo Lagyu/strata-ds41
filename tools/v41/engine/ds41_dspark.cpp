@@ -59,13 +59,16 @@ struct Ds41DSpark::Impl {
     std::pair<int, bool> last_key { -1, false };   ///< the graph ga was last planned for
     double ms = 0;
 
-    ~Impl() {
+    void flush_counts() const {   // the serve loop writes after every request too: a SIGTERM'd server runs no destructor
         if (const char * cf = std::getenv("STRATA_DSPARK_COUNT"); cf && !counts.empty()) {
             if (FILE * f = std::fopen(cf, "w")) {
                 for (auto & r : counts) { for (size_t i = 0; i < r.size(); ++i) std::fprintf(f, "%s%lld", i ? " " : "", (long long) r[i]); std::fputc('\n', f); }
                 std::fclose(f);
             }
         }
+    }
+    ~Impl() {
+        flush_counts();
         for (auto & kv : graphs) ggml_free(kv.second.c);
         if (ga) ggml_gallocr_free(ga);
         if (sbuf) ggml_backend_buffer_free(sbuf);
@@ -87,6 +90,7 @@ Ds41DSpark::Ds41DSpark() : p_(new Impl) {}
 Ds41DSpark::~Ds41DSpark() = default;
 int64_t Ds41DSpark::main_dim() const { return 3 * p_->D; }
 double Ds41DSpark::last_ms() const { return p_->ms; }
+void Ds41DSpark::write_counts() const { p_->flush_counts(); }
 size_t Ds41DSpark::weight_bytes() const { return p_->wbytes; }
 const std::string & Ds41DSpark::last_error() const { return p_->err; }
 
