@@ -1418,7 +1418,7 @@ index 6b36b8f..ae3bf82 100644
              GGML_ABORT("%s: unsupported src0 type: %s\n", __func__, ggml_type_name(src0_type));
              break;
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index a9038f1..d03abc2 100644
+index a9038f1..d6d4528 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -61,6 +61,7 @@
@@ -1429,7 +1429,20 @@ index a9038f1..d03abc2 100644
  #include "ggml-cuda/set.cuh"
  #include "ggml-cuda/set-rows.cuh"
  #include "ggml-cuda/pad_reflect_1d.cuh"
-@@ -2391,6 +2392,15 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
+@@ -1808,8 +1809,10 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
+     if (cc <= GGML_CUDA_CC_PASCAL) {
+         return false;
+     }
+-    //we only support fusion for ncols_dst = 1
+-    if (tensor->op == GGML_OP_MUL_MAT && dst->ne[1] != 1) {
++    // Strata-DS4.1: a MUL_MAT fuses up to MMVQ_MAX_BATCH_SIZE columns (the vector kernel's limit; DeepSeek-V4.1's
++    // 2-8-row verify passes); GGML_CUDA_MMVQ_FUSE_COLS=1 = the upstream rule (1 column)
++    static const int fuse_cols = getenv("GGML_CUDA_MMVQ_FUSE_COLS") ? atoi(getenv("GGML_CUDA_MMVQ_FUSE_COLS")) : MMVQ_MAX_BATCH_SIZE;
++    if (tensor->op == GGML_OP_MUL_MAT && dst->ne[1] > fuse_cols) {
+         return false;
+     }
+ 
+@@ -2391,6 +2394,15 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
          case GGML_OP_DSV4_HC_POST:
              ggml_cuda_op_dsv4_hc_post(ctx, dst);
              break;
@@ -1445,7 +1458,7 @@ index a9038f1..d03abc2 100644
          case GGML_OP_RWKV_WKV7:
              ggml_cuda_op_rwkv_wkv7(ctx, dst);
              break;
-@@ -2560,6 +2570,12 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
+@@ -2560,6 +2572,12 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
      bool use_cuda_graph = true;
      // Loop over nodes in GGML graph to obtain info needed for CUDA graph
  
@@ -1458,7 +1471,7 @@ index a9038f1..d03abc2 100644
      for (int i = 0; i < cgraph->n_nodes; i++) {
          ggml_tensor * node = cgraph->nodes[i];
  
-@@ -2567,6 +2583,12 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
+@@ -2567,6 +2585,12 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
              continue;
          }
  
@@ -1471,7 +1484,7 @@ index a9038f1..d03abc2 100644
          // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
          if (node->op == GGML_OP_MUL_MAT_ID) {
              const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
-@@ -2740,9 +2762,10 @@ static bool ggml_cuda_should_fuse_rms_norm_mul_rope(const ggml_tensor * rms_norm
+@@ -2740,9 +2764,10 @@ static bool ggml_cuda_should_fuse_rms_norm_mul_rope(const ggml_tensor * rms_norm
          return false;
      }
  
@@ -1484,7 +1497,7 @@ index a9038f1..d03abc2 100644
          return false;
      }
  
-@@ -5209,6 +5232,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+@@ -5209,6 +5234,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                          return true;
                      case GGML_TYPE_IQ4_NL:
                      case GGML_TYPE_MXFP4:
@@ -1492,7 +1505,7 @@ index a9038f1..d03abc2 100644
                          // 32-value sub-blocks, the row size does not guarantee
                          // the QK_K super-blocks the get_rows kernel iterates on
                          return op->src[0]->ne[0] % QK_K == 0;
-@@ -5226,7 +5250,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+@@ -5226,7 +5252,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                             (
                                 (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_BF16 ||
                                 op->type == GGML_TYPE_Q4_0 || op->type == GGML_TYPE_Q4_1 || op->type == GGML_TYPE_Q5_0 ||
@@ -1502,7 +1515,7 @@ index a9038f1..d03abc2 100644
                                 op->src[0]->type == GGML_TYPE_F32
                             ) || (
                                 op->type == GGML_TYPE_F16 && op->src[0]->type == GGML_TYPE_F16
-@@ -5499,6 +5524,13 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+@@ -5499,6 +5526,13 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
              return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
                  op->src[2]->type == GGML_TYPE_F32 && (op->src[3] == nullptr || op->src[3]->type == GGML_TYPE_F32) &&
                  op->type == GGML_TYPE_F32;
@@ -1824,6 +1837,48 @@ index bd5c5d4..fcb05ff 100644
                      }
                      if (GGML_CUDA_CC_IS_RDNA4(cc)) {
                          return ne11 <= 5;
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+index 6305230..1976c03 100644
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -1003,19 +1003,17 @@ static void mul_mat_vec_q_switch_fusion(
+ 
+     const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr ||
+                             fusion.x_scale != nullptr || fusion.gate_scale != nullptr;
+-    if constexpr (c_ncols_dst == 1) {
+-        if (has_fusion) {
+-            const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
+-            ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, true, small_k, halve_iters>, launch_params,
+-                 vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
+-                 channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
+-                 sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
+-            return;
+-        }
++    // Strata-DS4.1: the gate / up fusion for every ncols_dst (the dispatcher allows up to MMVQ_MAX_BATCH_SIZE columns
++    // for a MUL_MAT): the same partial sums as the two separate products, the GLU in the epilogue
++    if (has_fusion) {
++        const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
++        ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, true, small_k, halve_iters>, launch_params,
++             vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
++             channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
++             sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
++        return;
+     }
+ 
+-    GGML_ASSERT(!has_fusion && "fusion only supported for ncols_dst=1");
+-
+     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
+     ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, false, small_k, halve_iters>, launch_params,
+         vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
+@@ -1433,7 +1431,7 @@ void ggml_cuda_mul_mat_vec_q(
+     if (fusion) {
+         const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+         GGML_ASSERT( !ids || dst->ne[2] <= get_mmvq_mmid_max_batch(src0->type, cc));
+-        GGML_ASSERT(  ids || dst->ne[1] == 1);
++        GGML_ASSERT(  ids || dst->ne[1] <= MMVQ_MAX_BATCH_SIZE);   // Strata-DS4.1: the gate / up fusion for 1..8 columns
+         // Scale fusion is only allowed for NVFP4 currently as the cost of checking this at run-time in the prologue is
+         // non-negligible for some models such as gpt-oss-20b
+         GGML_ASSERT((fusion->x_scale == nullptr && fusion->gate_scale == nullptr) || src0->type == GGML_TYPE_NVFP4);
 diff --git a/ggml/src/ggml-cuda/rope.cu b/ggml/src/ggml-cuda/rope.cu
 index e546fb6..458e0ed 100644
 --- a/ggml/src/ggml-cuda/rope.cu

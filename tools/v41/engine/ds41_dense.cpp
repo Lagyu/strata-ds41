@@ -572,12 +572,19 @@ static Ds41Dense::Impl::GSlot & pass_graph_slot(Ds41Dense::Impl & im, const Ds41
 // FFN mixes into the state, the FFN hc_pre + ffn_norm), 16 finish, 32 the clamped SwiGLU (ggml_swiglu_clamp), 64 the
 // prediction graphs.  Every sub-op is bit-identical to the composite it replaces (ds41_generate --dense-bench rows
 // compared with cmp); the sub-op ids / contracts are the .cu's.
-enum { FZ_PRE = 1, FZ_ATTN = 2, FZ_ROUTER = 4, FZ_HC = 8, FZ_FINISH = 16, FZ_SWIGLU = 32, FZ_PREDICT = 64, FZ_ALL = 127 };
+// 128 skip the ggml_cont of an already contiguous tensor (a memcpy: the same bits), 256 compute a result straight into
+// its state view instead of copying it there (alias_into), 512 build the window-K / indexer-key rms_norm + mul + rope on
+// the 3-D tensor so ggml-cuda fuses the three (its fused kernel, with the rope offset), 1024 finish + the next layer's
+// prediction in ONE graph for multi-row passes (finish_predict_multi).
+enum { FZ_PRE = 1, FZ_ATTN = 2, FZ_ROUTER = 4, FZ_HC = 8, FZ_FINISH = 16, FZ_SWIGLU = 32, FZ_PREDICT = 64, FZ_NOCONT = 128,
+       FZ_ALIAS = 256, FZ_KVROPE = 512, FZ_FPRED = 1024, FZ_ALL = 2047 };
+static int g_fz = 0;   // the mask once a graph builder asked for it (fz_mask): cont_if / alias_into read bits 128 / 256
 enum ds41f_sub_op { DS41F_HC_PRE_NORM = 1, DS41F_ATTN_K = 3, DS41F_ATTN_MASK = 4, DS41F_ROUTER = 5, DS41F_HC_TAIL = 7,
                     DS41F_FFN_MIX = 8, DS41F_HC_PRE_NORM_MIX = 9, DS41F_FINISH = 10 };
 static int fz_mask(const Ds41Dense::Impl & im) {
     static const int m = std::getenv("STRATA_DENSE_FUSED") ? std::atoi(std::getenv("STRATA_DENSE_FUSED")) : FZ_ALL;
-    return im.cpu ? 0 : m;
+    g_fz = im.cpu ? 0 : m;
+    return g_fz;
 }
 static int32_t fbits(float f) { int32_t i; std::memcpy(&i, &f, 4); return i; }
 // rms_norm(hc_pre(x [D, HC, n], pre [HC, n])) * w  (DS41F_HC_PRE_NORM), into `into` (a state view) when given
@@ -614,7 +621,8 @@ static ggml_tensor * fz_router(ggml_context * gc, const Ds41Dense::Impl & im, gg
 // becomes a view of dst's storage, as ggml's in-place ops are, so the allocator gives it no memory of its own.  Only
 // for a freshly computed, contiguous result of dst's type and size; anything else keeps the copy.
 static bool alias_into(ggml_tensor * t, ggml_tensor * dst) {
-    static const bool on = std::getenv("STRATA_DENSE_ALIAS") && std::getenv("STRATA_DENSE_ALIAS")[0] == '1';
+    static const bool env = std::getenv("STRATA_DENSE_ALIAS") && std::getenv("STRATA_DENSE_ALIAS")[0] == '1';
+    const bool on = env || (g_fz & 256);
     if (!on || t->view_src || t->op == GGML_OP_NONE || t->op == GGML_OP_VIEW || t->op == GGML_OP_RESHAPE) return false;
     if (t->type != dst->type || ggml_nelements(t) != ggml_nelements(dst)) return false;
     if (!ggml_is_contiguous(t) || !ggml_is_contiguous(dst)) return false;
@@ -624,7 +632,8 @@ static bool alias_into(ggml_tensor * t, ggml_tensor * dst) {
 }
 
 static ggml_tensor * cont_if(ggml_context * gc, ggml_tensor * x) {
-    static const bool skip = std::getenv("STRATA_DENSE_NOCONT") && std::getenv("STRATA_DENSE_NOCONT")[0] == '1';
+    static const bool env = std::getenv("STRATA_DENSE_NOCONT") && std::getenv("STRATA_DENSE_NOCONT")[0] == '1';
+    const bool skip = env || (g_fz & 128);
     return (skip && ggml_is_contiguous(x)) ? x : ggml_cont(gc, x);
 }
 
@@ -693,8 +702,13 @@ static ggml_cgraph * build_attn(Ds41Dense::Impl & im, ggml_context * gc, int il,
     q = b.rope(q, pos, r);
 
     // ---- window K (= V): [ring | this pass's rows] -> each query's SWA rows; the ring keeps the last RAW
-    ggml_tensor * kv = b.rms_w(ggml_mul_mat(gc, im.BL(il, "attn_kv.weight"), xn), im.BL(il, "attn_kv_a_norm.weight"));
-    kv = b.rope(ggml_reshape_3d(gc, kv, DH, 1, n), pos, r);
+    ggml_tensor * kv = nullptr;
+    if (fz & FZ_KVROPE) {   // rms_norm + mul + rope on the 3-D tensor: ggml-cuda fuses the three into one kernel
+        kv = b.rope(b.rms_w(ggml_reshape_3d(gc, ggml_mul_mat(gc, im.BL(il, "attn_kv.weight"), xn), DH, 1, n), im.BL(il, "attn_kv_a_norm.weight")), pos, r);
+    } else {
+        kv = b.rms_w(ggml_mul_mat(gc, im.BL(il, "attn_kv.weight"), xn), im.BL(il, "attn_kv_a_norm.weight"));
+        kv = b.rope(ggml_reshape_3d(gc, kv, DH, 1, n), pos, r);
+    }
     ggml_tensor * kv2 = ggml_reshape_2d(gc, kv, DH, n);
     if (im.cfg.act_quant) kv2 = fake_quant(gc, cont_if(gc, kv2), Ds41Quant::FP8_POW2_32);   // model.py _window_kv
     const bool fz_attn = (fz & FZ_ATTN) != 0;
@@ -743,8 +757,14 @@ static ggml_cgraph * build_attn(Ds41Dense::Impl & im, ggml_context * gc, int il,
             ggml_tensor * cpos = b.v1(im.i_cpos[r], n, (size_t) col0 * 4);
             ggml_tensor * cslot = b.v1(im.i_cslot[r], n, (size_t) col0 * 4);
             // indexer keys from the UNROTATED latent (model.py Indexer.forward, owns_k)
-            ggml_tensor * ik = b.rms_w(ggml_mul_mat(gc, im.BL(il, "indexer.attn_k.weight"), latent), im.BL(il, "indexer.k_norm.weight"));
-            ik = ggml_reshape_2d(gc, b.rope(ggml_reshape_3d(gc, ik, im.ID, 1, n), cpos, r), im.ID, n);
+            ggml_tensor * ik = nullptr;
+            if (fz & FZ_KVROPE) {
+                ik = ggml_reshape_2d(gc, b.rope(b.rms_w(ggml_reshape_3d(gc, ggml_mul_mat(gc, im.BL(il, "indexer.attn_k.weight"), latent), im.ID, 1, n),
+                                                       im.BL(il, "indexer.k_norm.weight")), cpos, r), im.ID, n);
+            } else {
+                ik = b.rms_w(ggml_mul_mat(gc, im.BL(il, "indexer.attn_k.weight"), latent), im.BL(il, "indexer.k_norm.weight"));
+                ik = ggml_reshape_2d(gc, b.rope(ggml_reshape_3d(gc, ik, im.ID, 1, n), cpos, r), im.ID, n);
+            }
             if (im.cfg.act_quant) ik = fake_quant(gc, cont_if(gc, ik), Ds41Quant::FP4_POW2_32);
             idxk_w = ggml_set_rows(gc, L.idxk, ik, cslot);
             outs.push_back(idxk_w);
@@ -1122,8 +1142,46 @@ static ggml_cgraph * build_predict(Ds41Dense::Impl & im, ggml_context * gc, int 
     ggml_tensor * sc = ggml_add(gc, ggml_add(gc, ggml_sqrt(gc, ggml_softplus(gc, rl)), im.BL(il, "exp_probs_b.bias")),
                                 ggml_reshape_2d(gc, im.ly[(size_t) il].rbias, im.NE, 1));
     *out = ggml_argsort_top_k(gc, sc, 16);
+    if (n > 1) *out = ggml_cont(gc, *out);   // predict_multi reads 16 * n contiguous ids; the top-k is a view with rows NE apart
     ggml_set_output(*out);
     ggml_build_forward_expand(gf, *out);
+    return gf;
+}
+
+// finish + the next layer's prediction for an n-row pass in ONE graph (FZ_FPRED): the prediction reads the state the
+// finish writes (a dependency through the finish node), so the result is finish() then predict_multi(), with one
+// graph launch / sync fewer per layer.  Output: I32 [16, n] contiguous.
+static ggml_cgraph * build_finish_predict_multi(Ds41Dense::Impl & im, ggml_context * gc, int next_il, int64_t n, ggml_tensor ** pout) {
+    B b { &im, gc, &im.g };
+    ggml_cgraph * gf = ggml_new_graph_custom(gc, 128, false);
+    const int64_t D = im.D, HC = im.HC;
+    const int fz = fz_mask(im);
+    ggml_tensor * st = nullptr;
+    if (fz & FZ_FINISH) {
+        ggml_tensor * fs[5] = { b.cols2(im.shexp, D, n, 0), b.cols2(im.routed, D, n, 0), b.cols3(im.hap, D, HC, n, 0),
+                                b.cols2(im.post_f, HC, n, 0), b.cols3(im.comb_f, HC, HC, n, 0) };
+        st = ggml_ds41_fused_inplace(gc, DS41F_FINISH, fs, 5, b.cols3(im.x_state, D, HC, n, 0), nullptr, 0);
+    } else {
+        ggml_tensor * out = ggml_add(gc, b.cols2(im.shexp, D, n, 0), b.cols2(im.routed, D, n, 0));
+        ggml_tensor * x = ggml_dsv4_hc_post(gc, out, b.cols3(im.hap, D, HC, n, 0), b.cols2(im.post_f, HC, n, 0), b.cols3(im.comb_f, HC, HC, n, 0));
+        st = ggml_cpy(gc, x, b.cols3(im.x_state, D, HC, n, 0));
+    }
+    ggml_build_forward_expand(gf, st);
+    if (fz & FZ_PREDICT) {
+        ggml_tensor * xn = fz_hc_pre_norm(gc, im, st, b.cols2(im.pre_state, HC, n), im.BL(next_il, "ffn_norm.weight"), n);
+        ggml_tensor * rl = ggml_mul_mat(gc, im.BLpred(next_il), xn);
+        ggml_mul_mat_set_prec(rl, GGML_PREC_F32);
+        *pout = fz_router(gc, im, rl, im.BL(next_il, "exp_probs_b.bias"), im.ly[(size_t) next_il].rbias, 16, nullptr, nullptr, n);
+    } else {
+        ggml_tensor * xp = ggml_dsv4_hc_pre(gc, st, b.cols2(im.pre_state, HC, n));
+        ggml_tensor * rl = ggml_mul_mat(gc, im.BLpred(next_il), b.rms_w(xp, im.BL(next_il, "ffn_norm.weight")));
+        ggml_mul_mat_set_prec(rl, GGML_PREC_F32);
+        ggml_tensor * sc = ggml_add(gc, ggml_add(gc, ggml_sqrt(gc, ggml_softplus(gc, rl)), im.BL(next_il, "exp_probs_b.bias")),
+                                    ggml_reshape_2d(gc, im.ly[(size_t) next_il].rbias, im.NE, 1));
+        *pout = ggml_cont(gc, ggml_argsort_top_k(gc, sc, 16));
+    }
+    ggml_set_output(*pout);
+    ggml_build_forward_expand(gf, *pout);
     return gf;
 }
 
@@ -2074,6 +2132,18 @@ bool Ds41Dense::finish_predict(int il, const float * routed_sum, int next_il, in
     int32_t buf[16];
     ggml_backend_tensor_get(im.fpredict_out[next_il], buf, 0, sizeof(buf));
     for (int i = 0; i < n_top; ++i) top_ids[i] = buf[i];
+    return true;
+}
+
+bool Ds41Dense::finish_predict_multi(int il, int next_il, int * top_ids) {
+    Impl & im = *p_;
+    (void) il;
+    const int64_t n = im.n;
+    if (n < 1 || next_il < 0 || next_il >= (int) im.ly.size() || !(fz_mask(im) & FZ_FPRED) || !pass_graph_cache_on()) return false;
+    Impl::GSlot & s = pass_graph_slot(im, Impl::GKey { next_il, 7, 0, n });
+    if (!s.gf) s.gf = build_finish_predict_multi(im, s.ctx, next_il, n, &s.out);
+    if (!im.compute(s.gf, true)) return false;
+    ggml_backend_tensor_get(s.out, top_ids, 0, sizeof(int32_t) * 16 * (size_t) n);
     return true;
 }
 

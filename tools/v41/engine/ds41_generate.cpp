@@ -951,10 +951,11 @@ int main(int argc, char ** argv) {
         constexpr int kD3PfRows = 8;
         static_assert(kD3PfRows <= Ds41MoeTier::kMaxMulti, "the prefetch is consumed by ONE tier call per layer");
         const bool pf_now = rdev1 && !no_tier_batch && d3_pf > 0 && m <= kD3PfRows && !tier_skip;
+        bool have_pred = false;   // this layer's prediction came with the previous layer's finish (finish_predict_multi)
         for (int l = 0; l < n_layer; ++l) {
             if (pf_now) {
                 pv_pred.resize((size_t) m * 16);
-                if (dense.predict_multi(l, pv_pred.data())) {
+                if (have_pred || dense.predict_multi(l, pv_pred.data())) {
                     pv_score.clear();
                     for (int t = 0; t < m; ++t)
                         for (int i = 0; i < 16; ++i) {
@@ -1078,7 +1079,11 @@ int main(int argc, char ** argv) {
             }
             lap(1);
             tqd = tq;
-            if (!dense.finish(l, rdev1 ? nullptr : crouted_m.data())) { ferr = dense.last_error(); return false; }
+            // finish + the next layer's prediction in one graph when the prefetch wants the prediction (FZ_FPRED)
+            have_pred = false;
+            if (pf_now && rdev1 && l + 1 < n_layer && dense.finish_predict_multi(l, l + 1, pv_pred.data())) {
+                have_pred = true;
+            } else if (!dense.finish(l, rdev1 ? nullptr : crouted_m.data())) { ferr = dense.last_error(); return false; }
             lap(0);
             lapd(3);
             for (int j = 0; j < 3; ++j) {

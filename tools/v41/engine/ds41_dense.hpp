@@ -158,6 +158,11 @@ public:
     /// layer reads the state finish just wrote, so the result is identical to finish() then predict(), with one graph
     /// launch / sync / readback less per layer.  top_ids gets the next layer's top n_top (<= 16) predicted experts.
     bool finish_predict(int il, const float * routed_sum, int next_il, int * top_ids, int n_top);
+    /// Multi-row (and single-row) passes: finish(il) and predict_multi(next_il) in ONE cached graph - the same values
+    /// as the two calls (the prediction reads the state the finish writes), one graph launch / sync fewer per layer.
+    /// top_ids: 16 * n ids (token-major).  False (nothing done) when the merged graph is disabled (STRATA_DENSE_FUSED
+    /// bit 1024 off, DS41_PASS_GRAPH_CACHE=0): the caller then runs finish() and predict_multi() as before.
+    bool finish_predict_multi(int il, int next_il, int * top_ids);
     /// finish_predict + the routing predictions of the `ahead` layers after next_il, from the same state, in the same
     /// graph: ahead_ids[a * 16 ..] = layer next_il + 1 + a's top 16 (-1 past the last layer).  For speculative
     /// file-tier reads; a hint only.
