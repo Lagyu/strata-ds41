@@ -23,6 +23,14 @@ if [ -s "$C" ]; then
   grep -E "^DSpark: .*GB of weights|^VRAM: " local/serve-engine.log | tail -2 | cut -c1-160
 fi
 (cd /home/yuya/ds41 && python3 table.py S-old S-eng S-fgpipe S-fgpipe-r8 S-cap8 S-cap4 S-cap16 S-cap32 S-pf2 S-pf3 S-pf4 S-pf2b S-count S-keep96 S-keep128)
+# the skip rule between 0.10 (KL 0.059, +12%) and 0.15 (KL 0.131, +40%): speed, then its held-out score
+local/sweep.sh S-skip12 "$B" --skip-file=0.12
+local/sweep.sh S-skip10b "$B" --skip-file=0.10
+(cd /home/yuya/ds41 && python3 table.py S-cap8 S-skip10 S-skip10b S-skip12 S-skip15)
+sudo systemctl stop strata-ds41.service
+sleep 20
+local/eval-lucebox/run-eval-3gpu.sh skip12 -- --skip-file 0.12
+echo "eval skip12: $(cat local/eval-lucebox/skip12/score.json)"
 echo "$B" > local/active-config
-sudo systemctl restart strata-ds41.service
+sudo systemctl start strata-ds41.service
 echo "$(date +%T) chain-s18 done"
