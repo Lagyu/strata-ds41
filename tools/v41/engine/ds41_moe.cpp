@@ -4953,10 +4953,12 @@ bool gpu_run_chunk(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, co
     // processing order: VRAM-resident experts, then arena (DMA straight away), then file tier (read in the background
     // from the start of the call, so the arena DMAs and the reads overlap); entries are laid out in this order, so
     // consecutive experts of one class are adjacent in the sorted entry arrays (one launch per run)
-    // STRATA_PEER_CHUNK=1: a peer card computes the entries of the experts its store holds (order[3]), from the same
-    // q8_1 activations and with the resident experts' grouped kernel; the primary streams only the rest.  With the
-    // stores filled from the file tier (STRATA_PEER_FILL=file) that is what a long prompt's NVMe stream shrinks by.
-    static const bool chunk_peer = std::getenv("STRATA_PEER_CHUNK") && std::getenv("STRATA_PEER_CHUNK")[0] == '1';
+    // The peer cards compute the entries of the experts their stores hold (order[3]), from the same q8_1 activations
+    // and with the resident experts' grouped kernel; the primary streams only the rest.  With the stores filled from
+    // the file tier (STRATA_PEER_FILL=file) that is what a long prompt's NVMe stream shrinks by: measured on the
+    // 3-card box (R9700 28 GiB + XTX 20 GiB stores), a 4146-token prompt's expert phase 41.3 -> 22.2 s, 8443 -> 5924
+    // file-tier blobs, 81 -> 140 tok/s.  STRATA_PEER_CHUNK=0 keeps every peer-held expert on the primary's stream.
+    static const bool chunk_peer = !(std::getenv("STRATA_PEER_CHUNK") && std::getenv("STRATA_PEER_CHUNK")[0] == '0');
     const bool peers_on = chunk_peer && gp.peers_built();
     std::vector<int32_t> order[4];
     std::vector<int32_t> slot_e((size_t) NX, -1);
