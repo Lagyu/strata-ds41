@@ -5,8 +5,8 @@
 # +182, +512 tails) on the default config and with the arena adapting.
 cd /home/yuya/llm-src/strata-ds41
 B=local/ds41-yuya-3gpu.json
-# the Q8 variant again (its first bench start found the previous engine's VRAM still held)
-local/sweep.sh U-q8b local/ds41-unsloth-q8.json
+# the Q8 variant again with a 4096-token prompt batch (its F16 dense half leaves too little VRAM for the 8192 one: the 4K prompt got 400)
+local/sweep.sh U-q8b local/ds41-unsloth-q8.json --prompt-batch=4096
 grep -E "^VRAM: |^tier: " local/serve-engine.log | tail -2 | cut -c1-160
 local/sweep.sh U-rebal "$B" STRATA_ARENA_REBAL=1
 grep -E "rebal|swap" local/serve-engine.log | tail -3 | cut -c1-200
