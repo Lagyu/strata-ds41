@@ -186,6 +186,8 @@ struct Args {
     int  kv_type = -1;            // --kv-q8 / --kv-type N: the compressed KV + indexer keys' ggml type (-1 = BF16 with act_quant, else F32)
     int  enc_skip = -1;           // -1 = default (on for one-shot layer-major runs), 1 = --enc-skip, 0 = --no-enc-skip; only run the tokens before the replay window through layers 21-39
     int  enc_replay = 2560;       // --enc-replay N: the replay window (window_size * (n_layer - cand_layer) = 128*20)
+    bool enc_bounded = false;     // --enc-bounded: accept --enc-replay below the exact reach, the decoder window clipped at the
+                                  // replay start (DeepInfer's SWA bounded replay, its V4.1 default is 140 = 128 + 12); approximate
     float skip_miss = 0.0f, skip_file = 0.0f;
     double chunk_prefetch_gib = 0.0;
     int image_token = 129264;     // --image-token N: the model's <|image|> id (each image is one run of it in the prompt)
@@ -332,6 +334,7 @@ bool parse(int argc, char ** argv, Args & a) {
         else if (k == "--dump-logits") a.dump_logits = next();
         else if (k == "--dump-last") a.dump_last = next();
         else if (k == "--enc-skip") a.enc_skip = 1;
+        else if (k == "--enc-bounded") a.enc_bounded = true;
         else if (k == "--no-enc-skip") a.enc_skip = 0;
         else if (k == "--enc-replay") a.enc_replay = std::atoi(next().c_str());
         else if (k == "--image-token") a.image_token = std::atoi(next().c_str());
@@ -571,7 +574,13 @@ int main(int argc, char ** argv) {
     for (int64_t s : G.kv_sources) CL = std::max<int>(CL, (int) s);
     // exactness needs every later layer's window reach to stay inside the replay: reach = swa * (n_layer - CL)
     const int64_t reach = (int64_t) G.n_swa * (int64_t) (n_layer - CL);
-    if (enc_skip && ER < reach) {
+    const bool enc_bounded = enc_skip && a.enc_bounded && ER < reach;
+    if (enc_bounded) {   // DeepInfer's decoder SWA bounded replay: the window + the longest speculative backtrack
+        const int64_t least = G.n_swa + 12;
+        if (ER < least) { std::fprintf(stderr, "note: --enc-replay %lld < swa + 12; raised to %lld\n", (long long) ER, (long long) least); ER = least; }
+        std::fprintf(stderr, "enc-skip: BOUNDED replay of %lld tokens (exact reach %lld): the decoder layers' window is clipped at the"
+                     " replay start - approximate, DeepInfer's production scheme\n", (long long) ER, (long long) reach);
+    } else if (enc_skip && ER < reach) {
         std::fprintf(stderr, "note: --enc-replay %lld < the window reach %lld (swa %lld x %d layers past %d); raised\n",
                      (long long) ER, (long long) reach, (long long) G.n_swa, n_layer - CL, CL);
         ER = reach;
@@ -1218,6 +1227,12 @@ int main(int argc, char ** argv) {
                             B = std::max(SB, B / 2);
                             continue;
                         } else { ferr = dense.last_error(); return false; }
+                    }
+                    if (enc_bounded) {   // the replay start of THIS batch (the cut below, rounded to a sub-batch): the decoder masks
+                        const int64_t gpos = (int64_t) pos0 + c0, ta = (int64_t) pos0 + n - ER - gpos;
+                        int cb = ta <= 0 ? 0 : ta >= B ? B : (int) ta;
+                        cb = (cb / SB) * SB;
+                        dense.set_bounded_replay(CL, cb > 0 ? gpos + cb : -1);
                     }
                     if (dense.begin_batch(ids + c0, B, pos0 + c0)) break;
                     if (B > SB) {

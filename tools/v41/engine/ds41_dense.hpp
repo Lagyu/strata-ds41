@@ -105,6 +105,11 @@ public:
     /// `enc_replay` tokens are all that matters).  Writes no host ids/wts/fn, so batch_ids()/batch_wts()/batch_fn()
     /// are left untouched at these columns.
     bool attn_router_span_kv(int il, int col0, int n);
+    /// Bounded replay (DeepInfer's SWA bounded replay, --enc-bounded): the batch's rows from global position `from_pos`
+    /// on run every layer, the rows before it the encoder half only; the decoder layers (above `cut_layer`) then attend
+    /// their window only to positions >= from_pos (the earlier ones never ran those layers).  from_pos < 0 = off.  Set
+    /// before begin_batch (the masks are built there).  Approximate: the exact reach is SWA x the decoder layers.
+    void set_bounded_replay(int cut_layer, int64_t from_pos);
     /// The batch's host buffers filled by attn_router_span: ids / wts are n_used * B (token-major), fn is n_embd * B.
     const int32_t * batch_ids() const;
     const float * batch_wts() const;

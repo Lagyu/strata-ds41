@@ -196,6 +196,9 @@ struct Ds41Dense::Impl {
     ggml_tensor * i_pos = nullptr;        // I32 [NC]
     ggml_tensor * i_widx = nullptr;       // I32 [SWA * NC]   per query: rows of [ring | pass rows]
     ggml_tensor * i_wmask = nullptr;      // F32 [SWA, NC]
+    ggml_tensor * i_wmask_dec = nullptr;  // F32 [SWA, NC]  the same mask clipped at bounded_from (decoder layers, bounded replay)
+    int64_t bounded_from = -1;            // set_bounded_replay: the first replayed position (-1 = off)
+    int bounded_cut = -1;                 // ... and the last encoder layer: layers above it read i_wmask_dec
     ggml_tensor * i_wslot = nullptr;      // I32 [min(NC, RAW)]  ring slots of the pass's last rows
     ggml_tensor * i_nvis[3] = {};         // F32 [NC]   visible compressed rows per query (ratio 1 / 2)
     ggml_tensor * i_cslot[3] = {};        // I32 [NC]   compressed row each token writes (spare if its group is open)
@@ -593,7 +596,7 @@ static ggml_cgraph * build_attn(Ds41Dense::Impl & im, ggml_context * gc, int il,
     if (im.cfg.act_quant) kv2 = fake_quant(gc, cont_if(gc, kv2), Ds41Quant::FP8_POW2_32);   // model.py _window_kv
     ggml_tensor * wsrc = ggml_concat(gc, L.raw->type == GGML_TYPE_F32 ? L.raw : ggml_cast(gc, L.raw, GGML_TYPE_F32), kv2, 1);     // [DH, RAW + n]
     ggml_tensor * Kw = ggml_reshape_3d(gc, ggml_get_rows(gc, wsrc, b.v1(im.i_widx, SWA * n, (size_t) col0 * SWA * 4)), DH, SWA, n);
-    ggml_tensor * Mw = b.cols2(im.i_wmask, SWA, n, col0);
+    ggml_tensor * Mw = b.cols2(im.bounded_from >= 0 && il > im.bounded_cut ? im.i_wmask_dec : im.i_wmask, SWA, n, col0);
     {
         const int64_t k = std::min<int64_t>(n, RAW);
         ggml_tensor * last = ggml_view_2d(gc, kv2, DH, k, kv2->nb[1], (size_t) (n - k) * kv2->nb[1]);
@@ -1023,6 +1026,7 @@ Ds41Dense::Ds41Dense() : p_(new Impl()) {}
 Ds41Dense::~Ds41Dense() = default;
 const Ds41Geometry & Ds41Dense::geom() const { return p_->g; }
 ggml_tensor * Ds41Dense::weight(const std::string & name) const { return p_->w.get(name); }
+void Ds41Dense::set_bounded_replay(int cut_layer, int64_t from_pos) { p_->bounded_cut = cut_layer; p_->bounded_from = from_pos; }
 int64_t Ds41Dense::n_layer() const { return p_->nl; }
 ggml_backend_t Ds41Dense::backend() const { return p_->backend; }
 const std::string & Ds41Dense::last_error() const { return p_->err; }
@@ -1075,6 +1079,7 @@ static bool alloc_cols(Ds41Dense::Impl & im, int64_t NC, std::string & err) {
     im.i_widx = ggml_new_tensor_1d(c, GGML_TYPE_I32, im.SWA * NC);
     im.span_memo_pos0 = -1;   // new tensors: nothing uploaded yet
     im.i_wmask = ggml_new_tensor_2d(c, GGML_TYPE_F32, im.SWA, NC);
+    im.i_wmask_dec = ggml_new_tensor_2d(c, GGML_TYPE_F32, im.SWA, NC);
     im.i_wslot = ggml_new_tensor_1d(c, GGML_TYPE_I32, std::min<int64_t>(NC, im.RAW));
     for (int r = 1; r <= 2; ++r) {
         im.i_nvis[r] = ggml_new_tensor_1d(c, GGML_TYPE_F32, NC);
@@ -1385,7 +1390,7 @@ bool Ds41Dense::Impl::upload_inputs(const int * tids, int n, int pos0) {
     ggml_backend_tensor_set(im.i_pos, pos.data(), 0, (size_t) n * 4);
     // window: per query the SWA positions [p - SWA + 1, p] as rows of [ring (RAW) | pass rows]
     std::vector<int32_t> widx((size_t) (SWA * n));
-    std::vector<float> wm((size_t) (SWA * n));
+    std::vector<float> wm((size_t) (SWA * n)), wmd((size_t) (SWA * n));
     for (int t = 0; t < n; ++t) {
         const int64_t p = pos0 + t;
         for (int64_t j = 0; j < SWA; ++j) {
@@ -1397,10 +1402,14 @@ bool Ds41Dense::Impl::upload_inputs(const int * tids, int n, int pos0) {
             else row = (int32_t) (q % RAW);
             widx[(size_t) (t * SWA + j)] = row;
             wm[(size_t) (t * SWA + j)] = m;
+            // bounded replay (DeepInfer's SWA bounded replay): a decoder layer's query at position p attends keys from
+            // max(s, p - SWA + 1) only - the positions before the replay start s never ran the decoder layers
+            wmd[(size_t) (t * SWA + j)] = (im.bounded_from >= 0 && q < im.bounded_from) ? NEG_INF : m;
         }
     }
     ggml_backend_tensor_set(im.i_widx, widx.data(), 0, widx.size() * 4);
     ggml_backend_tensor_set(im.i_wmask, wm.data(), 0, wm.size() * 4);
+    ggml_backend_tensor_set(im.i_wmask_dec, wmd.data(), 0, wmd.size() * 4);
     {
         const int64_t k = std::min<int64_t>(n, RAW);
         std::vector<int32_t> ws((size_t) k);
