@@ -8,7 +8,7 @@ cd "$(dirname "$0")/../.."
 TAG=$1; shift
 E=local/eval-lucebox; O=$E/$TAG; mkdir -p "$O"
 export LD_LIBRARY_PATH=/opt/rocm/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
-python3 -c "
+/home/yuya/llm-src/hfenv/bin/python -c "
 import numpy as np
 t = np.load('$E/heldout_8x1024.npy')
 for i, s in enumerate(t): s.astype(np.int32).tofile('$O/seq%d.i32' % i)"
@@ -22,5 +22,5 @@ for i in 0 1 2 3 4 5 6 7; do
     > "$O/seq$i.out" 2> "$O/seq$i.log"
   echo "seq $i: $(grep '^PPL' "$O/seq$i.out")"
 done
-python3 $E/score.py "$O" | tee "$O/score.json"
+/home/yuya/llm-src/hfenv/bin/python $E/score.py "$O" | tee "$O/score.json"
 rm -f "$O"/seq*.f32
