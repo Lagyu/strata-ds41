@@ -396,7 +396,15 @@ inline std::string ds41_check_tensors(const GgufModel & m, Ds41Geometry & G, con
             for (auto x : st.first) w += std::to_string(x) + " ";
             return n + ": shape [" + a + "] expected [" + w + "]";
         }
-        if (t->type != st.second) return n + ": type " + std::string(ggml_type_name(t->type)) + " expected " + ggml_type_name(st.second);
+        // The dense matrices may come at another precision than DwarfStar's (unsloth's UD-Q8_K_XL has them in BF16 /
+        // F16, its UD-Q4_K_XL the F16 ones in Q8_0): any type the dense graph multiplies by is accepted where Q8_0 or
+        // F16 was predicted; vectors, norms and the I32 maps must match.
+        auto dense_ok = [](uint32_t have, uint32_t want_t) {
+            if (have == want_t) return true;
+            if (want_t != ty::Q8_0 && want_t != ty::F16) return false;
+            return have == ty::Q8_0 || have == ty::F16 || have == 30 /* BF16 */ || have == ty::F32;
+        };
+        if (!dense_ok(t->type, st.second)) return n + ": type " + std::string(ggml_type_name(t->type)) + " expected " + ggml_type_name(st.second);
         if (!m.in_bounds(*t, s)) return n + ": out of bounds";
     }
     for (size_t s = 0; s < m.size(); ++s)
@@ -404,7 +412,8 @@ inline std::string ds41_check_tensors(const GgufModel & m, Ds41Geometry & G, con
             // A GGUF that carries its Engram tables inside (ds4's DeepSeek-V4.1-Flash-Q2 has blk.{1,14}.engram_embd,
             // 202.8 GB of I8) is accepted here: those tensors are not loaded, the engine reads the two tables
             // from the --engram safetensors, which hold the same native FP8 rows.
-            if (!want.count(t.name) && t.name.find(".engram_embd.") == std::string::npos)
+            if (!want.count(t.name) && t.name.find(".engram_embd.") == std::string::npos &&
+                t.name != "per_layer_token_embd.weight")   // unsloth's Engram shard: the same rows under llama.cpp's name
                 return "unexpected tensor " + t.name;
     return {};
 }
