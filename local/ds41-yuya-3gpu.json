@@ -1,5 +1,5 @@
 {
- "_comment": "Third configuration (the current default): the x16 XTX (HIP 0) primary; the R9700 (HIP 1, OCuLink x4) and the second XTX (HIP 2, chipset x4) as peer expert tiers whose stores take the FILE tier's head (STRATA_PEER_FILL=file: the experts neither the primary's VRAM nor the arena holds), 28 + 20 GiB; a 95 GiB arena; DSpark depth 1 (measured: 7.0/7.1/7.9/5.5 vs depth 2's 7.1/6.4/7.2/5.1 and depth 4's ~5.1/4.2/5.1/3.4; depth 3 and the speculative NVMe reads lose); the peers also compute their experts' rows in the prompt chunk (the default since 2026-10-20: 4K prefill 81 -> 140 tok/s). KV cache: --kv-fp4 (Xolotl's bit-exact packing of the model's own KV rounding): held-out ppl 8.621 / top-1 93.1% / KL 0.0449 against the FP8 teacher (8.56), the fork's --kv-q8 8.650 / 93.0% / 0.0450, same speed.",
+ "_comment": "Third configuration (the current default): the x16 XTX (HIP 0) primary; the R9700 (HIP 1, OCuLink x4) and the second XTX (HIP 2, chipset x4) as peer expert tiers whose stores take the FILE tier's head (STRATA_PEER_FILL=file: the experts neither the primary's VRAM nor the arena holds), 28 + 20 GiB; a 95 GiB arena; DSpark depth 1 (measured: 7.0/7.1/7.9/5.5 vs depth 2's 7.1/6.4/7.2/5.1 and depth 4's ~5.1/4.2/5.1/3.4; depth 3 and the speculative NVMe reads lose); the peers also compute their experts' rows in the prompt chunk (the default since 2026-10-20: 4K prefill 81 -> 140 tok/s). KV cache: --kv-fp4 (Xolotl's bit-exact packing of the model's own KV rounding): held-out ppl 8.621 / top-1 93.1% / KL 0.0449 against the FP8 teacher (8.56), the fork's --kv-q8 8.650 / 93.0% / 0.0450, same speed. STRATA_BLOB_TWIN: the Linux SSD's copy of the model file serves 0.22 of every file-tier blob's parts (measured 7.4/7.1/8.5/5.4 vs 7.1/6.8/8.0/5.2 without; 0.30 is worse).",
  "exe": "local/ds41-engine.sh",
  "args": [
   "-m",
@@ -42,7 +42,9 @@
   "STRATA_TEXT_LOG": "local/v41-text.log",
   "HIP_VISIBLE_DEVICES": "0,1,2",
   "STRATA_PEER_GIB": "28,20",
-  "STRATA_PEER_FILL": "file"
+  "STRATA_PEER_FILL": "file",
+  "STRATA_BLOB_TWIN": "/home/yuya/models/DeepSeek-V4.1-Flash-1017-Lucebox/DeepSeek-V4.1-Flash-1017-MXFP4-ABL.gguf",
+  "STRATA_BLOB_MIRROR_SHARE": "0.22"
  },
  "cwd": ".",
  "tokenizer": "/home/yuya/models/dsv41-1017-tokenizer",
