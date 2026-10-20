@@ -38,7 +38,15 @@ json.dump(cfg, open(out, "w"), indent=1)
 print("variant:", out, "<-", base, *kv)
 EOF
 echo "$OUT" > local/active-config
-sudo systemctl restart strata-ds41.service || exit 1
+# stop, wait until every card's VRAM is released (a start right after a stop found 8 GiB still held on the primary:
+# the dense weights' cudaMalloc failed), then start
+sudo systemctl stop strata-ds41.service
+for i in $(seq 1 30); do
+  busy=$(rocm-smi --showmemuse 2>/dev/null | grep "VRAM%" | awk -F': ' '{s+=$NF} END{print s+0}')
+  [ "$busy" = "0" ] && break
+  sleep 2
+done
+sudo systemctl start strata-ds41.service || exit 1
 sleep 5
 for i in $(seq 1 90); do
   code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8150/v1/models 2>/dev/null)

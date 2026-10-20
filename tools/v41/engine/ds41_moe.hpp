@@ -245,6 +245,9 @@ private:
     bool read_direct(uint64_t off, size_t n, uint8_t* dst, uint8_t* scratch, size_t scratch_bytes, int fd = -1) const;
     bool open_mirror(const char* path, std::string& err);
     int mfd_ = -1;                        ///< the mirror (O_DIRECT), -1 = none
+    /// STRATA_BLOB_TWIN=<the model file's copy on another drive>: the mirror's share of every blob's parts (read_part)
+    /// comes from it - no mirror file to build, the whole file tier split over the two drives' bandwidth.
+    int tfd_ = -1;
     std::vector<uint64_t> moff_;          ///< per (layer, expert): the blob's offset in the mirror, ~0 = not mirrored
     int64_t mirrored_ = 0;
     int mshare_ = 280;                    ///< per mille of a mirrored blob's parts read from the mirror

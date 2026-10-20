@@ -6481,6 +6481,7 @@ Ds41FileBlobs::~Ds41FileBlobs() {
     if (fd_ >= 0) ds41_sys::close(fd_);
     if (dfd_ >= 0) ds41_sys::close(dfd_);
     if (mfd_ >= 0) ds41_sys::close(mfd_);
+    if (tfd_ >= 0) ds41_sys::close(tfd_);
     for (uint8_t* p : ball_) ds41_sys::aligned_free(p);
 }
 
@@ -6584,6 +6585,19 @@ bool Ds41FileBlobs::open(std::string& err) {
     if (mp && mp[0] && part_direct_ && dfd_ >= 0) {
         std::string merr;
         if (!open_mirror(mp, merr)) std::fprintf(stderr, "blob mirror: NOT used (%s)\n", merr.c_str());
+    }
+    if (const char* tp = std::getenv("STRATA_BLOB_TWIN")) {   // the model file's copy on another drive
+        const int tfd = ds41_sys::open(tp, O_RDONLY | O_DIRECT);
+        ds41_sys::Stat ts{}, ss{};
+        if (tfd < 0 || ds41_sys::fstat(tfd, &ts) != 0 || ds41_sys::fstat(fd_, &ss) != 0 || ts.st_size != ss.st_size) {
+            std::fprintf(stderr, "blob twin: NOT used (%s: not readable O_DIRECT, or not the model file's size)\n", tp);
+            if (tfd >= 0) ds41_sys::close(tfd);
+        } else {
+            tfd_ = tfd;
+            const char* sh = std::getenv("STRATA_BLOB_MIRROR_SHARE");
+            if (sh && sh[0]) mshare_ = std::max(0, std::min(1000, (int) std::lround(std::atof(sh) * 1000.0)));
+            std::fprintf(stderr, "blob twin: %s - share %.3f of every blob's parts\n", tp, mshare_ / 1000.0);
+        }
     }
     return true;
 }
@@ -6867,6 +6881,20 @@ void Ds41FileBlobs::read_part(int64_t layer, int64_t expert, int part, int npart
                 give_bounce(bb);
                 return;
             }
+        }
+    }
+    // the twin's share of the parts (STRATA_BLOB_TWIN): the same spans, from the copy on the other drive
+    if (tfd_ >= 0 && bb && nparts > 1 && ((part + 1) * mshare_) / 1000 != (part * mshare_) / 1000) {
+        bool ok = true;
+        uint64_t at2 = 0;
+        for (const Span& x : s) {
+            const uint64_t a = std::max(lo, at2), b = std::min(hi, at2 + x.bytes);
+            if (a < b && ok) ok = read_direct(x.off + (a - at2), (size_t) (b - a), dst + a, bb, scratch_, tfd_);
+            at2 += x.bytes;
+        }
+        if (ok) {
+            give_bounce(bb);
+            return;
         }
     }
     for (const Span& x : s) {
