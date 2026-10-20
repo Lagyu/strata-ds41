@@ -481,6 +481,11 @@ double log_softmax_at(const float * lg, int nv, int tok) {
 }  // namespace
 
 int main(int argc, char ** argv) {
+    // HIP graph replay of the multi-row pass graphs (DSpark verify passes, their finish + prediction) costs ~0.4 ms a
+    // layer in a decode whose expert tier keeps other streams busy with DMAs (3 GPUs, measured 2026-10-21: 8.45 ->
+    // 9.28 tok/s without it, the same bits; the dense bench alone shows no such cost).  ggml-cuda's
+    // GGML_CUDA_GRAPH_MAX_TOKENS=1 keeps the replay for the 1-token graphs only; a value set by the caller wins.
+    setenv("GGML_CUDA_GRAPH_MAX_TOKENS", "1", 0);
     if (!std::getenv("DS41_GGML_DEBUG"))
         ggml_log_set([](ggml_log_level lv, const char * text, void *) { if (lv != GGML_LOG_LEVEL_DEBUG) std::fputs(text, stderr); }, nullptr);
     Args a;
