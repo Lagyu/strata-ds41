@@ -238,7 +238,7 @@ public:
                       std::string& err) const;
 
 private:
-    struct Span { uint64_t off = 0, bytes = 0; };
+    struct Span { uint64_t off = 0, bytes = 0; int shard = 0; };   ///< shard: which file of a split model holds it
     void spans(int64_t l, int64_t e, Span s[3]) const;
     /// One 4096-aligned `pread` of [off, off+n) through the O_DIRECT twin fd, sliced out of `scratch`.  False when
     /// there is no twin fd or the bounce is too small (the caller then falls back to the buffered `read`).
@@ -258,6 +258,10 @@ private:
     mutable std::vector<uint8_t*> bfree_, ball_;
     bool part_direct_ = true;    ///< read_part through the O_DIRECT twin (STRATA_DECODE_DIRECT=0: buffered)
     std::string path_;
+    /// A split model (llama.cpp's -0000N-of-0000M shards): one descriptor pair per shard; fd_ / dfd_ alias shard 0's.
+    /// Each role of an expert may sit in another shard than the next role (unsloth's split cuts between tensors).
+    std::vector<int> fds_, dfds_;
+    std::vector<uint8_t> gsh_, ush_, dsh_;   ///< per (layer, expert): the shard of its gate / up / down tensor
     int fd_ = -1;
     int dfd_ = -1;               ///< O_DIRECT twin of fd_ (-1 where the filesystem refused it)
     size_t scratch_ = 0;         ///< the aligned bounce one read_direct span needs
