@@ -21,7 +21,7 @@ for i in 0 1 2 3 4 5 6 7; do
       --route-bias 0 --route-bias-file 0 --dump-last "$O/seq$i.$mode.f32" $extra > "$O/seq$i.$mode.out" 2> "$O/seq$i.$mode.log"
     grep -E "^prompt: |enc-skip: (BOUNDED|first)" "$O/seq$i.$mode.log" | tail -2 | sed "s/^/seq$i $mode: /" | cut -c1-160
   done
-  python3 local/kl-last.py "$O/seq$i.exact.f32" "$O/seq$i.bnd.f32" | sed "s/^/seq$i: /"
+  /home/yuya/llm-src/hfenv/bin/python local/kl-last.py "$O/seq$i.exact.f32" "$O/seq$i.bnd.f32" | sed "s/^/seq$i: /"
 done
 echo "$B" > local/active-config
 sudo systemctl start strata-ds41.service
