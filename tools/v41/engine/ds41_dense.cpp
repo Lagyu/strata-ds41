@@ -56,6 +56,7 @@ struct Allo {
     std::map<const ggml_cgraph *, uint64_t> graph_epoch;
     std::set<const void *> compute_bufs;
     ~Allo() { if (a) ggml_gallocr_free(a); }
+    void forget(const ggml_cgraph * g) { graph_epoch.erase(g); }   // the graph is being freed (its address may be reused)
     bool alloc(ggml_cgraph * g, bool reuse) {
         auto it = graph_epoch.find(g);
         if (reuse && g->uid != 0 && it != graph_epoch.end() && it->second == epoch) return true;
@@ -251,13 +252,27 @@ struct Ds41Dense::Impl {
     struct GKey { int il, kind; int64_t cap, n; bool operator<(const GKey & o) const {
         return std::tie(il, kind, cap, n) < std::tie(o.il, o.kind, o.cap, o.n); } };
     std::map<GKey, ggml_cgraph *> graphs;
+    // Multi-row pass graphs (DSpark verify passes, the DSpark seed / tail chunks, finish, init, head), each in its own
+    // context so that its node addresses stay put: ggml-cuda keys its CUDA/HIP graphs by the first node's address and
+    // replays only when the nodes' properties repeat.  The old path rebuilt every pass's graphs into one scratch
+    // buffer (pf_meta), so all 40 layers shared one key, every call looked like a changed graph and the verify passes
+    // never replayed (host-issued launches, a gallocr plan per layer).  Keyed like `graphs` (il, kind, cap, n); a new
+    // cap for the same (il, kind, n) evicts the stale one (caps are powers of two: a handful over a context).
+    // DS41_PASS_GRAPH_CACHE=0 restores the rebuild-per-pass path.
+    struct GSlot { ggml_context * ctx = nullptr; ggml_cgraph * gf = nullptr; ggml_tensor * out = nullptr; };
+    std::map<GKey, GSlot> gcache;
     std::map<int, ggml_tensor *> logits_out;   // decode head graph output, by nrows
     std::map<int, ggml_tensor *> predict_out;  // predict graph output, by layer
     std::map<std::pair<int, int>, ggml_tensor *> predict_out_n;   // predict_multi output, by (layer, pass width)
     std::map<int, ggml_tensor *> fpredict_out; // finish_predict graph output, by the predicted layer
     std::map<std::pair<int, int>, std::vector<ggml_tensor *>> fpredict_ahead; // finish_predict_ahead extra outputs
 
+    void drop_gcache() {
+        for (auto & e : gcache) { allo_dec.forget(e.second.gf); if (e.second.ctx) ggml_free(e.second.ctx); }
+        gcache.clear();
+    }
     ~Impl() {
+        drop_gcache();
         if (nbuf) ggml_backend_buffer_free(nbuf);
         if (nctx) ggml_free(nctx);
         if (sbuf) ggml_backend_buffer_free(sbuf);
@@ -426,12 +441,34 @@ struct B {
     }
     // hc_mixes (model.py Block.hc_mixes + kernel hc_split_sinkhorn): x [D, HC, n] -> pre [HC, n], post [HC, n],
     // comb [HC(dst), HC(src), n]
+    // the mixes GEMV alone: [24, n] (the fused hc tails take it from here)
+    ggml_tensor * hc_mixes_raw(ggml_tensor * x, ggml_tensor * fn) const {
+        const int64_t HC = g->hc, nt = x->ne[2], D = g->n_embd;
+        ggml_tensor * flat = ggml_rms_norm(c, ggml_reshape_2d(c, x, HC * D, nt), (float) g->rms_eps);
+        // 9..64 columns (the DSpark seed / prompt-tail chunks of 16): ggml-cuda hands a [24 x 20480] x [20480 x n] F16
+        // product to hipBLAS SGEMM behind an F16 -> F32 convert of the weights - 0.66-1.4 ms a call, 2 calls a layer,
+        // ~0.34 s a request.  The vector kernel takes <= 8 columns at ~15 us, so the product goes in pieces of 8 (a
+        // column's dot product is the same kernel either way; against the old SGEMM path these passes' bits move at
+        // the last ulp - F32 accumulation either way).  STRATA_HC_MIX_CHUNK=0 = one product.
+        static const bool chunk = !(std::getenv("STRATA_HC_MIX_CHUNK") && std::getenv("STRATA_HC_MIX_CHUNK")[0] == '0');
+        if (chunk && !im->cpu && nt > 8 && nt <= 64) {
+            ggml_tensor * mixes = nullptr;
+            for (int64_t c0 = 0; c0 < nt; c0 += 8) {
+                const int64_t cnt = std::min<int64_t>(8, nt - c0);
+                ggml_tensor * part = ggml_mul_mat(c, fn, ggml_view_2d(c, flat, HC * D, cnt, flat->nb[1], (size_t) c0 * flat->nb[1]));
+                ggml_mul_mat_set_prec(part, GGML_PREC_F32);
+                mixes = mixes ? ggml_concat(c, mixes, part, 1) : part;
+            }
+            return mixes;
+        }
+        ggml_tensor * mixes = ggml_mul_mat(c, fn, flat);                                  // [24, n]
+        ggml_mul_mat_set_prec(mixes, GGML_PREC_F32);
+        return mixes;
+    }
     void hc_mixes(ggml_tensor * x, ggml_tensor * fn, ggml_tensor * sc, ggml_tensor * bs,
                   ggml_tensor ** pre, ggml_tensor ** post, ggml_tensor ** comb) const {
         const int64_t HC = g->hc, nt = x->ne[2], D = g->n_embd;
-        ggml_tensor * flat = ggml_rms_norm(c, ggml_reshape_2d(c, x, HC * D, nt), (float) g->rms_eps);
-        ggml_tensor * mixes = ggml_mul_mat(c, fn, flat);                                  // [24, n]
-        ggml_mul_mat_set_prec(mixes, GGML_PREC_F32);
+        ggml_tensor * mixes = hc_mixes_raw(x, fn);
 #if defined(STRATA_DSV41_HC_MIX)
         // -DSTRATA_DSV41_HC_MIX=ON on a llama.cpp tree patched with tools/v41/ggml/dsv41-fuse.patch: the two mixes as
         // ONE op (GGML_OP_DSV41_HC_MIXES), the same mul/add/sigmoid/scale steps bit for bit (test_ds41_hcmix).  It
@@ -503,6 +540,65 @@ bool Ds41Dense::Impl::compute(ggml_cgraph * gf, bool cached) {
     if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS) { err = "graph compute failed"; return false; }
     if (g_dprof_on && g_dprof_slot >= 0) { g_dprof[1] += tq1 - tq0; g_dprof[2] += dprof_now() - tq1; }
     return true;
+}
+
+// A cached multi-row pass graph (Impl::gcache): the slot for `key`, fresh (gf == nullptr, ctx ready to build into) or
+// built.  Evicts the same (il, kind, n)'s other caps.
+static bool pass_graph_cache_on() {
+    static const bool on = !(std::getenv("DS41_PASS_GRAPH_CACHE") && std::getenv("DS41_PASS_GRAPH_CACHE")[0] == '0');
+    return on;
+}
+static Ds41Dense::Impl::GSlot & pass_graph_slot(Ds41Dense::Impl & im, const Ds41Dense::Impl::GKey & key) {
+    auto it = im.gcache.find(key);
+    if (it != im.gcache.end()) return it->second;
+    for (auto e = im.gcache.begin(); e != im.gcache.end();) {
+        if (e->first.il == key.il && e->first.kind == key.kind && e->first.n == key.n && e->first.cap != key.cap) {
+            im.allo_dec.forget(e->second.gf);
+            ggml_free(e->second.ctx);
+            e = im.gcache.erase(e);
+        } else {
+            ++e;
+        }
+    }
+    Ds41Dense::Impl::GSlot & s = im.gcache[key];
+    ggml_init_params p = { ggml_tensor_overhead() * 4096 + ggml_graph_overhead_custom(8192, false), nullptr, true };
+    s.ctx = ggml_init(p);
+    return s;
+}
+
+// ---- Strata-DS4.1 fused decode-layer glue (third_party/llama.cpp ggml-cuda/ds41-fused.cu, GGML_OP_DS41_FUSED).
+// STRATA_DENSE_FUSED=<mask> (default: everything on a CUDA/HIP backend; 0 = the stock-op composites).  Bits: 1 the
+// block's hc_pre + attn_norm, 2 the attention's K rows + mask, 4 the router tail, 8 the hc tails (attention hc_post, the
+// FFN mixes into the state, the FFN hc_pre + ffn_norm), 16 finish, 32 the clamped SwiGLU (ggml_swiglu_clamp), 64 the
+// prediction graphs.  Every sub-op is bit-identical to the composite it replaces (ds41_generate --dense-bench rows
+// compared with cmp); the sub-op ids / contracts are the .cu's.
+enum { FZ_PRE = 1, FZ_ATTN = 2, FZ_ROUTER = 4, FZ_HC = 8, FZ_FINISH = 16, FZ_SWIGLU = 32, FZ_PREDICT = 64, FZ_ALL = 127 };
+enum ds41f_sub_op { DS41F_HC_PRE_NORM = 1, DS41F_ATTN_K = 3, DS41F_ATTN_MASK = 4, DS41F_ROUTER = 5, DS41F_HC_TAIL = 7,
+                    DS41F_FFN_MIX = 8, DS41F_HC_PRE_NORM_MIX = 9, DS41F_FINISH = 10 };
+static int fz_mask(const Ds41Dense::Impl & im) {
+    static const int m = std::getenv("STRATA_DENSE_FUSED") ? std::atoi(std::getenv("STRATA_DENSE_FUSED")) : FZ_ALL;
+    return im.cpu ? 0 : m;
+}
+static int32_t fbits(float f) { int32_t i; std::memcpy(&i, &f, 4); return i; }
+// rms_norm(hc_pre(x [D, HC, n], pre [HC, n])) * w  (DS41F_HC_PRE_NORM), into `into` (a state view) when given
+static ggml_tensor * fz_hc_pre_norm(ggml_context * gc, const Ds41Dense::Impl & im, ggml_tensor * x, ggml_tensor * pre, ggml_tensor * w,
+                                    int64_t n, ggml_tensor * into = nullptr) {
+    ggml_tensor * srcs[3] = { x, pre, w };
+    const int32_t prm[3] = { fbits((float) im.g.rms_eps), 0, fbits(1.0f) };
+    return into ? ggml_ds41_fused_inplace(gc, DS41F_HC_PRE_NORM, srcs, 3, into, prm, 3)
+                : ggml_ds41_fused(gc, DS41F_HC_PRE_NORM, srcs, 3, GGML_TYPE_F32, im.D, n, 1, 1, prm, 3);
+}
+// the router tail: full (ids into `ids_out`, the weights into `wts_out`) or predict (the top-k ids, I32 [k, n])
+static ggml_tensor * fz_router(ggml_context * gc, const Ds41Dense::Impl & im, ggml_tensor * rl, ggml_tensor * bias, ggml_tensor * rbias,
+                               int k, ggml_tensor * ids_out, ggml_tensor * wts_out, int64_t n) {
+    if (ids_out) {
+        ggml_tensor * srcs[4] = { rl, bias, rbias, ids_out };
+        const int32_t prm[4] = { k, 0, im.g.norm_topk ? 1 : 0, fbits((float) im.g.weights_scale) };
+        return ggml_ds41_fused_inplace(gc, DS41F_ROUTER, srcs, 4, wts_out, prm, 4);
+    }
+    ggml_tensor * srcs[3] = { rl, bias, rbias };
+    const int32_t prm[4] = { k, 1, 0, 0 };
+    return ggml_ds41_fused(gc, DS41F_ROUTER, srcs, 3, GGML_TYPE_I32, k, n, 1, 1, prm, 4);
 }
 
 // ================================================================== the attention graph (+ router + shared expert)
@@ -578,11 +674,18 @@ static ggml_cgraph * build_attn(Ds41Dense::Impl & im, ggml_context * gc, int il,
     }
 
     // ---- attention hc: mixes of the block input; its pre-mix is the previous FFN's (pre_state)
-    ggml_tensor * a_pre = nullptr, * a_post = nullptr, * a_comb = nullptr;
-    b.hc_mixes(x, im.BL(il, "hc_attn_fn.weight"), im.BL(il, "hc_attn_scale.weight"), im.BL(il, "hc_attn_base.weight"),
-               &a_pre, &a_post, &a_comb);
-    ggml_tensor * xin = ggml_dsv4_hc_pre(gc, x, b.cols2(im.pre_state, HC, n, col0));             // [D, n]
-    ggml_tensor * xn = b.rms_w(xin, im.BL(il, "attn_norm.weight"));
+    const int fz = fz_mask(im);
+    ggml_tensor * a_pre = nullptr, * a_post = nullptr, * a_comb = nullptr, * mixes_a = nullptr;
+    if (fz & FZ_HC) mixes_a = b.hc_mixes_raw(x, im.BL(il, "hc_attn_fn.weight"));
+    else b.hc_mixes(x, im.BL(il, "hc_attn_fn.weight"), im.BL(il, "hc_attn_scale.weight"), im.BL(il, "hc_attn_base.weight"),
+                    &a_pre, &a_post, &a_comb);
+    ggml_tensor * xn = nullptr;
+    if (fz & FZ_PRE) {
+        xn = fz_hc_pre_norm(gc, im, x, b.cols2(im.pre_state, HC, n, col0), im.BL(il, "attn_norm.weight"), n);
+    } else {
+        ggml_tensor * xin = ggml_dsv4_hc_pre(gc, x, b.cols2(im.pre_state, HC, n, col0));             // [D, n]
+        xn = b.rms_w(xin, im.BL(il, "attn_norm.weight"));
+    }
 
     // ---- q (no per-head norm in V4.1)
     ggml_tensor * qr = b.rms_w(ggml_mul_mat(gc, im.BL(il, "attn_q_a.weight"), xn), im.BL(il, "attn_q_a_norm.weight"));
@@ -594,9 +697,15 @@ static ggml_cgraph * build_attn(Ds41Dense::Impl & im, ggml_context * gc, int il,
     kv = b.rope(ggml_reshape_3d(gc, kv, DH, 1, n), pos, r);
     ggml_tensor * kv2 = ggml_reshape_2d(gc, kv, DH, n);
     if (im.cfg.act_quant) kv2 = fake_quant(gc, cont_if(gc, kv2), Ds41Quant::FP8_POW2_32);   // model.py _window_kv
-    ggml_tensor * wsrc = ggml_concat(gc, L.raw->type == GGML_TYPE_F32 ? L.raw : ggml_cast(gc, L.raw, GGML_TYPE_F32), kv2, 1);     // [DH, RAW + n]
-    ggml_tensor * Kw = ggml_reshape_3d(gc, ggml_get_rows(gc, wsrc, b.v1(im.i_widx, SWA * n, (size_t) col0 * SWA * 4)), DH, SWA, n);
+    const bool fz_attn = (fz & FZ_ATTN) != 0;
+    ggml_tensor * Kw = nullptr;
+    if (!fz_attn) {
+        ggml_tensor * wsrc = ggml_concat(gc, L.raw->type == GGML_TYPE_F32 ? L.raw : ggml_cast(gc, L.raw, GGML_TYPE_F32), kv2, 1);     // [DH, RAW + n]
+        Kw = ggml_reshape_3d(gc, ggml_get_rows(gc, wsrc, b.v1(im.i_widx, SWA * n, (size_t) col0 * SWA * 4)), DH, SWA, n);
+    }
     ggml_tensor * Mw = b.cols2(im.bounded_from >= 0 && il > im.bounded_cut ? im.i_wmask_dec : im.i_wmask, SWA, n, col0);
+    ggml_tensor * f_comp = nullptr, * f_sel = nullptr, * f_selm = nullptr;   // the fused K / mask: the compressed rows' sources
+    int64_t f_K = 0;
     {
         const int64_t k = std::min<int64_t>(n, RAW);
         ggml_tensor * last = ggml_view_2d(gc, kv2, DH, k, kv2->nb[1], (size_t) (n - k) * kv2->nb[1]);
@@ -702,25 +811,44 @@ static ggml_cgraph * build_attn(Ds41Dense::Impl & im, ggml_context * gc, int il,
                 sel = ggml_view_2d(gc, IS.sel, K, n, IS.sel->nb[1], (size_t) col0 * IS.sel->nb[1]);
                 selm = ggml_view_2d(gc, IS.selm, K, n, IS.selm->nb[1], (size_t) col0 * IS.selm->nb[1]);
             }
-            Kc = ggml_reshape_3d(gc, ggml_get_rows(gc, comp, cont_if(gc, ggml_reshape_1d(gc, cont_if(gc, sel), K * n))), DH, K, n);
-            Mc = cont_if(gc, selm);
+            if (fz_attn) {
+                f_comp = comp; f_sel = sel; f_selm = selm; f_K = K;
+            } else {
+                Kc = ggml_reshape_3d(gc, ggml_get_rows(gc, comp, cont_if(gc, ggml_reshape_1d(gc, cont_if(gc, sel), K * n))), DH, K, n);
+                Mc = cont_if(gc, selm);
+            }
             // the source's rows must be read AFTER this pass wrote its own (a kv source attends to its new row)
         }
     }
 
     // ---- attention: per query its window rows + its top-k compressed rows, one flash-attn with the query as batch
-    ggml_tensor * Kall = Kc ? ggml_concat(gc, Kw, Kc, 1) : Kw;                                 // [DH, M, n]
-    ggml_tensor * Mall = Mc ? ggml_concat(gc, Mw, Mc, 0) : Mw;                                 // [M, n]
-    int64_t M = Kall->ne[1];
-    if (!im.cpu && M % 256) {   // ggml-cuda's flash-attn for d 512 wants the key count a multiple of 256
-        const int64_t pad = 256 - M % 256;
-        Kall = ggml_pad(gc, Kall, 0, (int) pad, 0, 0);
-        Mall = ggml_concat(gc, Mall, ggml_fill(gc, ggml_new_tensor_2d(gc, GGML_TYPE_F32, pad, n), NEG_INF), 0);
-        M += pad;
+    ggml_tensor * k4 = nullptr, * m4 = nullptr;
+    if (fz_attn) {
+        // DS41F_ATTN_K / DS41F_ATTN_MASK: the window rows straight from the ring + this pass's rows, the compressed rows
+        // straight from the cache, F16 and padded to 256 keys in one kernel each
+        int64_t M = SWA + f_K;
+        if (M % 256) M += 256 - M % 256;
+        ggml_tensor * kv2c = ggml_is_contiguous(kv2) ? kv2 : ggml_cont(gc, kv2);
+        ggml_tensor * ks[5] = { kv2c, L.raw, b.v1(im.i_widx, SWA * n, (size_t) col0 * SWA * 4), f_comp, f_sel };
+        const int32_t kp[3] = { (int32_t) SWA, (int32_t) f_K, (int32_t) RAW };
+        k4 = ggml_ds41_fused(gc, DS41F_ATTN_K, ks, f_K > 0 ? 5 : 3, GGML_TYPE_F16, DH, M, 1, n, kp, 3);
+        ggml_tensor * ms[2] = { Mw, f_selm };
+        const int32_t mp[2] = { (int32_t) SWA, (int32_t) f_K };
+        m4 = ggml_ds41_fused(gc, DS41F_ATTN_MASK, ms, f_K > 0 ? 2 : 1, GGML_TYPE_F16, M, 1, 1, n, mp, 2);
+    } else {
+        ggml_tensor * Kall = Kc ? ggml_concat(gc, Kw, Kc, 1) : Kw;                                 // [DH, M, n]
+        ggml_tensor * Mall = Mc ? ggml_concat(gc, Mw, Mc, 0) : Mw;                                 // [M, n]
+        int64_t M = Kall->ne[1];
+        if (!im.cpu && M % 256) {   // ggml-cuda's flash-attn for d 512 wants the key count a multiple of 256
+            const int64_t pad = 256 - M % 256;
+            Kall = ggml_pad(gc, Kall, 0, (int) pad, 0, 0);
+            Mall = ggml_concat(gc, Mall, ggml_fill(gc, ggml_new_tensor_2d(gc, GGML_TYPE_F32, pad, n), NEG_INF), 0);
+            M += pad;
+        }
+        k4 = ggml_cast(gc, ggml_reshape_4d(gc, Kall, DH, M, 1, n), GGML_TYPE_F16);
+        m4 = ggml_cast(gc, ggml_reshape_4d(gc, Mall, M, 1, 1, n), GGML_TYPE_F16);
     }
-    ggml_tensor * k4 = ggml_cast(gc, ggml_reshape_4d(gc, Kall, DH, M, 1, n), GGML_TYPE_F16);
     ggml_tensor * q4 = ggml_permute(gc, ggml_reshape_4d(gc, q, DH, NH, 1, n), 0, 2, 1, 3);    // [DH, 1, NH, n]
-    ggml_tensor * m4 = ggml_cast(gc, ggml_reshape_4d(gc, Mall, M, 1, 1, n), GGML_TYPE_F16);
     ggml_tensor * o = ggml_flash_attn_ext(gc, q4, k4, k4, m4, 1.0f / std::sqrt((float) DH), 0.0f, 0.0f);
     ggml_flash_attn_ext_add_sinks(o, im.BL(il, "attn_sinks.weight"));
     o = ggml_reshape_3d(gc, o, DH, NH, n);
@@ -732,11 +860,30 @@ static ggml_cgraph * build_attn(Ds41Dense::Impl & im, ggml_context * gc, int il,
     ggml_tensor * attn = ggml_mul_mat(gc, im.BL(il, "attn_output_b.weight"), b.flat2(oa, im.OL * im.OG, n));   // [D, n]
 
     // ---- hc_post(attention) -> FFN hc: its mixes give the next layer's pre-mix; its input uses the attention's
-    ggml_tensor * h = ggml_dsv4_hc_post(gc, attn, x, a_post, a_comb);                       // [D, HC, n]
+    ggml_tensor * h = nullptr, * fn = nullptr;
     ggml_tensor * f_pre = nullptr, * f_post = nullptr, * f_comb = nullptr;
-    b.hc_mixes(h, im.BL(il, "hc_ffn_fn.weight"), im.BL(il, "hc_ffn_scale.weight"), im.BL(il, "hc_ffn_base.weight"),
-               &f_pre, &f_post, &f_comb);
-    ggml_tensor * fn = b.rms_w(ggml_dsv4_hc_pre(gc, h, a_pre), im.BL(il, "ffn_norm.weight"));   // [D, n]
+    ggml_tensor * fz_fmix = nullptr;   // the FFN mixes written into the state (fused)
+    if (fz & FZ_HC) {
+        // DS41F_HC_TAIL: h = hc_post(attn, x, post, comb) of the attention mixes, straight into hap's columns;
+        // DS41F_FFN_MIX: the FFN mixes' pre / post / comb into pre_state / post_f / comb_f;
+        // DS41F_HC_PRE_NORM_MIX: fn = rms_norm(hc_pre(h, pre of the attention mixes)) * ffn_norm, straight into o_fn
+        const int32_t hp[2] = { fbits((float) G.hc_eps), (int32_t) G.hc_iters };
+        ggml_tensor * hs[5] = { mixes_a, im.BL(il, "hc_attn_scale.weight"), im.BL(il, "hc_attn_base.weight"), attn, x };
+        h = ggml_ds41_fused_inplace(gc, DS41F_HC_TAIL, hs, 5, b.cols3(im.hap, D, HC, n, col0), hp, 2);
+        ggml_tensor * mixes_f = b.hc_mixes_raw(h, im.BL(il, "hc_ffn_fn.weight"));
+        ggml_tensor * post_v = b.cols2(im.post_f, HC, n, col0);
+        ggml_tensor * ms[6] = { mixes_f, im.BL(il, "hc_ffn_scale.weight"), im.BL(il, "hc_ffn_base.weight"),
+                                b.cols2(im.pre_state, HC, n, col0), post_v, b.cols3(im.comb_f, HC, HC, n, col0) };
+        fz_fmix = ggml_ds41_fused_inplace(gc, DS41F_FFN_MIX, ms, 6, post_v, hp, 2);
+        ggml_tensor * fs[5] = { h, mixes_a, im.BL(il, "hc_attn_scale.weight"), im.BL(il, "hc_attn_base.weight"), im.BL(il, "ffn_norm.weight") };
+        const int32_t fp[3] = { fbits((float) G.rms_eps), fbits((float) G.hc_eps), fbits(1.0f) };
+        fn = ggml_ds41_fused_inplace(gc, DS41F_HC_PRE_NORM_MIX, fs, 5, b.cols2(im.o_fn, D, n, col0), fp, 3);
+    } else {
+        h = ggml_dsv4_hc_post(gc, attn, x, a_post, a_comb);                       // [D, HC, n]
+        b.hc_mixes(h, im.BL(il, "hc_ffn_fn.weight"), im.BL(il, "hc_ffn_scale.weight"), im.BL(il, "hc_ffn_base.weight"),
+                   &f_pre, &f_post, &f_comb);
+        fn = b.rms_w(ggml_dsv4_hc_pre(gc, h, a_pre), im.BL(il, "ffn_norm.weight"));   // [D, n]
+    }
 
     // ---- router (model.py Gate): sqrt(softplus), top-k on score + bias, weights from the raw scores
     ggml_tensor * rl = ggml_mul_mat(gc, im.BL(il, "ffn_gate_inp.weight"), fn);
@@ -803,37 +950,62 @@ static ggml_cgraph * build_attn(Ds41Dense::Impl & im, ggml_context * gc, int il,
     } else {
         sel = ggml_add(gc, s0, rb);
     }
-    ggml_tensor * ids = ggml_argsort_top_k(gc, sel, (int) im.NU);   // [NU, n]
-    ggml_tensor * wts = ggml_reshape_2d(gc, ggml_get_rows(gc, ggml_reshape_3d(gc, sc, 1, im.NE, n), ids), im.NU, n);
-    if (G.norm_topk) wts = ggml_div(gc, wts, ggml_scale_bias(gc, ggml_sum_rows(gc, wts), 1.0f, 1e-20f));
-    wts = ggml_scale(gc, wts, (float) G.weights_scale);
+    // the plain router (no smart bias, no vision bias) in one kernel: DS41F_ROUTER writes the ids into o_ids and the
+    // normalized weights into o_wts straight away
+    const bool fz_rt = (fz & FZ_ROUTER) && !xids && rb_margin < 0.0f && !smart_router() && !(im.vision && im.i_img);
+    ggml_tensor * ids = nullptr, * wts = nullptr;
+    if (fz_rt) {
+        wts = fz_router(gc, im, rl, im.BL(il, "exp_probs_b.bias"), im.ly[(size_t) il].rbias, (int) im.NU,
+                        b.cols2(im.o_ids, im.NU, n, col0), b.cols2(im.o_wts, im.NU, n, col0), n);
+    } else {
+        ids = ggml_argsort_top_k(gc, sel, (int) im.NU);   // [NU, n]
+        wts = ggml_reshape_2d(gc, ggml_get_rows(gc, ggml_reshape_3d(gc, sc, 1, im.NE, n), ids), im.NU, n);
+        if (G.norm_topk) wts = ggml_div(gc, wts, ggml_scale_bias(gc, ggml_sum_rows(gc, wts), 1.0f, 1e-20f));
+        wts = ggml_scale(gc, wts, (float) G.weights_scale);
+    }
 
     // ---- shared expert (model.py Expert, clamped SwiGLU)
     const float lim = (float) G.swiglu_limit;
     ggml_tensor * up = ggml_mul_mat(gc, im.BL(il, "ffn_up_shexp.weight"), fn);
     ggml_tensor * gt = ggml_mul_mat(gc, im.BL(il, "ffn_gate_shexp.weight"), fn);
-    if (lim > 0) {
-        up = ggml_clamp(gc, up, -lim, lim);
-        gt = ggml_clamp(gc, gt, NEG_INF, lim);
+    ggml_tensor * act = nullptr;
+    if (lim > 0 && (fz & FZ_SWIGLU)) {
+        act = ggml_swiglu_clamp(gc, gt, up, lim);   // min(gate, lim), clamp(up, -lim, lim), silu(gate) * up: one kernel
+    } else {
+        if (lim > 0) {
+            up = ggml_clamp(gc, up, -lim, lim);
+            gt = ggml_clamp(gc, gt, NEG_INF, lim);
+        }
+        act = ggml_swiglu_split(gc, gt, up);
     }
-    ggml_tensor * se = ggml_mul_mat(gc, im.BL(il, "ffn_down_shexp.weight"), ggml_swiglu_split(gc, gt, up));
+    ggml_tensor * se = ggml_mul_mat(gc, im.BL(il, "ffn_down_shexp.weight"), act);
 
     // the results go to the persistent state: copied at the end, or (STRATA_DENSE_ALIAS) computed in place there
     auto out_to = [&](ggml_tensor * t, ggml_tensor * dst) { outs.push_back(alias_into(t, dst) ? t : ggml_cpy(gc, t, dst)); };
-    out_to(h, b.cols3(im.hap, D, HC, n, col0));
-    outs.push_back(ggml_cpy(gc, f_post, b.cols2(im.post_f, HC, n, col0)));
-    out_to(f_comb, b.cols3(im.comb_f, HC, HC, n, col0));
+    if (fz & FZ_HC) {   // h, the FFN mixes and fn were computed in place
+        outs.push_back(h);
+        outs.push_back(fz_fmix);
+        outs.push_back(fn);
+    } else {
+        out_to(h, b.cols3(im.hap, D, HC, n, col0));
+        outs.push_back(ggml_cpy(gc, f_post, b.cols2(im.post_f, HC, n, col0)));
+        out_to(f_comb, b.cols3(im.comb_f, HC, HC, n, col0));
+        out_to(fn, b.cols2(im.o_fn, D, n, col0));
+    }
     out_to(se, b.cols2(im.shexp, D, n, col0));
-    out_to(fn, b.cols2(im.o_fn, D, n, col0));
-    outs.push_back(ggml_cpy(gc, ids, b.cols2(im.o_ids, im.NU, n, col0)));
-    out_to(wts, b.cols2(im.o_wts, im.NU, n, col0));
+    if (fz_rt) {
+        outs.push_back(wts);   // ids / wts in place
+    } else {
+        outs.push_back(ggml_cpy(gc, ids, b.cols2(im.o_ids, im.NU, n, col0)));
+        out_to(wts, b.cols2(im.o_wts, im.NU, n, col0));
+    }
     if (xids) {   // route meter: the exact top-NU and their normalized weights
         ggml_tensor * xw = ggml_reshape_2d(gc, ggml_get_rows(gc, ggml_reshape_3d(gc, sc, 1, im.NE, n), xids), im.NU, n);
         xw = ggml_div(gc, xw, ggml_scale_bias(gc, ggml_sum_rows(gc, xw), 1.0f, 1e-20f));
         outs.push_back(ggml_cpy(gc, xids, b.cols2(im.o_xids, im.NU, n, col0)));
         outs.push_back(ggml_cpy(gc, xw, b.cols2(im.o_xwts, im.NU, n, col0)));
     }
-    outs.push_back(ggml_cpy(gc, f_pre, b.cols2(im.pre_state, HC, n, col0)));   // reads of pre_state happen above
+    if (!(fz & FZ_HC)) outs.push_back(ggml_cpy(gc, f_pre, b.cols2(im.pre_state, HC, n, col0)));   // reads of pre_state happen above
     for (ggml_tensor * t : outs) ggml_build_forward_expand(gf, t);
     for (ggml_tensor * t : late) ggml_build_forward_expand(gf, t);
     return gf;
@@ -935,6 +1107,15 @@ static ggml_cgraph * build_predict(Ds41Dense::Impl & im, ggml_context * gc, int 
     B b { &im, gc, &im.g };
     ggml_cgraph * gf = ggml_new_graph_custom(gc, 64, false);
     const int64_t D = im.D, HC = im.HC;
+    if (fz_mask(im) & FZ_PREDICT) {   // fused: hc_pre + ffn_norm in one kernel, the router GEMV, the top-16 in one kernel
+        ggml_tensor * xn = fz_hc_pre_norm(gc, im, b.cols3(im.x_state, D, HC, n), b.cols2(im.pre_state, HC, n), im.BL(il, "ffn_norm.weight"), n);
+        ggml_tensor * rl = ggml_mul_mat(gc, im.BLpred(il), xn);
+        ggml_mul_mat_set_prec(rl, GGML_PREC_F32);
+        *out = fz_router(gc, im, rl, im.BL(il, "exp_probs_b.bias"), im.ly[(size_t) il].rbias, 16, nullptr, nullptr, n);   // I32 [16, n], contiguous
+        ggml_set_output(*out);
+        ggml_build_forward_expand(gf, *out);
+        return gf;
+    }
     ggml_tensor * x = ggml_dsv4_hc_pre(gc, b.cols3(im.x_state, D, HC, n), b.cols2(im.pre_state, HC, n));
     ggml_tensor * rl = ggml_mul_mat(gc, im.BLpred(il), b.rms_w(x, im.BL(il, "ffn_norm.weight")));
     ggml_mul_mat_set_prec(rl, GGML_PREC_F32);
@@ -951,6 +1132,12 @@ static ggml_cgraph * build_finish(Ds41Dense::Impl & im, ggml_context * gc, int64
     B b { &im, gc, &im.g };
     ggml_cgraph * gf = ggml_new_graph_custom(gc, 64, false);
     const int64_t D = im.D, HC = im.HC;
+    if (fz_mask(im) & FZ_FINISH) {   // DS41F_FINISH: the add, hc_post and the state write in one kernel
+        ggml_tensor * fs[5] = { b.cols2(im.shexp, D, n, col0), b.cols2(im.routed, D, n, col0), b.cols3(im.hap, D, HC, n, col0),
+                                b.cols2(im.post_f, HC, n, col0), b.cols3(im.comb_f, HC, HC, n, col0) };
+        ggml_build_forward_expand(gf, ggml_ds41_fused_inplace(gc, DS41F_FINISH, fs, 5, b.cols3(im.x_state, D, HC, n, col0), nullptr, 0));
+        return gf;
+    }
     ggml_tensor * out = ggml_add(gc, b.cols2(im.shexp, D, n, col0), b.cols2(im.routed, D, n, col0));
     ggml_tensor * x = ggml_dsv4_hc_post(gc, out, b.cols3(im.hap, D, HC, n, col0), b.cols2(im.post_f, HC, n, col0),
                                         b.cols3(im.comb_f, HC, HC, n, col0));
@@ -1114,6 +1301,7 @@ bool Ds41Dense::set_columns(int nc) {
     // every cached graph holds views of the old columns (their addresses are fixed at the first allocation), and the
     // allocators remember graphs by address - all of it goes, and is rebuilt lazily for the new tensors
     im.graphs.clear();
+    im.drop_gcache();
     im.logits_out.clear();
     im.predict_out.clear();
     im.predict_out_n.clear();
@@ -1495,13 +1683,17 @@ bool Ds41Dense::begin(const int * tids, int n, int pos0) {
         auto it = im.graphs.find({ -1, 0, 0, 1 });
         if (it == im.graphs.end()) it = im.graphs.emplace(Impl::GKey { -1, 0, 0, 1 }, build_init(im, im.gctx, 1)).first;
         gf = it->second;
+    } else if (pass_graph_cache_on()) {
+        Impl::GSlot & s = pass_graph_slot(im, Impl::GKey { -1, 0, 0, n });
+        if (!s.gf) s.gf = build_init(im, s.ctx, n);
+        gf = s.gf;
     } else {
         meta.resize(ggml_tensor_overhead() * 256 + ggml_graph_overhead_custom(64, false));
         ggml_init_params p = { meta.size(), meta.data(), true };
         gc = ggml_init(p);
         gf = build_init(im, gc, n);
     }
-    const bool ok = im.compute(gf, cached);
+    const bool ok = im.compute(gf, cached || gc == nullptr);
     if (gc) ggml_free(gc);
     return ok;
 }
@@ -1718,13 +1910,25 @@ bool Ds41Dense::attn_router(int il, int * ids, float * wts, const float ** fn_ho
             }
         }
         gf = it->second;
+    } else if (pass_graph_cache_on()) {
+        const double tb0 = g_dprof_on ? dprof_now() : 0;
+        Impl::GSlot & s = pass_graph_slot(im, Impl::GKey { il, 1, cap, n });
+        if (!s.gf) s.gf = build_attn(im, s.ctx, il, n);
+        gf = s.gf;
+        if (g_dprof_on) g_dprof[0] += dprof_now() - tb0;
     } else {
+        const double tb0 = g_dprof_on ? dprof_now() : 0;
         im.pf_meta.resize(ggml_tensor_overhead() * 8192 + ggml_graph_overhead_custom(8192, false));
         ggml_init_params p = { im.pf_meta.size(), im.pf_meta.data(), true };
         gc = ggml_init(p);
         gf = build_attn(im, gc, il, n);
+        if (g_dprof_on) g_dprof[0] += dprof_now() - tb0;
     }
-    const bool ok = im.compute(gf, cached);
+    g_dprof_slot = 0;   // STRATA_DENSE_PROF=1: alloc / gpu compute of the pass path too (prof_report)
+    const bool ok = im.compute(gf, cached || (gc == nullptr));
+    g_dprof_slot = -1;
+    const double tr0 = g_dprof_on ? dprof_now() : 0;
+    if (g_dprof_on) g_dprof[7] += 1;
     if (gc) ggml_free(gc);
     if (!ok) return false;
     // one sync for the three readbacks (was one per tensor_get: 3 x 40 stream syncs per decode token)
@@ -1736,6 +1940,50 @@ bool Ds41Dense::attn_router(int il, int * ids, float * wts, const float ** fn_ho
         ggml_backend_tensor_get_async(im.backend, im.o_xwts, im.host_xwts.data(), 0, (size_t) (im.NU * n) * 4);
     }
     ggml_backend_synchronize(im.backend);
+    if (g_dprof_on) g_dprof[4] += dprof_now() - tr0;
+    // DS41_DUMP_LAYER=L DS41_DUMP_DIR=dir (diagnostic): the state this layer's attention graph wrote, on the pass
+    // DS41_DUMP_PASS (default 0) - for a per-tensor cmp of a kernel change (local/dump-cmp.py)
+    {
+        static const int dl = std::getenv("DS41_DUMP_LAYER") ? std::atoi(std::getenv("DS41_DUMP_LAYER")) : -1;
+        static const int dp = std::getenv("DS41_DUMP_PASS") ? std::atoi(std::getenv("DS41_DUMP_PASS")) : 0;
+        static int dpass = -1;
+        if (dl != -1 && il == 0) ++dpass;
+        if (dl == -2 && dpass == dp) {   // DS41_DUMP_LAYER=-2: one FNV-1a checksum line per layer instead (every layer, one run)
+            auto ck = [&](ggml_tensor * t, size_t bytes) {
+                std::vector<uint8_t> buf(bytes);
+                ggml_backend_tensor_get(t, buf.data(), 0, bytes);
+                uint64_t h = 1469598103934665603ull;
+                for (uint8_t c : buf) { h ^= c; h *= 1099511628211ull; }
+                return h;
+            };
+            std::fprintf(stderr, "[ck] L%02d fn %016llx ids %016llx wts %016llx hap %016llx post %016llx comb %016llx pre %016llx shexp %016llx x %016llx\n", il,
+                         (unsigned long long) ck(im.o_fn, (size_t) im.D * n * 4), (unsigned long long) ck(im.o_ids, (size_t) im.NU * n * 4),
+                         (unsigned long long) ck(im.o_wts, (size_t) im.NU * n * 4), (unsigned long long) ck(im.hap, (size_t) im.D * im.HC * n * 4),
+                         (unsigned long long) ck(im.post_f, (size_t) im.HC * n * 4), (unsigned long long) ck(im.comb_f, (size_t) im.HC * im.HC * n * 4),
+                         (unsigned long long) ck(im.pre_state, (size_t) im.HC * n * 4), (unsigned long long) ck(im.shexp, (size_t) im.D * n * 4),
+                         (unsigned long long) ck(im.x_state, (size_t) im.D * im.HC * n * 4));
+        }
+        if (dl == il && dpass == dp) {
+            const std::string dir = std::getenv("DS41_DUMP_DIR") ? std::getenv("DS41_DUMP_DIR") : ".";
+            auto dump = [&](const char * name, ggml_tensor * t, size_t bytes) {
+                std::vector<uint8_t> buf(bytes);
+                ggml_backend_tensor_get(t, buf.data(), 0, bytes);
+                FILE * f = std::fopen((dir + "/" + name + ".bin").c_str(), "wb");
+                if (f) { std::fwrite(buf.data(), 1, bytes, f); std::fclose(f); }
+            };
+            dump("o_fn", im.o_fn, (size_t) im.D * n * 4);
+            dump("o_ids", im.o_ids, (size_t) im.NU * n * 4);
+            dump("o_wts", im.o_wts, (size_t) im.NU * n * 4);
+            dump("hap", im.hap, (size_t) im.D * im.HC * n * 4);
+            dump("post_f", im.post_f, (size_t) im.HC * n * 4);
+            dump("comb_f", im.comb_f, (size_t) im.HC * im.HC * n * 4);
+            dump("pre_state", im.pre_state, (size_t) im.HC * n * 4);
+            dump("shexp", im.shexp, (size_t) im.D * n * 4);
+            dump("x_state", im.x_state, (size_t) im.D * im.HC * n * 4);
+            if (im.ly[(size_t) il].raw) dump("raw", im.ly[(size_t) il].raw, ggml_nbytes(im.ly[(size_t) il].raw));
+            std::fprintf(stderr, "[dump] layer %d pass %d (%d rows) -> %s\n", il, dp, (int) n, dir.c_str());
+        }
+    }
     if (im.o_xids) meter_add(im, 0, n);
     std::memcpy(ids, im.host_ids.data(), (size_t) (im.NU * n) * 4);
     std::memcpy(wts, im.host_wts.data(), (size_t) (im.NU * n) * 4);
@@ -1794,13 +2042,17 @@ bool Ds41Dense::finish(int il, const float * routed_sum) {
         auto it = im.graphs.find({ -1, 2, 0, 1 });
         if (it == im.graphs.end()) it = im.graphs.emplace(Impl::GKey { -1, 2, 0, 1 }, build_finish(im, im.gctx, 1)).first;
         gf = it->second;
+    } else if (pass_graph_cache_on()) {
+        Impl::GSlot & s = pass_graph_slot(im, Impl::GKey { -1, 2, 0, n });
+        if (!s.gf) s.gf = build_finish(im, s.ctx, n);
+        gf = s.gf;
     } else {
         meta.resize(ggml_tensor_overhead() * 64 + ggml_graph_overhead_custom(64, false));
         ggml_init_params p = { meta.size(), meta.data(), true };
         gc = ggml_init(p);
         gf = build_finish(im, gc, n);
     }
-    const bool ok = im.compute(gf, cached);
+    const bool ok = im.compute(gf, cached || gc == nullptr);
     if (gc) ggml_free(gc);
     return ok;
 }
@@ -1862,6 +2114,13 @@ bool Ds41Dense::finish_predict_ahead(int il, const float * routed_sum, int next_
 bool Ds41Dense::logits(int row0, int nrows, float * out) {
     Impl & im = *p_;
     if (row0 < 0 || nrows < 1 || row0 + nrows > im.n) { im.err = "bad logits rows"; return false; }
+    if (pass_graph_cache_on()) {
+        Impl::GSlot & s = pass_graph_slot(im, Impl::GKey { row0, 4, 0, nrows });
+        if (!s.gf) s.gf = build_head(im, s.ctx, row0, nrows, &s.out);
+        const bool ok = im.compute(s.gf, true);
+        if (ok) ggml_backend_tensor_get(s.out, out, 0, (size_t) nrows * (size_t) im.g.vocab * 4);
+        return ok;
+    }
     std::vector<uint8_t> meta(ggml_tensor_overhead() * 64 + ggml_graph_overhead_custom(64, false));
     ggml_init_params p = { meta.size(), meta.data(), true };
     ggml_context * gc = ggml_init(p);

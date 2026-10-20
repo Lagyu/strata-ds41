@@ -149,6 +149,10 @@ namespace {
 
 struct Args {
     std::string model, ids_csv, ids_file, rank, dump_logits, dump_last, dump_routes;
+    std::string dense_bench;      // --dense-bench R:P: after the prompt, P verify-shaped passes of R rows with the expert tier
+                                  // skipped (routed sums = 0) - the dense half's own time per pass / layer, no NVMe or PCIe
+                                  // noise; the rows' logits go to --dump-last (all P*R rows) for a bit-exact A/B of dense
+                                  // kernel changes.  Garbage text by construction.
     std::string build_mirror;      // --build-mirror F [--mirror-gib N]: write the blob mirror (coldest experts by --rank) and exit
     double mirror_gib = 85.0;
     std::string prune;            // --prune F: "layer expert" lines (coldest first - v41_prune_list.py), soft or hard pruned
@@ -333,6 +337,7 @@ bool parse(int argc, char ** argv, Args & a) {
         else if (k == "--quiet") a.quiet = true;
         else if (k == "--dump-logits") a.dump_logits = next();
         else if (k == "--dump-last") a.dump_last = next();
+        else if (k == "--dense-bench") a.dense_bench = next();
         else if (k == "--enc-skip") a.enc_skip = 1;
         else if (k == "--enc-bounded") a.enc_bounded = true;
         else if (k == "--no-enc-skip") a.enc_skip = 0;
@@ -909,18 +914,25 @@ int main(int argc, char ** argv) {
     static long qfp_file = 0, qfp_hit[2][4] = {}, qfp_uhit[2][4] = {}, qfp_iss[2][4] = {}, qfp_calls = 0, qfp_pass = 0;
     std::vector<std::pair<int, int>> pv_score;
     double pv_ms[4] = {0, 0, 0, 0};   // pass_v split: dense (begin/attn_router/finish), tier, taps (read_state), logits
+    double pvd_ms[4] = {0, 0, 0, 0};  // the dense bucket's own split: begin, predict (+ prefetch issue), attn_router, finish
     long pv_n = 0, pv_tok = 0;
+    // --dense-bench (and STRATA_TIER_SKIP=1, measurement only): the expert tier is not run - the routed sums stay
+    // whatever the routed tensor holds (the bench zeroes it once), and no prefetch is issued.  Garbage text.
+    bool tier_skip = std::getenv("STRATA_TIER_SKIP") && std::getenv("STRATA_TIER_SKIP")[0] == '1';
     auto pass_v = [&](const int * toks, int m, int pos) -> bool {
         // D3 (the batched per-class verify tier) is the default: correct (bias-off verify-vs-prefill gate, near-ties
         // only) and faster (verify 167.6 -> ~100 ms/pass).  STRATA_TIER_BATCH=0 = the per-token run_to_dev path.
         static const bool no_tier_batch = [] { const char* v = std::getenv("STRATA_TIER_BATCH"); return v && v[0] == '0'; }();
         double tq = now_ms();
         auto lap = [&](int i) { const double t = now_ms(); pv_ms[i] += t - tq; tq = t; };
+        double tqd = tq;
+        auto lapd = [&](int i) { const double t = now_ms(); pvd_ms[i] += t - tqd; tqd = t; };
         ++pv_n; pv_tok += m;
         mids.resize((size_t) m * top_k);
         mw.resize((size_t) m * top_k);
         vh.assign((size_t) m * 3 * n_embd, 0.0f);
         if (!dense.begin(toks, m, pos)) { ferr = dense.last_error(); return false; }
+        lapd(0);
         if (d3_fpred) {
             for (int k = 0; k < 2; ++k) {
                 fpv[k].assign((size_t) n_layer * Ds41MoeTier::kMaxMulti * 16, -1);
@@ -938,7 +950,7 @@ int main(int argc, char ** argv) {
         static const int d3_pf = std::getenv("STRATA_D3_PF") ? std::atoi(std::getenv("STRATA_D3_PF")) : 1;
         constexpr int kD3PfRows = 8;
         static_assert(kD3PfRows <= Ds41MoeTier::kMaxMulti, "the prefetch is consumed by ONE tier call per layer");
-        const bool pf_now = rdev1 && !no_tier_batch && d3_pf > 0 && m <= kD3PfRows;
+        const bool pf_now = rdev1 && !no_tier_batch && d3_pf > 0 && m <= kD3PfRows && !tier_skip;
         for (int l = 0; l < n_layer; ++l) {
             if (pf_now) {
                 pv_pred.resize((size_t) m * 16);
@@ -1001,7 +1013,9 @@ int main(int argc, char ** argv) {
                 }
             }
             const float * fn = nullptr;
+            lapd(1);
             if (!dense.attn_router(l, mids.data(), mw.data(), &fn)) { ferr = dense.last_error(); return false; }
+            lapd(2);
             g_routes.add(l, mids.data(), m);
             if (d3_fpred && m <= Ds41MoeTier::kMaxMulti) {
                 ++qfp_calls;
@@ -1038,7 +1052,9 @@ int main(int argc, char ** argv) {
                                  (double) qfp_iss[1][0] / qfp_calls, (double) qfp_iss[1][1] / qfp_calls, (double) qfp_iss[1][2] / qfp_calls, (double) qfp_iss[1][3] / qfp_calls);
             }
             lap(0);
-            if (rdev1 && !no_tier_batch) {
+            if (tier_skip) {
+                // measurement only: no experts (see tier_skip above)
+            } else if (rdev1 && !no_tier_batch) {
                 // D3: ONE batched per-class tier call for the pass's m tokens (the union of their experts is served
                 // once), not m run_to_dev calls.  Split at Ds41MoeTier::kMaxMulti (16: a depth-4 pass and a 16-row
                 // lookup verify / prompt pass are one call each).
@@ -1061,8 +1077,10 @@ int main(int argc, char ** argv) {
                 }
             }
             lap(1);
+            tqd = tq;
             if (!dense.finish(l, rdev1 ? nullptr : crouted_m.data())) { ferr = dense.last_error(); return false; }
             lap(0);
+            lapd(3);
             for (int j = 0; j < 3; ++j) {
                 if (l != dm_layers[j]) continue;
                 if (!dense.read_state(vx, vpre)) { ferr = dense.last_error(); return false; }
@@ -2212,9 +2230,56 @@ int main(int argc, char ** argv) {
         std::ofstream f(a.dump_logits, std::ios::binary);
         f.write((const char *) all.data(), (std::streamsize) (all.size() * 4));
     }
-    if (!a.dump_last.empty()) {   // the last row's logits - the one row enc-skip still computes exactly
+    if (!a.dump_last.empty() && a.dense_bench.empty()) {   // the last row's logits - the one row enc-skip still computes exactly
         std::ofstream f(a.dump_last, std::ios::binary);
         f.write((const char *) last_logits.data(), (std::streamsize) (last_logits.size() * 4));
+    }
+    if (!a.dense_bench.empty()) {
+        // --dense-bench R:P (see Args): the dense half alone, P passes of R rows (the shape of DSpark's verify passes), the
+        // tier skipped, routed sums zero.  Tokens cycle through the prompt, positions continue after it.
+        int R = 2, P = 50;
+        if (std::sscanf(a.dense_bench.c_str(), "%d:%d", &R, &P) < 1 || R < 1 || R > 16 || P < 1) {
+            std::fprintf(stderr, "ds41_generate: --dense-bench wants R:P with 1 <= R <= 16\n");
+            return 2;
+        }
+        if (defer_vram && !open_cache()) { std::fprintf(stderr, "ds41_generate: deferred seed: %s\n", err.c_str()); return 1; }
+        tier_skip = true;
+        {
+            std::vector<float> z((size_t) R * n_embd, 0.0f);
+            if (!dense.upload_routed(z.data(), R)) std::fprintf(stderr, "dense-bench: note: could not zero the routed sums (%s)\n", dense.last_error().c_str());
+        }
+        for (double & v : pv_ms) v = 0;
+        for (double & v : pvd_ms) v = 0;
+        pv_n = 0; pv_tok = 0;
+        std::ofstream dump;
+        if (!a.dump_last.empty()) dump.open(a.dump_last, std::ios::binary);
+        std::vector<int> bt((size_t) R);
+        std::vector<double> ms((size_t) P);
+        const int pos_b = (int) prompt.size();
+        for (int p = 0; p < P; ++p) {
+            for (int i = 0; i < R; ++i) bt[(size_t) i] = prompt[(size_t) ((p * R + i) % (int) prompt.size())];
+            const int pos = pos_b + p * R;
+            if (pos + R > (int) a.ctx) { std::fprintf(stderr, "dense-bench: the context is full at pass %d\n", p); P = p; break; }
+            const double t0 = now_ms();
+            if (!pass_v(bt.data(), R, pos)) { std::fprintf(stderr, "ds41_generate: dense-bench pass %d: %s\n", p, ferr.c_str()); return 1; }
+            ms[(size_t) p] = now_ms() - t0;
+            if (dump.is_open()) dump.write((const char *) vlog.data(), (std::streamsize) ((size_t) R * nv * 4));
+        }
+        std::vector<double> sorted(ms.begin(), ms.begin() + P);
+        std::sort(sorted.begin(), sorted.end());
+        double mean = 0;
+        const int skip = std::min(P - 1, 2);   // the first passes build / warm the graphs
+        for (int p = skip; p < P; ++p) mean += ms[(size_t) p];
+        mean /= std::max(1, P - skip);
+        std::fprintf(stderr, "dense-bench: %d rows x %d passes: %.2f ms/pass mean (after %d warm-up), min %.2f, median %.2f, max %.2f; "
+                     "per layer %.3f ms\n", R, P, mean, skip, sorted.front(), sorted[(size_t) P / 2], sorted.back(), mean / n_layer);
+        std::fprintf(stderr, "dense-bench split (all %ld passes): begin %.2f, predict %.2f, attn_router %.2f, finish %.2f, logits %.2f ms/pass; "
+                     "attn_router %.1f us/layer, finish %.1f us/layer, predict %.1f us/layer\n", pv_n, pvd_ms[0] / pv_n, pvd_ms[1] / pv_n,
+                     pvd_ms[2] / pv_n, pvd_ms[3] / pv_n, pv_ms[3] / pv_n, 1000.0 * pvd_ms[2] / pv_n / n_layer, 1000.0 * pvd_ms[3] / pv_n / n_layer,
+                     1000.0 * pvd_ms[1] / pv_n / n_layer);
+        dense.prof_report("dense-bench");
+        tier.close();
+        return 0;
     }
     tier.reset_stats();
     // STRATA_PROFILE_DECODE=1: nsys --capture-range=cudaProfilerApi captures exactly the decode
@@ -2375,6 +2440,9 @@ int main(int argc, char ** argv) {
         std::fprintf(stderr, "pass_v split (all %ld passes, %.2f tokens each): dense %.1f ms, tier %.1f ms, taps %.1f ms, "
                      "logits %.1f ms per pass\n", pv_n, (double) pv_tok / std::max(1L, pv_n), pv_ms[0] / std::max(1L, pv_n),
                      pv_ms[1] / std::max(1L, pv_n), pv_ms[2] / std::max(1L, pv_n), pv_ms[3] / std::max(1L, pv_n));
+    if (spec)
+        std::fprintf(stderr, "pass_v dense split: begin %.2f, predict %.2f, attn_router %.2f, finish %.2f ms per pass\n",
+                     pvd_ms[0] / std::max(1L, pv_n), pvd_ms[1] / std::max(1L, pv_n), pvd_ms[2] / std::max(1L, pv_n), pvd_ms[3] / std::max(1L, pv_n));
     if (g_routes.on()) {   // calibration: the routing counts (v41_rank.py's stats/LNN.json) after the decode
         std::string rerr;
         if (!g_routes.write(rerr)) std::fprintf(stderr, "routes: %s\n", rerr.c_str());
