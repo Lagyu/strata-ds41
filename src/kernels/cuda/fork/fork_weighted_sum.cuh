@@ -39,6 +39,25 @@ __global__ void decode_rows_sum_kernel(const float* __restrict__ parts, const fl
     }
 }
 
+// The prompt chunk's peer helper: rows [0, n) of `src` (n_embd floats each) land at rows dst[r] of `out` - a
+// peer's compact result pad scattered into the entries' rows of c_parts before the top-k sum.
+__global__ void rows_scatter_kernel(const float* __restrict__ src, const int32_t* __restrict__ dst, int64_t n, int64_t H,
+                                    float* __restrict__ out) {
+    const int64_t total = n * H;
+    for (int64_t q = (int64_t) blockIdx.x * blockDim.x + threadIdx.x; q < total; q += (int64_t) gridDim.x * blockDim.x) {
+        const int64_t r = q / H, i = q - r * H;
+        out[(int64_t) dst[r] * H + i] = src[q];
+    }
+}
+
+void rows_scatter(const float* src, const int32_t* dst, int64_t n, int64_t H, float* out, void* stream) {
+    if (n <= 0) return;
+    const int64_t total = n * H;
+    const unsigned blocks = (unsigned) std::min<int64_t>((total + 255) / 256, 65535);
+    rows_scatter_kernel<<<blocks, 256, 0, (cudaStream_t) stream>>>(src, dst, n, H, out);
+    check("rows_scatter");
+}
+
 void decode_rows_sum(const float* parts, const float* w, int K, int64_t H, float* out, void* stream) {
     const unsigned blocks = (unsigned) std::min<int64_t>((H + 255) / 256, 1024);
     decode_rows_sum_kernel<<<blocks, 256, 0, (cudaStream_t) stream>>>(parts, w, K, H, out);

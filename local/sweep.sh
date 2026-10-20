@@ -49,6 +49,6 @@ done
 [ "$code" = "200" ] || { echo "$LABEL: not ready after $((i*5)) s"; exit 1; }
 echo "$LABEL: ready after $((i*5)) s ($(date +%T))"
 START=$(wc -l < local/serve-engine.log)
-(cd /home/yuya/ds41 && python3 bench.py --url http://127.0.0.1:8150 --model deepseek-v4.1-flash-1017 --label "$LABEL" --reasoning-effort none "${BENCH_ARGS[@]:-}" 2>&1 | grep -E "^$LABEL|Error|error" | cut -c1-200)
+(cd /home/yuya/ds41 && python3 bench.py --url http://127.0.0.1:8150 --model deepseek-v4.1-flash-1017 --label "$LABEL" --reasoning-effort none ${BENCH_ARGS:-} 2>&1 | grep -E "^$LABEL|Error|error" | cut -c1-200)
 tail -n +"$START" local/serve-engine.log | grep -E "^serve: (prompt [0-9]+ tokens|[0-9]+ tokens in|DSpark [0-9]+ passes)|^peer:|^tier:" | cut -c1-230
 echo "$LABEL: done $(date +%T)"

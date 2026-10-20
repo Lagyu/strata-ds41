@@ -204,6 +204,20 @@ struct PeerGpu {
     std::vector<Pend> pend;
     std::vector<cudaEvent_t> ev_free;
     int64_t admits = 0, admit_waits = 0;
+    /// The prompt chunk's helper (STRATA_PEER_CHUNK=1, gpu_run_chunk): this card computes the chunk rows of the
+    /// experts its store holds from the primary's q8_1 activations.  Grown to the largest chunk seen.
+    void* p_xq = nullptr;       ///< the chunk's q8_1 activations (p_xq_tok tokens)
+    int64_t p_xq_tok = 0;
+    void* p_parts = nullptr;    ///< the rows (p_rows x n_embd floats) and the grouped kernel's scratch for them
+    void* p_scratch = nullptr;
+    int64_t p_rows = 0;
+    void* p_meta = nullptr;     ///< the launch's five metadata arrays (device) and their pinned staging
+    uint8_t* p_hmeta = nullptr;
+    size_t p_meta_bytes = 0;
+    float* p_hpad = nullptr;    ///< pinned: the rows on their way to the primary (p_rows x n_embd)
+    cudaEvent_t p_done = nullptr;    ///< recorded on this card after the rows' D2H
+    cudaEvent_t p_taken = nullptr;   ///< recorded on the primary after it copied the pad up (the pad is free again)
+    int64_t chunk_rows = 0, chunk_launches = 0;   ///< diagnostics
 
     const uint8_t* ptr(int64_t layer, int64_t expert) const {
         if (!base || layer < 0 || layer >= n_layers || expert < 0 || expert >= n_experts) return nullptr;
@@ -229,6 +243,16 @@ struct PeerGpu {
         if (base) cudaFree(base);
         if (h_meta) cudaFreeHost(h_meta);
         if (h_parts) cudaFreeHost(h_parts);
+        if (p_done) cudaEventDestroy(p_done);
+        if (p_taken) cudaEventDestroy(p_taken);
+        for (void* p : {p_xq, p_parts, p_scratch, p_meta})
+            if (p) cudaFree(p);
+        if (p_hmeta) cudaFreeHost(p_hmeta);
+        if (p_hpad) cudaFreeHost(p_hpad);
+        p_xq = p_parts = p_scratch = p_meta = nullptr;
+        p_hmeta = nullptr;
+        p_hpad = nullptr;
+        p_done = p_taken = nullptr;
         if (s) cudaStreamDestroy(s);
         (void) cudaGetLastError();
         dev = -1;
@@ -510,6 +534,14 @@ struct Gpu {
          *c_start = nullptr, *c_ng = nullptr, *c_dst = nullptr, *c_tokv = nullptr, *c_stage[2] = {};
     uint8_t* c_bounce[2] = {};
     float* c_hparts = nullptr;
+    /// the prompt chunk's peer helper: the q8_1 activations' pinned copy (the peers read it), the event after its D2H,
+    /// and the device staging the peers' rows are scattered from (rows + their c_parts row indices)
+    void* c_hxq = nullptr;
+    int64_t c_hxq_tok = 0;
+    cudaEvent_t c_xq_ev = nullptr;
+    void* c_pbuf = nullptr;
+    void* c_pdst = nullptr;
+    int64_t c_pbuf_rows = 0;
     cudaStream_t s_cp = nullptr;
     cudaEvent_t c_copied[2] = {}, c_used[2] = {};
     /// run_chunk's MMQ products (Ds41MoeConfig::chunk_mmq): up to `m_rows` sorted entries per launch.  `m_ok[l]`:
@@ -561,6 +593,10 @@ struct Gpu {
         for (uint8_t* p : c_bounce)
             if (p) cudaFreeHost(p);
         if (c_hparts) cudaFreeHost(c_hparts);
+        if (c_hxq) cudaFreeHost(c_hxq);
+        if (c_xq_ev) cudaEventDestroy(c_xq_ev);
+        for (void* p : {c_pbuf, c_pdst})
+            if (p) cudaFree(p);
         for (int i = 0; i < 2; ++i) {
             if (c_copied[i]) cudaEventDestroy(c_copied[i]);
             if (c_used[i]) cudaEventDestroy(c_used[i]);
@@ -4917,19 +4953,25 @@ bool gpu_run_chunk(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, co
     // processing order: VRAM-resident experts, then arena (DMA straight away), then file tier (read in the background
     // from the start of the call, so the arena DMAs and the reads overlap); entries are laid out in this order, so
     // consecutive experts of one class are adjacent in the sorted entry arrays (one launch per run)
-    std::vector<int32_t> order[3];
+    // STRATA_PEER_CHUNK=1: a peer card computes the entries of the experts its store holds (order[3]), from the same
+    // q8_1 activations and with the resident experts' grouped kernel; the primary streams only the rest.  With the
+    // stores filled from the file tier (STRATA_PEER_FILL=file) that is what a long prompt's NVMe stream shrinks by.
+    static const bool chunk_peer = std::getenv("STRATA_PEER_CHUNK") && std::getenv("STRATA_PEER_CHUNK")[0] == '1';
+    const bool peers_on = chunk_peer && gp.peers_built();
+    std::vector<int32_t> order[4];
     std::vector<int32_t> slot_e((size_t) NX, -1);
     for (int64_t e = 0; e < NX; ++e) {
         if (!cnt[(size_t) e]) continue;
         const int32_t sl = (gp.cache && !im.cfg.no_cache) ? gp.cache->slot_of(layer, e) : -1;
         slot_e[(size_t) e] = sl;
-        order[sl >= 0 ? 0 : gp.arena.ptr(layer, e) ? 1 : 2].push_back((int32_t) e);
+        const bool on_peer = peers_on && sl < 0 && gp.peer_holding(layer, (int32_t) e) != nullptr;
+        order[sl >= 0 ? 0 : on_peer ? 3 : gp.arena.ptr(layer, e) ? 1 : 2].push_back((int32_t) e);
     }
     if (first_pass) rebal_count(im, layer, ids, NE);   // the conversation-adaptive arena's usage counts (all classes)
     // STRATA_ROUTE_LOG=<file> (diagnostic, off by default): every routed expert of this batch pass with its tier
     // (0 VRAM cache, 1 RAM arena, 2 file) and token count - turnbench's cross-turn overlap analysis reads it
     if (static FILE* rlog = std::getenv("STRATA_ROUTE_LOG") ? std::fopen(std::getenv("STRATA_ROUTE_LOG"), "a") : nullptr; rlog) {
-        for (int t = 0; t < 3; ++t)
+        for (int t = 0; t < 4; ++t)
             for (int32_t e : order[t]) std::fprintf(rlog, "%lld %d %d %d\n", (long long) layer, e, t, cnt[(size_t) e]);
         std::fflush(rlog);
     }
@@ -4966,6 +5008,106 @@ bool gpu_run_chunk(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, co
         for (int c0 = 0; c0 < n; c0 += 8)
             strata::kernels::native_quantize_q8_1((const float*) gp.c_x + (size_t) c0 * (size_t) H,
                                                   (uint8_t*) gp.c_xq + (size_t) c0 * col, (int) H, std::min(8, n - c0), gp.s);
+    }
+
+    // ---- the peers' share (order[3]): each peer gets the pass's q8_1 activations (one D2H to a pinned copy, then
+    // one H2D per peer), its experts' entries as a compact list (grp_start offsets, ent_dst = the compact row,
+    // ent_tok = the entry's token), runs the grouped kernel on its own stream and sends the rows back to a pinned pad.
+    // The primary scatters them into c_parts before the sum (below).  Everything here is asynchronous: the peers
+    // work while the primary streams the arena and the file tier. ----
+    struct PeerChunk { PeerGpu* pg; int64_t rows; std::vector<int32_t> dst; };
+    std::vector<PeerChunk> pchunks;
+    int64_t ent_peer = 0;
+    if (!order[3].empty()) {
+        const size_t col = strata::kernels::native_q8_1_bytes((int) H, 1);
+        const size_t xq_bytes = (size_t) n * col;
+        if (first_pass) {
+            if (gp.c_hxq_tok < n) {
+                if (gp.c_hxq) cudaFreeHost(gp.c_hxq);
+                gp.c_hxq = nullptr;
+                ck(cudaHostAlloc(&gp.c_hxq, xq_bytes, cudaHostAllocPortable), "c_hxq");
+                gp.c_hxq_tok = n;
+            }
+            if (!gp.c_xq_ev) ck(cudaEventCreateWithFlags(&gp.c_xq_ev, cudaEventDisableTiming), "c_xq_ev");
+            ck(cudaMemcpyAsync(gp.c_hxq, gp.c_xq, xq_bytes, cudaMemcpyDeviceToHost, gp.s), "c_xq d2h");
+            ck(cudaEventRecord(gp.c_xq_ev, gp.s), "c_xq record");
+        }
+        for (auto& pp : gp.peers) {
+            PeerGpu& pg = *pp;
+            std::vector<int32_t> es;
+            for (int32_t e : order[3])
+                if (gp.peer_holding(layer, e) == &pg) es.push_back(e);
+            if (es.empty()) continue;
+            const int ng = (int) es.size();
+            int64_t ne_p = 0;
+            for (int32_t e : es) ne_p += cnt[(size_t) e];
+            DevGuard dg(pg.dev);
+            if (pg.p_taken) ck(cudaEventSynchronize(pg.p_taken), "peer chunk pad free");   // the previous pass's rows are up
+            if (pg.p_xq_tok < n) {
+                if (pg.p_xq) cudaFree(pg.p_xq);
+                ck(cudaMalloc(&pg.p_xq, xq_bytes), "peer p_xq");
+                pg.p_xq_tok = n;
+            }
+            if (pg.p_rows < ne_p) {
+                for (void* p : {pg.p_parts, pg.p_scratch}) if (p) cudaFree(p);
+                if (pg.p_hpad) cudaFreeHost(pg.p_hpad);
+                ck(cudaMalloc(&pg.p_parts, (size_t) ne_p * (size_t) H * 4), "peer p_parts");
+                ck(cudaMalloc(&pg.p_scratch, strata::kernels::native_expert_scratch_bytes(ne_p, im.g.n_ff)), "peer p_scratch");
+                ck(cudaHostAlloc((void**) &pg.p_hpad, (size_t) ne_p * (size_t) H * 4, cudaHostAllocPortable), "peer p_hpad");
+                pg.p_rows = ne_p;
+            }
+            auto a16 = [](size_t x) { return (x + 15) & ~(size_t) 15; };
+            const size_t o_ptr = 0, o_st = a16(o_ptr + 8 * (size_t) ng), o_ng = a16(o_st + 4 * (size_t) (ng + 1)),
+                         o_dst = a16(o_ng + 4), o_tok = a16(o_dst + 4 * (size_t) ne_p), o_end = a16(o_tok + 4 * (size_t) ne_p);
+            if (pg.p_meta_bytes < o_end) {
+                if (pg.p_meta) cudaFree(pg.p_meta);
+                if (pg.p_hmeta) cudaFreeHost(pg.p_hmeta);
+                ck(cudaMalloc(&pg.p_meta, o_end), "peer p_meta");
+                ck(cudaHostAlloc((void**) &pg.p_hmeta, o_end, cudaHostAllocPortable), "peer p_hmeta");
+                pg.p_meta_bytes = o_end;
+            }
+            if (!pg.p_done) ck(cudaEventCreateWithFlags(&pg.p_done, cudaEventDisableTiming), "peer p_done");
+            PeerChunk pc{&pg, ne_p, {}};
+            pc.dst.reserve((size_t) ne_p);
+            unsigned long long* mptr = (unsigned long long*) (pg.p_hmeta + o_ptr);
+            int32_t* mst = (int32_t*) (pg.p_hmeta + o_st);
+            int32_t* mdst = (int32_t*) (pg.p_hmeta + o_dst);
+            int32_t* mtok = (int32_t*) (pg.p_hmeta + o_tok);
+            int32_t at = 0;
+            for (int g = 0; g < ng; ++g) {
+                const int32_t e = es[(size_t) g];
+                mptr[g] = (unsigned long long) pg.ptr(layer, e);
+                mst[g] = at;
+                for (int32_t r = first[(size_t) e]; r < first[(size_t) e] + cnt[(size_t) e]; ++r) {
+                    mdst[at] = at;                 // the compact row of p_parts
+                    mtok[at] = tok[(size_t) r];
+                    pc.dst.push_back(dst[(size_t) r]);   // ... and its row of c_parts, for the scatter
+                    ++at;
+                }
+            }
+            mst[ng] = at;
+            *(int32_t*) (pg.p_hmeta + o_ng) = ng;
+            if (first_pass) {
+                if (cudaStreamWaitEvent(pg.s, gp.c_xq_ev, 0) != cudaSuccess) {   // a runtime that refuses a cross-device wait
+                    (void) cudaGetLastError();
+                    ck(cudaEventSynchronize(gp.c_xq_ev), "c_xq host wait");
+                }
+                ck(cudaMemcpyAsync(pg.p_xq, gp.c_hxq, xq_bytes, cudaMemcpyHostToDevice, pg.s), "peer chunk xq h2d");
+            }
+            ck(cudaMemcpyAsync(pg.p_meta, pg.p_hmeta, o_end, cudaMemcpyHostToDevice, pg.s), "peer chunk meta");
+            const uint8_t* dm = (const uint8_t*) pg.p_meta;
+            strata::kernels::native_expert_grouped(pg.gll[(size_t) CI], (const unsigned long long*) (dm + o_ptr),
+                                                  (const int32_t*) (dm + o_st), (const int32_t*) (dm + o_ng),
+                                                  (const int32_t*) (dm + o_dst), (const int32_t*) (dm + o_tok), ng, ne_p,
+                                                  pg.p_xq, pg.p_scratch, (float*) pg.p_parts, pg.s, ng);
+            ck(cudaMemcpyAsync(pg.p_hpad, pg.p_parts, (size_t) ne_p * (size_t) H * 4, cudaMemcpyDeviceToHost, pg.s),
+               "peer chunk rows d2h");
+            ck(cudaEventRecord(pg.p_done, pg.s), "peer chunk done");
+            pg.chunk_rows += ne_p;
+            ++pg.chunk_launches;
+            ent_peer += ne_p;
+            pchunks.push_back(std::move(pc));
+        }
     }
 
     // a launch over groups `es` (expert ids) whose blobs are at `ptrs`: grp_start are offsets into the sorted entries
@@ -5363,6 +5505,27 @@ bool gpu_run_chunk(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, co
         }
         chunk_prestage(im, nl, h_last >= 0 ? 1 - h_last : 0);
     }
+
+    // ---- the peers' rows: up into a device staging buffer, then scattered into their entries' rows of c_parts ----
+    for (PeerChunk& pc : pchunks) {
+        PeerGpu& pg = *pc.pg;
+        if (cudaStreamWaitEvent(gp.s, pg.p_done, 0) != cudaSuccess) {
+            (void) cudaGetLastError();
+            ck(cudaEventSynchronize(pg.p_done), "peer chunk host wait");
+        }
+        if (gp.c_pbuf_rows < pc.rows) {
+            for (void* p : {gp.c_pbuf, gp.c_pdst}) if (p) cudaFree(p);
+            ck(cudaMalloc(&gp.c_pbuf, (size_t) pc.rows * (size_t) H * 4), "c_pbuf");
+            ck(cudaMalloc(&gp.c_pdst, sizeof(int32_t) * (size_t) pc.rows), "c_pdst");
+            gp.c_pbuf_rows = pc.rows;
+        }
+        ck(cudaMemcpyAsync(gp.c_pbuf, pg.p_hpad, (size_t) pc.rows * (size_t) H * 4, cudaMemcpyHostToDevice, gp.s), "peer rows h2d");
+        ck(cudaMemcpyAsync(gp.c_pdst, pc.dst.data(), sizeof(int32_t) * (size_t) pc.rows, cudaMemcpyHostToDevice, gp.s), "peer rows dst");
+        strata::kernels::rows_scatter((const float*) gp.c_pbuf, (const int32_t*) gp.c_pdst, pc.rows, H, (float*) gp.c_parts, gp.s);
+        if (!pg.p_taken) ck(cudaEventCreateWithFlags(&pg.p_taken, cudaEventDisableTiming), "peer p_taken");
+        ck(cudaEventRecord(pg.p_taken, gp.s), "peer pad taken");
+    }
+    ent_hit += ent_peer;   // the peers' entries count as resident: no stream, no file read
 
     if (!last_pass) {   // the weighted sum waits for the last class pass
         st.hits = ent_hit;

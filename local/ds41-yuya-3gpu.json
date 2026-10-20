@@ -42,7 +42,8 @@
   "STRATA_TEXT_LOG": "local/v41-text.log",
   "HIP_VISIBLE_DEVICES": "0,1,2",
   "STRATA_PEER_GIB": "28,20",
-  "STRATA_PEER_FILL": "file"
+  "STRATA_PEER_FILL": "file",
+  "DS41_EXE": "/home/yuya/llm-src/strata-ds41/build-hip/ds41_generate.sweep"
  },
  "cwd": ".",
  "tokenizer": "/home/yuya/models/dsv41-1017-tokenizer",
