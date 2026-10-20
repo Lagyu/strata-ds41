@@ -19,8 +19,10 @@ def put(k, f):
     else:
         w.add_key_value(k, v, t)
 n_u = n_d = 0
+tensors = int(sys.argv[4]) if len(sys.argv) > 4 else None   # split.tensors.count override (the dense shard adds Engram norms)
 for k, f in r.fields.items():
     if k.startswith("GGUF.") or k == "general.architecture" or k.startswith("deepseek41."): continue
+    if k == "split.tensors.count" and tensors is not None: w.add_int32(k, tensors); n_u += 1; continue
     put(k, f); n_u += 1
 for k, f in d.fields.items():
     if not k.startswith("deepseek41."): continue

@@ -16,9 +16,11 @@ from gguf import GGUFReader, GGUFWriter, GGMLQuantizationType as T
 src, dst = sys.argv[1], sys.argv[2]
 r = GGUFReader(src)
 w = GGUFWriter(dst, "deepseek41", use_temp_file=False)
+n_gates = sum(1 for t in r.tensors if t.name.endswith(".engram_gate.weight"))
 for k, f in r.fields.items():
     if k.startswith("split."):
         v = int(f.parts[f.data[0]][0])
+        if k == "split.tensors.count": v += n_gates   # each engram_gate becomes two tensors (q_norm, k_norm)
         (w.add_uint16 if k != "split.tensors.count" else w.add_int32)(k, v)
 
 def ne(t):            # GGUF order [ne0, ne1, ...]
@@ -48,8 +50,21 @@ def converts(t):
     return t.name == "token_embd.weight" or t.tensor_type == T.BF16 or \
         (t.tensor_type == T.F32 and (t.name.endswith("hc_attn_fn.weight") or t.name.endswith("hc_ffn_fn.weight")))
 
+# unsloth's blk.L.engram_gate.weight [D, HC] is exactly DwarfStar's engram_q_norm * engram_k_norm (checked: max diff 0 on
+# both Engram layers), which the dense graph multiplies at run time: it becomes engram_q_norm, with engram_k_norm = ones,
+# so the product is the same bits; the gate tensor itself is not written
+gates = [t for t in r.tensors if t.name.endswith(".engram_gate.weight")]
+synth = {}   # name -> float32 array in numpy order
+for t in gates:
+    g = np.asarray(t.data).reshape(-1).view(np.float32).reshape(int(t.n_elements) // int(t.shape[0]), int(t.shape[0]))
+    base = t.name[: -len("engram_gate.weight")]
+    synth[base + "engram_q_norm.weight"] = g.copy()
+    synth[base + "engram_k_norm.weight"] = np.ones_like(g)
 # pass 1: the tensor infos (numpy-order shapes, as GGUFWriter.add_tensor passes them)
+for name, arr in synth.items():
+    w.add_tensor_info(name, list(arr.shape), np.dtype(np.float32), arr.nbytes, raw_dtype=T.F32)
 for t in r.tensors:
+    if t.name.endswith(".engram_gate.weight"): continue
     shape_np = list(reversed(ne(t)))
     if converts(t):
         w.add_tensor_info(t.name, shape_np, np.dtype(np.float16), int(t.n_elements) * 2, raw_dtype=T.F16)
@@ -61,7 +76,10 @@ w.write_kv_data_to_file()
 w.write_ti_data_to_file()
 # pass 2: the bytes, one tensor at a time
 n_conv = n_copy = lossy = 0
+for name, arr in synth.items():
+    w.write_tensor_data(np.ascontiguousarray(arr))
 for t in r.tensors:
+    if t.name.endswith(".engram_gate.weight"): continue
     if converts(t):
         f16, bad = to_f16(t)
         w.write_tensor_data(np.ascontiguousarray(f16))
@@ -70,4 +88,4 @@ for t in r.tensors:
         w.write_tensor_data(np.ascontiguousarray(np.asarray(t.data).reshape(-1).view(np.uint8)))
         n_copy += 1
 w.close()
-print(f"wrote {dst}: converted to F16 x{n_conv}, copied x{n_copy}; elements changed by the F16 rounding: {lossy}")
+print(f"wrote {dst}: converted to F16 x{n_conv}, copied x{n_copy}, synthesized {len(synth)} Engram norms from {len(gates)} gates; elements changed by the F16 rounding: {lossy}")
