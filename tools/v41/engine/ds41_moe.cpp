@@ -4276,7 +4276,7 @@ bool gpu_run_n_ex(Ds41MoeImpl& im, int64_t layer, int nt, const int32_t* ids, co
     };
     auto launch_site = [&](int want) {
         bool used[kMaxEnt] = {};
-        auto in_site = [&](int u) { return cls[u] == want || (want == PCIE && cls[u] == FILEG); };
+        auto in_site = [&](int u) { return cls[u] == want; };   // PCIE and FILEG are launched as two sites (below)
         int left = 0;
         for (int u = 0; u < nu; ++u) if (in_site(u)) ++left;
         int si = 0;   // the next d_stage slot (of the current bank)
@@ -4290,7 +4290,7 @@ bool gpu_run_n_ex(Ds41MoeImpl& im, int64_t layer, int nt, const int32_t* ids, co
             for (int u = 0; u < nu; ++u) {
                 if (used[u] || !in_site(u) || im.g.cls(layer, ue[u]) != c) continue;
                 used[u] = true; --left;
-                if (want == PCIE) {
+                if (want == PCIE || want == FILEG) {
                     const int32_t e = ue[u];
                     const int64_t BL = BLX(e);
                     const uint8_t* src = gp.arena.ptr(layer, e);
@@ -4345,7 +4345,7 @@ bool gpu_run_n_ex(Ds41MoeImpl& im, int64_t layer, int nt, const int32_t* ids, co
                 for (int j = 0; j < NE; ++j)
                     if (ent_u[j] == u) { dst.push_back(j); tok.push_back(j / (int) K); }
             }
-            if (want == PCIE) {
+            if (want == PCIE || want == FILEG) {
                 const double xl0 = xprof ? now_ms() : 0;
                 pcie_launch(c, ptr, start, dst, tok);
                 if (xprof) xp[9] += now_ms() - xl0;
@@ -4375,12 +4375,17 @@ bool gpu_run_n_ex(Ds41MoeImpl& im, int64_t layer, int nt, const int32_t* ids, co
             lru_old[n_lru] = v; lru_dem[n_lru] = dem; lru_new[n_lru++] = e;
         }
     }
+    // The arena misses' DMAs and launch go first, under the file-tier reads still in flight: the wait for those reads
+    // was ~2 ms of a 6 ms layer-call (DS41_PROF_X on the 3-card box: 0.6 file-tier blobs a call, ~3.5 ms each) and the
+    // DMAs used to queue only after it.  Two sites now (PCIE, then FILEG once the blobs are home); the same
+    // kernels over the same rows, bit for bit.
+    launch_site(PCIE);
     if (nfg > 0) {   // the file-tier blobs must be home before their DMAs are queued
         if (nfr > 0) gp.rpool->wait();
         im.st.file_tier += nfg;
         im.st.file_ms += now_ms() - tfg;
+        launch_site(FILEG);
     }
-    launch_site(PCIE);
     if (dn) {   // belt and braces: `s` has waited on every PCIe-site copy, so the sync that ends this call covers s_dn
         ck(cudaEventRecord(gp.dn_ev[1], gp.s_dn), "d3 dn tail record");
         ck(cudaStreamWaitEvent(gp.s, gp.dn_ev[1], 0), "d3 dn tail wait");
