@@ -1,5 +1,5 @@
 {
- "_comment": "Third configuration (the current default): the x16 XTX (HIP 0) primary; the R9700 (HIP 1, OCuLink x4) and the second XTX (HIP 2, chipset x4) as peer expert tiers whose stores take the FILE tier's head (STRATA_PEER_FILL=file: the experts neither the primary's VRAM nor the arena holds), 28 + 20 GiB; a 95 GiB arena; DSpark depth 2 (measured: +40% decode over depth 4; depth 3 and the speculative NVMe reads lose); the peers also compute their experts' rows in the prompt chunk (the default since 2026-10-20: 4K prefill 81 -> 140 tok/s).",
+ "_comment": "Third configuration (the current default): the x16 XTX (HIP 0) primary; the R9700 (HIP 1, OCuLink x4) and the second XTX (HIP 2, chipset x4) as peer expert tiers whose stores take the FILE tier's head (STRATA_PEER_FILL=file: the experts neither the primary's VRAM nor the arena holds), 28 + 20 GiB; a 95 GiB arena; DSpark depth 1 (measured: 7.0/7.1/7.9/5.5 vs depth 2's 7.1/6.4/7.2/5.1 and depth 4's ~5.1/4.2/5.1/3.4; depth 3 and the speculative NVMe reads lose); the peers also compute their experts' rows in the prompt chunk (the default since 2026-10-20: 4K prefill 81 -> 140 tok/s).",
  "exe": "local/ds41-engine.sh",
  "args": [
   "-m",
@@ -35,7 +35,7 @@
   "STRATA_NO_LARGEPAGES": "1",
   "GGML_NO_BACKTRACE": "1",
   "STRATA_SERVE_DSPARK": "/home/yuya/models/dsv41-1017-strata/DSpark-1017-Q2K-Q4K-sidecar.gguf",
-  "STRATA_DSPARK_DEPTH": "2",
+  "STRATA_DSPARK_DEPTH": "1",
   "STRATA_PRESTAGE_GIB": "1.5",
   "STRATA_SERVE_STEP_MAX": "96",
   "STRATA_SERVE_PASS_BIAS": "0",
