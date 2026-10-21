@@ -1430,16 +1430,6 @@ bool Ds41MemoryBlobs::has(int64_t layer, int64_t expert) const {
 Ds41MoeTier::Ds41MoeTier() : im_(new Ds41MoeImpl) {}
 Ds41MoeTier::~Ds41MoeTier() { close(); }
 
-/// How many equal-sized slots the VRAM budget buys.  `--slots N` is a count and stays one (`slot_gib` is 0 then,
-/// ds41_generate only fills it for the automatic size); an automatic size is the free VRAM after the dense half, so
-/// it must cap the count of a uniform geometry too - all 384 experts of 40 layers at 9.5 MiB each is 142 GiB, not
-/// 14.  1 at the minimum: a single blob that still does not fit must fail in ExpertCache::open, with its own message.
-int64_t uniform_slots(const Ds41MoeConfig& cfg, int64_t blob) {
-    if (cfg.slot_gib <= 0 || blob <= 0) return cfg.slots;
-    const double n = cfg.slot_gib * 1073741824.0 / (double) blob;
-    return std::max<int64_t>(1, std::min<int64_t>(cfg.slots, (int64_t) n));
-}
-
 /// The peer cards (Ds41MoeConfig::peer_devices, else the single peer_device), in order.
 static std::vector<int> peer_devices(const Ds41MoeConfig& cfg) {
     std::vector<int> v = cfg.peer_devices;
@@ -1595,11 +1585,12 @@ bool Ds41MoeTier::init(const Ds41MoeGeom& geom, Ds41BlobSource* blobs, const Ds4
         ck(cudaMallocHost((void**) &gp.h_dummy, (size_t) im_->blob), "h_dummy");
         std::memset(gp.h_dummy, 0, (size_t) im_->blob);
     }
-    // a geometry whose blob size varies per layer opens its cache at the seed, sized to the ranked experts; a
-    // uniform one opens it here, its slot count capped by the free-VRAM budget when the size was automatic
-    if (!cfg.no_cache && cfg.slots > 0 && !im_->mixed_sizes && !cfg.defer_cache) {   // defer_cache: opened at the seed
-        const int64_t n = uniform_slots(cfg, im_->blob);
-        std::vector<int64_t> sizes((size_t) n, im_->blob);
+    // a geometry whose blob size varies per layer opens its cache at the seed, sized to the ranked experts
+    // A uniform geometry with an AUTO slot budget (slot_gib > 0, no --slots) opens at the seed too, sized by that
+    // budget: there cfg.slots is the whole model (ds41_generate: n_layers * n_experts), so opening here asked for every
+    // expert (all-Q3_K V4.1: 217.5 GiB) and failed tier init, and serve's release_cache() + seed never reopened it
+    if (!cfg.no_cache && cfg.slots > 0 && !im_->mixed_sizes && !cfg.defer_cache && !(cfg.slot_gib > 0)) {   // defer_cache: opened at the seed
+        std::vector<int64_t> sizes((size_t) cfg.slots, im_->blob);
         gp.cache.reset(new strata::core::ExpertCache());
         if (!gp.cache->open_sized(sizes, geom.n_layers, geom.n_experts, err)) return false;
     }
@@ -2105,11 +2096,14 @@ bool Ds41MoeTier::seed_from_ranked(const std::vector<std::pair<int32_t, int32_t>
             if (!im_->gpu->cache->open_sized(sizes, im_->g.n_layers, im_->g.n_experts, err)) return false;
         }
     }
-    // uniform blobs with defer_cache: the cache opens now (after the prompt chunks gave their VRAM back), its slot
-    // count capped by the free-VRAM budget when the size was automatic
-    if (!im_->mixed_sizes && im_->cfg.defer_cache && im_->gpu && !im_->gpu->cache && !im_->cfg.no_cache &&
-        im_->cfg.slots > 0) {
-        std::vector<int64_t> sizes((size_t) uniform_slots(im_->cfg, im_->blob), im_->blob);
+    // uniform blobs with defer_cache, or with an auto slot budget: the cache opens now (after the prompt chunks gave
+    // their VRAM back), at most `slots` experts and slot_gib bytes of whole 256-aligned slots (open_sized's padding)
+    int64_t n_uni = im_->cfg.slots;
+    if (im_->cfg.slot_gib > 0)
+        n_uni = std::min<int64_t>(n_uni, (int64_t) (im_->cfg.slot_gib * 1073741824.0 / (double) ((im_->blob + 255) / 256 * 256)));
+    if (!im_->mixed_sizes && (im_->cfg.defer_cache || im_->cfg.slot_gib > 0) && im_->gpu && !im_->gpu->cache &&
+        !im_->cfg.no_cache && n_uni > 0) {
+        std::vector<int64_t> sizes((size_t) n_uni, im_->blob);
         im_->gpu->cache.reset(new strata::core::ExpertCache());
         if (keep_cache_mode()) im_->gpu->cache->set_segment_bytes((int64_t) 64 << 20);
         if (!im_->gpu->cache->open_sized(sizes, im_->g.n_layers, im_->g.n_experts, err)) return false;
