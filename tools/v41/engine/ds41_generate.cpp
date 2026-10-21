@@ -1139,6 +1139,7 @@ int main(int argc, char ** argv) {
     }
 #if defined(DS41_HAVE_DSPARK)
     std::unique_ptr<Ds41DSpark> dsp;
+    ggml_backend_t dsp_backend = nullptr;   // STRATA_DSPARK_DEVICE: the drafter's own backend on another card
 #endif
     // --serve: the VRAM expert cache's size for the server's Monitor tab ("Experts in VRAM"), each time it opens or
     // shuts (the deferred seed opens it only after the first prompt; a layer-major batch shuts it for the prompt)
@@ -1156,7 +1157,26 @@ int main(int argc, char ** argv) {
             sc.sidecar = dsp_path;
             sc.main_gguf = a.model;
             sc.max_append = 16;
-            if (!std::getenv("STRATA_DSPARK_OWN_HEAD")) sc.shared_head = dense.weight("output.weight");   // -0.7 GB
+            // STRATA_DSPARK_DEVICE=N (the N-th GPU in HIP_VISIBLE_DEVICES order): the drafter on another card - its
+            // 4.9 GB of weights (+ its own copy of the head, 0.7 GB) leave the primary ~270 expert slots more; the
+            // main_hidden rows and the drafts cross through host memory either way.  Shrink that card's
+            // STRATA_PEER_GIB by ~6 GiB.
+            static const int dsp_dev = std::getenv("STRATA_DSPARK_DEVICE") ? std::atoi(std::getenv("STRATA_DSPARK_DEVICE")) : -1;
+            if (dsp_dev >= 0) {
+                int gpu_i = 0;
+                ggml_backend_dev_t pick = nullptr;
+                for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+                    ggml_backend_dev_t d = ggml_backend_dev_get(i);
+                    if (ggml_backend_dev_type(d) != GGML_BACKEND_DEVICE_TYPE_GPU) continue;
+                    if (gpu_i++ == dsp_dev) { pick = d; break; }
+                }
+                if (!pick) { err = "STRATA_DSPARK_DEVICE: no such GPU"; return false; }
+                if (!dsp_backend) dsp_backend = ggml_backend_dev_init(pick, nullptr);
+                if (!dsp_backend) { err = "STRATA_DSPARK_DEVICE: backend init failed"; return false; }
+                sc.backend = dsp_backend;
+                std::fprintf(stderr, "\nDSpark: on %s (STRATA_DSPARK_DEVICE=%d, its own head)", ggml_backend_dev_name(pick), dsp_dev);
+            }
+            if (!std::getenv("STRATA_DSPARK_OWN_HEAD") && dsp_dev < 0) sc.shared_head = dense.weight("output.weight");   // -0.7 GB
             dsp = std::make_unique<Ds41DSpark>();
             const double ti = now_ms();
             if (!dsp->init(sc, err)) { err = "DSpark init: " + err; return false; }
