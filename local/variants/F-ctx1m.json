@@ -1,5 +1,5 @@
 {
- "_comment": "long-context variant of ds41-yuya-3gpu.json: --ctx 1048576 (the model maximum; the shared fp4 KV is ~1.2 GiB at 1M)",
+ "_comment": "long-context variant of ds41-yuya-3gpu.json: --ctx 1048576 (the model maximum; the shared fp4 KV is ~1.2 GiB at 1M). 2026-10-21: the drafter on the R9700 (STRATA_DSPARK_DEVICE=1, peer store 22 GiB) and a 0.5 GiB prestage = ~6 GiB more VRAM on card 0 for the layer-major prompt batch, whose attention graph grows with the context (the 524K needle OOM'd at 4150 columns); decode is a little slower with the drafter on the peer, irrelevant for a 2 h prompt",
  "exe": "local/ds41-engine.sh",
  "args": [
   "-m",
@@ -36,15 +36,16 @@
   "GGML_NO_BACKTRACE": "1",
   "STRATA_SERVE_DSPARK": "/home/yuya/models/dsv41-1017-strata/DSpark-1017-Q2K-Q4K-sidecar.gguf",
   "STRATA_DSPARK_DEPTH": "1",
-  "STRATA_PRESTAGE_GIB": "1.5",
+  "STRATA_PRESTAGE_GIB": "0.5",
   "STRATA_SERVE_STEP_MAX": "96",
   "STRATA_SERVE_PASS_BIAS": "0",
   "STRATA_TEXT_LOG": "local/v41-text.log",
   "HIP_VISIBLE_DEVICES": "0,1,2",
-  "STRATA_PEER_GIB": "28,20",
+  "STRATA_PEER_GIB": "22,20",
   "STRATA_PEER_FILL": "file",
   "STRATA_BLOB_TWIN": "/home/yuya/models/DeepSeek-V4.1-Flash-1017-Lucebox/DeepSeek-V4.1-Flash-1017-MXFP4-ABL.gguf",
-  "STRATA_BLOB_MIRROR_SHARE": "0.22"
+  "STRATA_BLOB_MIRROR_SHARE": "0.22",
+  "STRATA_DSPARK_DEVICE": "1"
  },
  "cwd": ".",
  "tokenizer": "/home/yuya/models/dsv41-1017-tokenizer",

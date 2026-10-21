@@ -1,0 +1,7 @@
+2needle 2needle_1:233  tokens 120397  messages 616  chars 575066  answer_chars 932
+2needle 2needle_1:214  tokens 129116  messages 660  chars 600989  answer_chars 1073
+4needle 4needle_1:241  tokens 120684  messages 608  chars 564256  answer_chars 2178
+4needle 4needle_1:289  tokens 129683  messages 668  chars 610884  answer_chars 273
+8needle 8needle_1:267  tokens 120067  messages 622  chars 565603  answer_chars 1275
+8needle 8needle_1:287  tokens 130536  messages 658  chars 630925  answer_chars 2175
+rows: 2needle_1:233,4needle_1:241,8needle_1:267

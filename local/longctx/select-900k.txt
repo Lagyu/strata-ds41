@@ -1,0 +1,12 @@
+2needle 2needle_1:120  tokens 853725  messages 4144  chars 4092877  answer_chars 1261
+2needle 2needle_1:123  tokens 902013  messages 4612  chars 4264615  answer_chars 702
+2needle 2needle_1:113  tokens 950108  messages 4698  chars 4499187  answer_chars 576
+4needle 4needle_1:189  tokens 850425  messages 4376  chars 4033427  answer_chars 743
+4needle 4needle_1:124  tokens 894086  messages 4688  chars 4191999  answer_chars 2039
+4needle 4needle_1:116  tokens 925980  messages 4856  chars 4371163  answer_chars 840
+8needle 8needle_1:150  tokens 850788  messages 4252  chars 4078806  answer_chars 1040
+8needle 8needle_1:103  tokens 906165  messages 4644  chars 4167644  answer_chars 2128
+8needle 8needle_1:182  tokens 939845  messages 4830  chars 4419897  answer_chars 1022
+rows: 
+
+# 1M target (user 10:15): the rows above replaced by ~986K-token ones from select-1m.txt; spares 2needle_1:176, 4needle_1:104, 8needle_1:180

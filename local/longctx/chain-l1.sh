@@ -5,7 +5,7 @@
 # log: logs/chain-l1.log.  The service is left on the 1M variant at the end (restart on the default to go back).
 cd /home/yuya/llm-src/strata-ds41
 PY=/home/yuya/llm-src/hfenv/bin/python3
-until grep -q "chain-f4 done" logs/chain-f4.log 2>/dev/null; do sleep 30; done
+until grep -q "chain-f4b done" logs/chain-f4b.log 2>/dev/null; do sleep 30; done
 until curl -s -m 5 http://127.0.0.1:8150/v1/models | grep -q loaded; do sleep 10; done
 echo "== NIAH scaling, default config (ctx 131072) $(date +%H:%M)"
 $PY local/longctx/niah_run.py --tokens 32768,65536,126000 --depths 0.5 --label niah-default

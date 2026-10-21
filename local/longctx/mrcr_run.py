@@ -104,18 +104,19 @@ def cmd_run(a):
             n, nm = count_tokens(tok, r["prompt"])
             ans_tokens = len(tok.encode(r["answer"], add_special_tokens=False).ids)
             max_new = a.max_new or min(4096, ans_tokens + 64)
+            label = a.label.replace("900k", "1m") if n > 950_000 else a.label   # the chain's stage name was written for ~900K rows
             print(f"== {name}:{i}  needles {needles}  ~{n} tokens  {nm} messages  answer {ans_tokens} tokens; max_new {max_new}", flush=True)
             try:
                 out, wall = chat(a.url, msgs, max_new)
             except Exception as e:  # noqa: BLE001
                 print("   request failed:", e, flush=True)
-                rec = {"label": a.label, "row": f"{name}:{i}", "needles": needles, "tokens_est": n, "error": str(e)}
+                rec = {"label": label, "row": f"{name}:{i}", "needles": needles, "tokens_est": n, "error": str(e)}
                 open(RESULTS, "a").write(json.dumps(rec) + "\n")
                 continue
             text = out["choices"][0]["message"]["content"]
             usage = out.get("usage", {})
             score = grade(text, r["answer"], r["random_string_to_prepend"])
-            rec = {"label": a.label, "row": f"{name}:{i}", "needles": needles, "tokens_est": n,
+            rec = {"label": label, "row": f"{name}:{i}", "needles": needles, "tokens_est": n,
                    "prompt_tokens": usage.get("prompt_tokens"), "completion_tokens": usage.get("completion_tokens"),
                    "wall_s": round(wall, 1), "score": round(score, 4), "prefix_ok": text.startswith(r["random_string_to_prepend"]),
                    "timings": (out.get("usage") or {}).get("timings") or out.get("timings"), "response_head": text[:200], "answer_head": r["answer"][:200]}

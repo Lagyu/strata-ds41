@@ -1829,7 +1829,13 @@ int main(int argc, char ** argv) {
                 // the fit above was calibrated with the default 1 GiB margin: a smaller --vram-margin (more decode
                 // slots) must not widen the batch past it (a 22K prompt at --vram-margin 0.5 took B=11914 and its
                 // 2.28 GiB graph buffer did not fit, 2026-10-18)
-                const double room = (double) frb - std::max(1.0, a.vram_margin_gib) * 1073741824.0 - 4.3 * 1073741824.0;
+                // long prompts (2026-10-21, the 524K needle): a dense sub-batch's attention graph grows with the
+                // context (index scores / top-k over every position for S rows): the 4150-column batch at 524K wanted
+                // a 4.66 GiB graph buffer, 2.47 GiB over the ~2.19 GiB the fixed term assumes, and the request failed
+                // ("graph allocation failed").  ~10 B per position per sub-batch row, so the fixed term grows by
+                // S * total * 10 B (0.64 GiB at 131K, 5 GiB at 1M); the fit shrinks the batch instead of failing
+                const double ctx_term = (double) S * (double) total * 10.0;
+                const double room = (double) frb - std::max(1.0, a.vram_margin_gib) * 1073741824.0 - 4.3 * 1073741824.0 - ctx_term;
                 const int fit = (int) std::max<int64_t>(2, (int64_t) (room / (0.95 * 1048576.0)));
                 pb_cap = std::min(PB, std::max(SB, fit));
                 if (vram_trace) std::fprintf(stderr, "vram trace: cap free %.2f GiB room %.2f GiB fit %d -> pb_cap %d\n",
