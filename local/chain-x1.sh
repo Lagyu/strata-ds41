@@ -9,7 +9,7 @@ cd /home/yuya/llm-src/strata-ds41
 XQ=/mnt/win/llm/xq-1017-v3
 wait_vram_zero() {
     for i in $(seq 1 90); do
-        used=$(rocm-smi --showmemuse 2>/dev/null | grep -E "GPU\[0\].*Used" | grep -oE "[0-9]+" | tail -1)
+        used=$(rocm-smi --showmemuse 2>/dev/null | grep -E "GPU\[0\].*VRAM%" | grep -oE "[0-9]+$")
         [ -n "$used" ] && [ "$used" -lt 3 ] && return 0
         sleep 5
     done
@@ -17,11 +17,16 @@ wait_vram_zero() {
 wait_loaded() { until curl -s -m 5 http://127.0.0.1:8150/v1/models | grep -q loaded; do sleep 10; done; }
 until grep -q "chain-l3 done" logs/chain-l3.log 2>/dev/null; do sleep 30; done
 until grep -q "build exit 0" logs/build-xolotl-merge.log 2>/dev/null; do sleep 30; done
-echo "== 1) merged-engine parity eval on the MXFP4-ABL model $(date +%H:%M)"
-sudo systemctl stop strata-ds41.service; wait_vram_zero
-local/eval-lucebox/run-eval-3gpu.sh merge-abl 2>&1 | tail -3
-cat local/eval-lucebox/merge-abl/score.json; echo
-echo "   reference base-3gpu: $(cat local/eval-lucebox/base-3gpu/score.json)"
+if [ -s local/eval-lucebox/merge-abl/score.json ]; then
+    echo "== 1) merged-engine parity eval: done earlier (2026-10-21 13:28, identical to base-3gpu) - skipped"
+    sudo systemctl stop strata-ds41.service 2>/dev/null; wait_vram_zero
+else
+    echo "== 1) merged-engine parity eval on the MXFP4-ABL model $(date +%H:%M)"
+    sudo systemctl stop strata-ds41.service; wait_vram_zero
+    local/eval-lucebox/run-eval-3gpu.sh merge-abl 2>&1 | tail -3
+    cat local/eval-lucebox/merge-abl/score.json; echo
+    echo "   reference base-3gpu: $(cat local/eval-lucebox/base-3gpu/score.json)"
+fi
 echo "== 2) XQ v3 eval $(date +%H:%M)"
 until [ -f $XQ/JOINED.ok ]; do sleep 30; done
 MODEL=$XQ/V41-XQ-1017-v3.gguf local/eval-lucebox/run-eval-3gpu.sh xq3 -- --rank $XQ/rank-1017-v3.bin 2>&1 | tail -3

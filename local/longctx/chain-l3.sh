@@ -8,7 +8,7 @@ cd /home/yuya/llm-src/strata-ds41
 PY=/home/yuya/llm-src/hfenv/bin/python3
 wait_vram_zero() {   # the old engine must have released its VRAM before the new one starts (else the new one OOMs)
     for i in $(seq 1 60); do
-        used=$(rocm-smi --showmemuse 2>/dev/null | grep -E "GPU\[0\].*Used" | grep -oE "[0-9]+" | tail -1)
+        used=$(rocm-smi --showmemuse 2>/dev/null | grep -E "GPU\[0\].*VRAM%" | grep -oE "[0-9]+$")
         [ -n "$used" ] && [ "$used" -lt 3 ] && return 0
         sleep 5
     done
