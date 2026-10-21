@@ -29,12 +29,20 @@ else
 fi
 echo "== 2) XQ v3 eval $(date +%H:%M)"
 until [ -f $XQ/JOINED.ok ]; do sleep 30; done
-MODEL=$XQ/V41-XQ-1017-v3.gguf local/eval-lucebox/run-eval-3gpu.sh xq3 -- --rank $XQ/rank-1017-v3.bin 2>&1 | tail -3
+if [ -s local/eval-lucebox/xq3/score.json ]; then
+    echo "   done earlier - skipped"
+else
+    MODEL=$XQ/V41-XQ-1017-v3.gguf local/eval-lucebox/run-eval-3gpu.sh xq3 -- --rank $XQ/rank-1017-v3.bin 2>&1 | tail -3
+fi
 cat local/eval-lucebox/xq3/score.json; echo
 grep -E "tier:|peer: device|VRAM:" local/eval-lucebox/xq3/seq0.log | head -4 | cut -c1-160
-echo "== 3) the service on XQ v3 + the speed set $(date +%H:%M)"
+echo "== 3) the speed set on the XQ v3 config $(date +%H:%M)"
 local/sweep.sh X-xq3 local/ds41-yuya-3gpu-xq3.json
 (cd /home/yuya/ds41 && python3 table.py F-ref F-ref3 X-xq3)
 grep -E "tier:|peer: device|expert slots|DSpark:" local/serve-engine.log | tail -5 | cut -c1-160
-echo local/ds41-yuya-3gpu-xq3.json > local/active-config
-echo "chain-x1 done $(date +%H:%M) (service on local/ds41-yuya-3gpu-xq3.json)"
+# 2026-10-21 15:30: XQ v3 scored KL 0.428 / top-1 72.9 % / ppl 11.13 on the held-out set (lossless: 0.045 / 93.6 % /
+# 8.63), so the service goes BACK to the MXFP4-ABL config until the user decides (quality first); the XQ config is
+# local/ds41-yuya-3gpu-xq3.json.
+echo local/ds41-yuya-3gpu.json > local/active-config
+sudo systemctl restart strata-ds41.service; wait_loaded
+echo "chain-x1 done $(date +%H:%M) (service back on local/ds41-yuya-3gpu.json)"
