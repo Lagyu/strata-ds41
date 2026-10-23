@@ -1,0 +1,9 @@
+{
+ "_comment": "MCP servers for the web chat's tools (Claude Desktop's format; run-ds41.sh passes this file as --mcp-config when it exists). The model sees them as duckduckgo__search / duckduckgo__fetch_content / duckduckgo__expand_link; only requests with \"strata_mcp\": true get them (the web app at http://127.0.0.1:8150/ sends it). duckduckgo-mcp-server 0.7.0 (nickclyde) in its own venv, with the [browser] extra: DuckDuckGo fingerprint-blocks plain httpx, so search falls back to curl_cffi's Chrome TLS; --fetch-backend auto does the same for pages behind Cloudflare. Options (env): DDG_SAFE_SEARCH (STRICT/MODERATE/OFF, default MODERATE), DDG_REGION (e.g. jp-ja; default none), DDG_SEARCH_RPM (default 30). Off: \"disabled\": true, or delete this file.",
+ "mcpServers": {
+  "duckduckgo": {
+   "command": "/home/yuya/tools/ddg-mcp/.venv/bin/duckduckgo-mcp-server",
+   "args": ["--fetch-backend", "auto"]
+  }
+ }
+}
