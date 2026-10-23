@@ -108,3 +108,16 @@ out/
 /HANDOFF_*.md
 /RESUME_PROMPT_*.md
 /START_HERE*.md
+
+# strata-ds41 on this box (local/): build copies, evaluation and profiling outputs, runtime state
+/local/ggml-src/
+/local/ggml-shared/
+/local/active-config
+/local/eval-lucebox/*/
+/local/eval-lucebox/*.npy
+/local/eval-lucebox/*.i32
+/local/secprof/eval/
+/local/longctx/results.jsonl
+/local/maya-s/*.ok
+# replays a private agent-harness session, so it stays on the machine
+/local/resume-test/
