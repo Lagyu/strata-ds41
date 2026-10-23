@@ -1,0 +1,12 @@
+[Unit]
+Description=RX 7900 XTX core clock cap and undervolt (/etc/amdgpu-undervolt.conf)
+After=systemd-modules-load.service systemd-udev-trigger.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/amdgpu-undervolt apply
+TimeoutStartSec=150
+
+[Install]
+WantedBy=multi-user.target

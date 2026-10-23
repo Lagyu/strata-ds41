@@ -1,0 +1,11 @@
+[Unit]
+Description=All fan headers at full speed (cools the OCuLink adapter)
+After=multi-user.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/fans-max.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

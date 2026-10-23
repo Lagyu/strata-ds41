@@ -1,0 +1,23 @@
+[Unit]
+Description=DeepSeek-V4.1-Flash-1017 (MXFP4, abliterated) on Strata 0.2.0 + the DeepSeek engine (strata-ds41 tree) - API on 127.0.0.1:8150
+# All the engines want the GPUs and most of the RAM.
+Conflicts=maya-l.service ds41.service strata-v41.service
+After=network-online.target
+
+[Service]
+User=yuya
+Group=yuya
+SupplementaryGroups=render video
+WorkingDirectory=/home/yuya/llm-src/strata-ds41
+Environment=HOME=/home/yuya
+# The expert arena is pinned host memory.
+LimitMEMLOCK=infinity
+LimitNOFILE=65536
+ExecStart=/home/yuya/llm-src/strata-ds41/local/run-ds41.sh
+ExecStartPost=-/home/yuya/llm-src/strata-ds41/local/warmup.sh
+TimeoutStartSec=900
+TimeoutStopSec=120
+Restart=no
+
+[Install]
+WantedBy=multi-user.target

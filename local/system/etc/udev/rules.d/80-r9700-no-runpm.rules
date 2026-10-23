@@ -1,0 +1,5 @@
+# Keep the Radeon AI PRO R9700 (1002:7551, OCuLink eGPU on the DEG1) out of runtime suspend (BACO).
+# 2026-10-21 23:04 its wake-up from BACO failed ("Failed to exit BACO state", SMU resume -62); the card stayed
+# unusable (ROCm init failed) until a reboot.  amdgpu's probe turns runtime PM back on, so this acts on the driver
+# "bind" event.  Cost: the card idles in D0 instead of powering down.  Undo: delete this file (and reboot).
+ACTION=="bind", SUBSYSTEM=="pci", DRIVER=="amdgpu", ATTR{vendor}=="0x1002", ATTR{device}=="0x7551", ATTR{power/control}="on"

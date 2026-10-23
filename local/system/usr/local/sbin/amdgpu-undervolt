@@ -1,0 +1,108 @@
+#!/bin/bash
+# amdgpu-undervolt - core clock cap + undervolt for the two RX 7900 XTX cards through amdgpu overdrive.
+# Linux side of the Windows gputune setup (the numbers mean the same). Set up 2026-10-18 by Claude Code.
+#
+#   amdgpu-undervolt apply    cap the core clock at GFXCLK_MAX_MHZ and shift the V/F curve by VOLT_MV - FACTORY_MV
+#   amdgpu-undervolt reset    factory settings until the next apply / boot
+#   amdgpu-undervolt status   overdrive table plus live clock, voltage, power and temperatures per card
+#
+# Values: /etc/amdgpu-undervolt.conf. At boot: amdgpu-undervolt.service (journalctl -b -u amdgpu-undervolt).
+# The overdrive file only exists when amdgpu.ppfeaturemask has bit 0x4000 (/etc/default/grub.d/91-amdgpu-overdrive.cfg).
+# A GPU reset after a hang puts that card back to factory settings; "sudo systemctl restart amdgpu-undervolt" re-applies.
+
+set -u
+CARDS="1849:5304 1849:5302"
+GFXCLK_MAX_MHZ=2800
+VOLT_MV=1040
+FACTORY_MV=1150
+WAIT_S=60
+[ -r /etc/amdgpu-undervolt.conf ] && . /etc/amdgpu-undervolt.conf
+OFFSET=$((VOLT_MV - FACTORY_MV))
+MASK=/sys/module/amdgpu/parameters/ppfeaturemask
+
+subsys() { local v d; v=$(<"$1/subsystem_vendor"); d=$(<"$1/subsystem_device"); echo "${v#0x}:${d#0x}"; }
+name() { echo "${1##*/} ($(subsys "$1"))"; }
+
+# the listed cards: AMD display functions whose PCI subsystem id is in CARDS (so slot moves or another AMD card don't matter)
+find_cards() {
+  local d
+  for d in /sys/bus/pci/devices/*; do
+    [ "$(<"$d/vendor")" = 0x1002 ] || continue
+    case $(<"$d/class") in 0x03*) ;; *) continue ;; esac
+    case " $CARDS " in *" $(subsys "$d") "*) echo "$d" ;; esac
+  done
+}
+
+od_unlocked() { [ -r $MASK ] && (( $(<$MASK) & 0x4000 )); }
+od_sclk_max() { awk '/^OD_SCLK:/ {s = 1; next} s && /^1:/ {print $2 + 0; exit}' "$1/pp_od_clk_voltage"; }
+od_offset() { awk '/^OD_VDDGFX_OFFSET:/ {getline; print $1 + 0; exit}' "$1/pp_od_clk_voltage"; }
+
+cmd_apply() {
+  local i n d f want rc=0
+  want=$(wc -w <<<"$CARDS")
+  # at boot amdgpu may still be initialising the cards: wait for every listed card's overdrive file
+  for ((i = 0; ; i++)); do
+    if [ -r $MASK ] && ! od_unlocked; then
+      echo "overdrive is locked: amdgpu.ppfeaturemask=$(<$MASK) lacks bit 0x4000 (needs a boot with /etc/default/grub.d/91-amdgpu-overdrive.cfg)"
+      return 1
+    fi
+    n=0
+    for d in $(find_cards); do [ -e "$d/pp_od_clk_voltage" ] && n=$((n + 1)); done
+    if [ "$n" -ge "$want" ] || [ "$i" -ge "$WAIT_S" ]; then break; fi
+    sleep 1
+  done
+  for d in $(find_cards); do
+    f=$d/pp_od_clk_voltage
+    if [ ! -e "$f" ]; then
+      echo "$(name "$d"): no overdrive file, skipped"; rc=1; continue
+    fi
+    if printf 's 1 %d\n' "$GFXCLK_MAX_MHZ" >"$f" && printf 'vo %d\n' "$OFFSET" >"$f" && printf 'c\n' >"$f"; then
+      if [ "$(od_sclk_max "$d")" = "$GFXCLK_MAX_MHZ" ] && [ "$(od_offset "$d")" = "$OFFSET" ]; then
+        echo "$(name "$d"): core max $GFXCLK_MAX_MHZ MHz, voltage offset $OFFSET mV ($VOLT_MV mV vs factory $FACTORY_MV) - ok"
+      else
+        echo "$(name "$d"): written, but reads back core max $(od_sclk_max "$d") MHz, offset $(od_offset "$d") mV"; rc=1
+      fi
+    else
+      # a rejected value leaves an uncommitted edit behind: drop it and stay on factory settings
+      printf 'r\n' >"$f"; printf 'c\n' >"$f"
+      echo "$(name "$d"): FAILED (driver rejected the values, card left at factory settings)"; rc=1
+    fi
+  done
+  n=$(find_cards | wc -l)
+  [ "$n" -ge "$want" ] || { echo "only $n of $want listed cards present ($CARDS)"; rc=1; }
+  return $rc
+}
+
+cmd_reset() {
+  local d rc=0
+  for d in $(find_cards); do
+    if [ -e "$d/pp_od_clk_voltage" ] && printf 'r\n' >"$d/pp_od_clk_voltage" && printf 'c\n' >"$d/pp_od_clk_voltage"; then
+      echo "$(name "$d"): factory settings (core max $(od_sclk_max "$d") MHz, offset $(od_offset "$d") mV)"
+    else
+      echo "$(name "$d"): reset FAILED"; rc=1
+    fi
+  done
+  return $rc
+}
+
+cmd_status() {
+  local d h p
+  od_unlocked || echo "overdrive locked (amdgpu.ppfeaturemask=$(cat $MASK 2>/dev/null)); a boot with /etc/default/grub.d/91-amdgpu-overdrive.cfg unlocks it"
+  echo "configured: core max $GFXCLK_MAX_MHZ MHz, $VOLT_MV mV (offset $OFFSET mV vs factory $FACTORY_MV) for $CARDS"
+  for d in $(find_cards); do
+    h=$(ls -d "$d"/hwmon/hwmon* | head -1)
+    p=$(cat "$h/power1_average" 2>/dev/null || cat "$h/power1_input" 2>/dev/null || echo 0)
+    echo "== $(name "$d")"
+    [ -r "$d/pp_od_clk_voltage" ] && sed 's/^/   /' "$d/pp_od_clk_voltage"
+    echo "   now: core $(awk '/\*/ {print $2}' "$d/pp_dpm_sclk"), vddgfx $(<"$h/in0_input") mV, power $((p / 1000000)) W" \
+         "(cap $(($(<"$h/power1_cap") / 1000000)) W), edge $(($(<"$h/temp1_input") / 1000)) C," \
+         "junction $(($(<"$h/temp2_input") / 1000)) C, busy $(<"$d/gpu_busy_percent")%"
+  done
+}
+
+case ${1:-status} in
+  apply) cmd_apply ;;
+  reset) cmd_reset ;;
+  status) cmd_status ;;
+  *) echo "usage: ${0##*/} apply|reset|status" >&2; exit 2 ;;
+esac

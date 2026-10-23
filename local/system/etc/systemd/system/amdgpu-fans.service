@@ -1,0 +1,12 @@
+[Unit]
+Description=AMD GPU fan curves: 50% floor, zero-RPM off, steeper curve - airflow over the M.2 drives (/usr/local/sbin/amdgpu-fans.sh)
+After=systemd-modules-load.service systemd-udev-trigger.service amdgpu-undervolt.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/amdgpu-fans.sh
+TimeoutStartSec=60
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,11 @@
+[Unit]
+Description=CPU package power cap (RAPL PL1 110 W / PL2 140 W)
+After=multi-user.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/cpu-power-cap.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
