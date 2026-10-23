@@ -1,3 +1,7 @@
+> **This fork:** the DeepSeek-V4.1 server of one AMD workstation (2x Radeon RX 7900 XTX + Radeon AI PRO R9700, ROCm):
+> Xolotl's engine on Strata 0.2.0, plus serving work and the machine's configuration. See
+> [local/README.md](local/README.md). The rest of this page is upstream's README.
+
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="apps/host/public/brand/strata-lockup-dark.svg">
