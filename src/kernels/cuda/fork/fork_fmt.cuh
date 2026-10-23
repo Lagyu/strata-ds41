@@ -31,5 +31,7 @@ template<> struct Fmt<143> { static constexpr int qk = 128, ipb = 4, step = 1;
 // "moe lora: routed-expert deltas on 26 layer(s) (n_embd 4096, n_ff 2048)".  Fmt<12>/Fmt<18>/Fmt<22> are all
 // defined in this build, so this is the whole fix (see HANDOFF.md §6).
 #define STRATA_GU_FMTS_FORK(X) X(10) X(11) X(39) X(143)
-#define STRATA_D_FMTS_FORK(X) X(10) X(11) X(12) X(18) X(22) X(39) X(143)
+// 2026-10-23: IQ3_S (21) as a DOWN format too - peasantsmith's Maya-S DeepSeek-V4.1 quant has IQ3_S down on layers 0-3
+// and 36-39 (IQ2_S gate/up); Fmt<21> / Split<21> are upstream's (gate/up had it), only the list lacked it.
+#define STRATA_D_FMTS_FORK(X) X(10) X(11) X(12) X(18) X(21) X(22) X(39) X(143)
 #define STRATA_MMVQ_FMTS_FORK(X) X(10) X(39) X(143)

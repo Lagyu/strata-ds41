@@ -362,6 +362,14 @@ int main(int argc, char** argv) {
     check(42, 42, 2560, 640, s, rng);
     check(21, 20, 2560, 640, s, rng);                                   // a model's shapes
     check(21, 23, 2560, 768, s, rng);
+    // DeepSeek-V4.1 Maya-S (2026-10-23): IQ2_XXS / IQ3_XXS on layers 4-35, IQ2_S / IQ3_S on layers 0-3 and 36-39 (the
+    // IQ3_S down format is fork_fmt.cuh's addition), small shapes and the model's own (n_embd 5120, n_ff 2304)
+    check(16, 18, 512, 256, s, rng);
+    check(22, 21, 512, 256, s, rng);
+    check(16, 21, 512, 256, s, rng);
+    check(22, 18, 512, 256, s, rng);
+    check(16, 18, 5120, 2304, s, rng);
+    check(22, 21, 5120, 2304, s, rng);
     if (do_bench) bench(s, rng);
     std::printf("native_grouped_parity: %d failures\n", g_fail);
     cudaStreamDestroy(s);
