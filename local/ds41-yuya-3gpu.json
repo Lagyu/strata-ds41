@@ -1,5 +1,5 @@
 {
- "_comment": "Third configuration (the current default): the x16 XTX (HIP 0) primary; the R9700 (HIP 1, OCuLink x4) and the second XTX (HIP 2, chipset x4) as peer expert tiers whose stores take the FILE tier's head (STRATA_PEER_FILL=file: the experts neither the primary's VRAM nor the arena holds), 28 + 20 GiB; a 95 GiB arena; DSpark depth 1 (measured: 7.0/7.1/7.9/5.5 vs depth 2's 7.1/6.4/7.2/5.1 and depth 4's ~5.1/4.2/5.1/3.4; depth 3 and the speculative NVMe reads lose); the peers also compute their experts' rows in the prompt chunk (the default since 2026-10-20: 4K prefill 81 -> 140 tok/s). KV cache: --kv-fp4 (Xolotl's bit-exact packing of the model's own KV rounding): held-out ppl 8.621 / top-1 93.1% / KL 0.0449 against the FP8 teacher (8.56), the fork's --kv-q8 8.650 / 93.0% / 0.0450, same speed. STRATA_BLOB_TWIN: the Linux SSD's copy of the model file serves 0.22 of every file-tier blob's parts (measured 7.4/7.1/8.5/5.4 vs 7.1/6.8/8.0/5.2 without; 0.30 is worse).",
+ "_comment": "2026-10-22 10:30: STRATA_SERVE_PARK_MAX 1114112 (>= ctx + 64): the engine parks the live conversation for ANY unrelated request (a Strata chat question, a dsh summary or subagent) and restores it when its next turn comes - the 65536 default never fit once requests carry dsh's 256K max_tokens or the 1M context's room. A full park copies the 4 kv-source layers' NVFP4 comp + MXFP4 idxk rows = ~0.94 GB to host RAM (356 B a row; 3 ratio-2 layers x 524,289 rows + 1 ratio-1 layer x 1,048,577). 2026-10-22, for DeepSeek Harness's default config (user: \"adjust the settings of our LLM server to use the deepseek harness's default config, with 1M context length\"): --ctx 1048576 with the long-context VRAM layout of local/variants/F-ctx1m.json (the drafter on the R9700 = STRATA_DSPARK_DEVICE=1, peer stores 22,20 GiB, prestage 0.5 GiB: ~6 GiB more on card 0 for a long prompt's attention graph; the 524K needle passed with it), and no server-side thinking budget (was reasoning_budget_tokens 4096; dsh sends none and caps a reply at 256K tokens). The 131K settings before: git show HEAD:local/ds41-yuya-3gpu.json. Third configuration (the current default): the x16 XTX (HIP 0) primary; the R9700 (HIP 1, OCuLink x4) and the second XTX (HIP 2, chipset x4) as peer expert tiers whose stores take the FILE tier's head (STRATA_PEER_FILL=file: the experts neither the primary's VRAM nor the arena holds), 28 + 20 GiB; a 95 GiB arena; DSpark depth 1 (measured: 7.0/7.1/7.9/5.5 vs depth 2's 7.1/6.4/7.2/5.1 and depth 4's ~5.1/4.2/5.1/3.4; depth 3 and the speculative NVMe reads lose); the peers also compute their experts' rows in the prompt chunk (the default since 2026-10-20: 4K prefill 81 -> 140 tok/s). KV cache: --kv-fp4 (Xolotl's bit-exact packing of the model's own KV rounding): held-out ppl 8.621 / top-1 93.1% / KL 0.0449 against the FP8 teacher (8.56), the fork's --kv-q8 8.650 / 93.0% / 0.0450, same speed. STRATA_BLOB_TWIN: the Linux SSD's copy of the model file serves 0.22 of every file-tier blob's parts (measured 7.4/7.1/8.5/5.4 vs 7.1/6.8/8.0/5.2 without; 0.30 is worse). 2026-10-23 00:00: STRATA_SERVE_LOOKUP=8 (lookup decoding: when the last 4 tokens occurred earlier in the request, the tokens that followed them are the verify pass's drafts; verified, so the same output): measured +20% on a copy-heavy 400-token output (8.9 -> 10.7 tok/s, 8 tokens/pass), neutral (+1-3%) on plain prose; local/perf-probe 2026-10-22 23:27. Also measured and rejected there: STRATA_SERVE_KEEP_CACHE=1 with --no-vram-lru (no cache re-open after a read, but the static VRAM set decodes 29% slower than the LRU set); appends of 150-400 tokens as decode-side passes (10.9 / 24.0 s vs the batch's 8.2 / 11.2 s). 2026-10-23 06:30 (build-hip/ds41_generate = the 06:06 build-hip2 build; rollback .prod-1022-2242): STRATA_SERVE_PREFIX_DIR (shared-prefix parks also kept as 0600 files, loaded at start: a restart no longer re-reads each subagent system prompt; the files hold the prefix's token ids - unset the env to stop), STRATA_DSPARK_CONF=0.5 (Maya v1.1.20's cumulative draft cut at depth 1: a draft with confidence below 0.5 is not verified; +3-5% decode measured, same output), a STOP during a prompt read now ends it within a layer (completed 8192-token batches stay loaded). STRATA_SERVE_KEEP_CACHE must stay unset: on HIP the segmented cache does not exist and keep mode disables the VRAM cache (measured -30% decode).",
  "exe": "local/ds41-engine.sh",
  "args": [
   "-m",
@@ -13,7 +13,7 @@
   "--threads",
   "12",
   "--ctx",
-  "131072",
+  "1048576",
   "--stop",
   "1",
   "--kv-fp4",
@@ -36,15 +36,23 @@
   "GGML_NO_BACKTRACE": "1",
   "STRATA_SERVE_DSPARK": "/home/yuya/models/dsv41-1017-strata/DSpark-1017-Q2K-Q4K-sidecar.gguf",
   "STRATA_DSPARK_DEPTH": "1",
-  "STRATA_PRESTAGE_GIB": "1.5",
+  "STRATA_PRESTAGE_GIB": "0.5",
   "STRATA_SERVE_STEP_MAX": "96",
   "STRATA_SERVE_PASS_BIAS": "0",
   "STRATA_TEXT_LOG": "local/v41-text.log",
   "HIP_VISIBLE_DEVICES": "0,1,2",
-  "STRATA_PEER_GIB": "28,20",
+  "STRATA_PEER_GIB": "22,20",
   "STRATA_PEER_FILL": "file",
   "STRATA_BLOB_TWIN": "/home/yuya/models/DeepSeek-V4.1-Flash-1017-Lucebox/DeepSeek-V4.1-Flash-1017-MXFP4-ABL.gguf",
-  "STRATA_BLOB_MIRROR_SHARE": "0.22"
+  "STRATA_BLOB_MIRROR_SHARE": "0.22",
+  "STRATA_DSPARK_DEVICE": "1",
+  "STRATA_SERVE_TAIL_RESUME": "1",
+  "STRATA_ROUTE_COUNTS": "/home/yuya/datasets/prod-route-counts/counts.csv",
+  "STRATA_SERVE_PARK_SLOTS": "12",
+  "STRATA_SERVE_PARK_GIB": "4",
+  "STRATA_SERVE_LOOKUP": "8",
+  "STRATA_SERVE_PREFIX_DIR": "/home/yuya/.cache/strata-ds41/prefix",
+  "STRATA_DSPARK_CONF": "0.5"
  },
  "cwd": ".",
  "tokenizer": "/home/yuya/models/dsv41-1017-tokenizer",
@@ -58,6 +66,5 @@
   "top_p": 0.95
  },
  "reasoning_loop_recovery": "recover",
- "reasoning_budget_tokens": 4096,
  "reasoning_close_retry": true
 }

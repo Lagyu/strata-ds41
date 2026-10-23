@@ -38,6 +38,7 @@ json.dump(cfg, open(out, "w"), indent=1)
 print("variant:", out, "<-", base, *kv)
 EOF
 echo "$OUT" > local/active-config
+# (2026-10-23: the readiness check sends STRATA_API_KEY when the environment has it - the server wants it since lan.env)
 # stop, wait until every card's VRAM is released (a start right after a stop found 8 GiB still held on the primary:
 # the dense weights' cudaMalloc failed), then start
 sudo systemctl stop strata-ds41.service
@@ -49,7 +50,7 @@ done
 sudo systemctl start strata-ds41.service || exit 1
 sleep 5
 for i in $(seq 1 90); do
-  code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8150/v1/models 2>/dev/null)
+  code=$(curl -s -o /dev/null -w '%{http_code}' ${STRATA_API_KEY:+-H "Authorization: Bearer $STRATA_API_KEY"} http://127.0.0.1:8150/v1/models 2>/dev/null)
   [ "$code" = "200" ] && break
   systemctl is-active -q strata-ds41.service || { echo "$LABEL: the service died while loading"; tail -5 local/serve-engine.log | cut -c1-200; exit 1; }
   sleep 5

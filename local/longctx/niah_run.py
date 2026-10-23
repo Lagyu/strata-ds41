@@ -40,7 +40,10 @@ def build(tok, text_ids, n_tokens, depth, code):
 def chat(url, messages, max_new):
     body = json.dumps({"model": "deepseek-v4.1-flash-1017", "messages": messages, "temperature": 0.0,
                        "max_tokens": max_new, "stream": False, "reasoning_effort": "none"}).encode()
-    req = urllib.request.Request(url + "/v1/chat/completions", data=body, headers={"Content-Type": "application/json"})
+    headers = {"Content-Type": "application/json"}
+    if os.environ.get("STRATA_API_KEY"):  # the server wants its key once lan.env is set
+        headers["Authorization"] = "Bearer " + os.environ["STRATA_API_KEY"]
+    req = urllib.request.Request(url + "/v1/chat/completions", data=body, headers=headers)
     t0 = time.time()
     with urllib.request.urlopen(req, timeout=None) as resp:
         out = json.loads(resp.read().decode())
