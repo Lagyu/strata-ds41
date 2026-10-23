@@ -274,6 +274,32 @@ void Ds41DSpark::reset() {
     p_->filled.assign(WIN, -1);
 }
 
+bool Ds41DSpark::window_out(std::vector<uint8_t> & bytes, std::vector<int> & filled) const {
+    const Impl & im = *p_;
+    if (im.ring.empty()) return false;
+    ggml_backend_synchronize(im.be);
+    size_t total = 0;
+    for (ggml_tensor * t : im.ring) total += ggml_nbytes(t);
+    bytes.resize(total);
+    size_t off = 0;
+    for (ggml_tensor * t : im.ring) { ggml_backend_tensor_get(t, bytes.data() + off, 0, ggml_nbytes(t)); off += ggml_nbytes(t); }
+    filled = im.filled;
+    return true;
+}
+
+bool Ds41DSpark::window_in(const std::vector<uint8_t> & bytes, const std::vector<int> & filled) {
+    Impl & im = *p_;
+    size_t total = 0;
+    for (ggml_tensor * t : im.ring) total += ggml_nbytes(t);
+    if (im.ring.empty() || bytes.size() != total || filled.size() != (size_t) WIN) { im.err = "DSpark window_in: not this stack's window"; return false; }
+    ggml_backend_synchronize(im.be);
+    size_t off = 0;
+    for (ggml_tensor * t : im.ring) { ggml_backend_tensor_set(t, bytes.data() + off, 0, ggml_nbytes(t)); off += ggml_nbytes(t); }
+    ggml_backend_synchronize(im.be);
+    im.filled = filled;
+    return true;
+}
+
 static ggml_tensor * fake_quant_fp8(ggml_context * c, ggml_tensor * x) {
 #if defined(STRATA_DSV41_FQ_OP)
     static const bool composite = std::getenv("STRATA_FQ_COMPOSITE") != nullptr;

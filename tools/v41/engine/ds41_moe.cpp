@@ -5980,7 +5980,6 @@ int64_t Ds41MoeTier::shrink_cache_for(int64_t need_bytes, std::string& err) {
     // every refusal says why (s6: the first A/B never kept the cache and logged nothing)
     if (!im_->gpu || !im_->gpu->cache) { err = "no VRAM cache"; return -1; }
     if (!im_->gpu->cache->segmented()) { err = "the cache is not segmented"; return -1; }
-    if (im_->cfg.vram_lru) { err = "--vram-lru"; return -1; }
     if (!im_->shrunk.empty()) { err = "still shrunk from the last batch (regrow_cache did not run)"; return -1; }
     strata::core::ExpertCache& c = *im_->gpu->cache;
     if (cudaDeviceSynchronize() != cudaSuccess) { err = "shrink_cache_for: device failed"; return -1; }
@@ -5996,6 +5995,39 @@ int64_t Ds41MoeTier::shrink_cache_for(int64_t need_bytes, std::string& err) {
     }
     const int64_t keep = c.slots_within(keep_bytes);
     const int64_t NX = im_->g.n_experts;
+    if (im_->cfg.vram_lru) {
+        // 2026-10-23: under the LRU the slots are in replacement order, not rank order, so the tail is not the coldest.
+        // Gather the `keep` most recently used experts (vlast = the tick of the last use; the seed's order for the
+        // untouched) below the shrink point by swapping their blobs with the cold ones there, then evict the tail as
+        // before - the decode after the batch keeps the set it had.  Uniform slots only (swap_slots refuses sized ones,
+        // and the whole cache is released then, as without keep-cache).
+        struct Ent { int64_t age; int32_t slot, l, e; };
+        std::vector<Ent> res;
+        for (int64_t l = 0; l < im_->g.n_layers; ++l)
+            for (int64_t e = 0; e < NX; ++e) {
+                const int32_t sl = c.slot_of(l, e);
+                if (sl < 0) continue;
+                const int64_t age = im_->vlast.empty() ? -1 : im_->vlast[(size_t) (l * NX + e)];
+                res.push_back({ age, sl, (int32_t) l, (int32_t) e });
+            }
+        std::stable_sort(res.begin(), res.end(), [](const Ent& x, const Ent& y) { return x.age != y.age ? x.age > y.age : x.slot < y.slot; });
+        std::vector<char> hot((size_t) c.slots(), 0);
+        const size_t nkeep = std::min<size_t>((size_t) keep, res.size());
+        for (size_t i = 0; i < nkeep; ++i) hot[(size_t) res[i].slot] = 1;
+        std::vector<int32_t> low;   // slots below the point that hold a cold expert, or nothing
+        for (int64_t s = 0; s < keep; ++s) if (!hot[(size_t) s]) low.push_back((int32_t) s);
+        size_t li = 0;
+        int64_t swaps = 0;
+        const double ts = now_ms();
+        for (size_t i = 0; i < nkeep && li < low.size(); ++i) {
+            if (res[i].slot < keep) continue;
+            if (!c.swap_slots(res[i].slot, low[li++], err)) return -1;
+            ++swaps;
+        }
+        if (cudaDeviceSynchronize() != cudaSuccess) { err = "shrink_cache_for: the slot swaps failed"; return -1; }
+        std::fprintf(stderr, "serve: keep-cache: %lld of %lld slots stay (LRU order, %lld swaps in %.0f ms)\n", (long long) keep,
+                     (long long) c.slots(), (long long) swaps, now_ms() - ts);
+    }
     std::vector<std::array<int32_t, 3>> gone;
     for (int64_t l = 0; l < im_->g.n_layers; ++l)
         for (int64_t e = 0; e < NX; ++e) {
@@ -6253,7 +6285,66 @@ struct Rebal {
     bool decode_reads = false;  ///< reads only between requests (s6: reads during decode cost it 5-19 %); STRATA_ARENA_REBAL_DECODE=1 = also during decode
 };
 
+// STRATA_ROUTE_COUNTS=<file> (measurement, off by default): every routed (layer, expert) pick the tier is asked to
+// run - decode, verify and prompt chunks alike, through rebal_count below - counted and written as Lucebox's
+// routing-stats.csv (a row per layer, a count per expert) every ~30 s and at exit.  It is a workload's expert profile
+// for tools/v41/splice_b.py rank --csv; nothing in the engine reads it back.
+namespace {
+struct RouteCounts {
+    std::string path;
+    int64_t nl = 0, ne = 0, k = 0;
+    std::vector<int64_t> c;
+    std::mutex mu;
+    double last_ms = 0;
+    void write() {
+        std::lock_guard<std::mutex> lock(mu);
+        const std::string tmp = path + ".tmp";
+        FILE* f = std::fopen(tmp.c_str(), "w");
+        if (!f) return;
+        std::fprintf(f, "# hotness table: n_layer=%lld n_expert=%lld n_expert_used=%lld\n", (long long) nl, (long long) ne,
+                     (long long) k);
+        std::fprintf(f, "# format: one row per layer, columns are expert activation counts (expert 0..N-1)\n");
+        for (int64_t l = 0; l < nl; ++l) {
+            for (int64_t e = 0; e < ne; ++e) std::fprintf(f, e ? ",%lld" : "%lld", (long long) c[(size_t) (l * ne + e)]);
+            std::fputc('\n', f);
+        }
+        std::fclose(f);
+        std::rename(tmp.c_str(), path.c_str());
+    }
+};
+RouteCounts* g_route_counts = nullptr;
+
+RouteCounts* route_counts(const Ds41MoeGeom& g) {
+    static std::once_flag once;
+    std::call_once(once, [&] {
+        const char* p = std::getenv("STRATA_ROUTE_COUNTS");
+        if (!p || !*p) return;
+        g_route_counts = new RouteCounts;
+        g_route_counts->path = p;
+        g_route_counts->nl = g.n_layers;
+        g_route_counts->ne = g.n_experts;
+        g_route_counts->k = g.top_k;
+        g_route_counts->c.assign((size_t) (g.n_layers * g.n_experts), 0);
+        std::atexit([] { g_route_counts->write(); });
+        std::fprintf(stderr, "route counts -> %s\n", p);
+    });
+    return g_route_counts;
+}
+}  // namespace
+
 void rebal_count(Ds41MoeImpl& im, int64_t layer, const int32_t* ids, int64_t n) {
+    if (RouteCounts* rc = route_counts(im.g); rc && layer >= 0 && layer < rc->nl) {
+        {
+            std::lock_guard<std::mutex> lock(rc->mu);
+            int64_t* row = rc->c.data() + (size_t) (layer * rc->ne);
+            for (int64_t i = 0; i < n; ++i)
+                if (ids[i] >= 0 && ids[i] < rc->ne) ++row[ids[i]];
+        }
+        if (layer == rc->nl - 1 && now_ms() - rc->last_ms > 30000.0) {
+            rc->last_ms = now_ms();
+            rc->write();
+        }
+    }
     if (!im.rebal || layer < 0 || layer >= im.g.n_layers) return;
     const int64_t NX = im.g.n_experts;
     float* sc = im.rebal->score.data() + (size_t) (layer * NX);

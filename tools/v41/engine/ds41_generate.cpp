@@ -1249,6 +1249,14 @@ int main(int argc, char ** argv) {
     // the layer-major batch width for THIS turn: PB, clamped per request by the VRAM actually free (the --serve loop
     // sets it; a one-shot run keeps PB)
     int pb_cap = PB;
+    // 2026-10-23 (after Project Maya v1.1.20 "Stop stops, even while a long prompt is read"): --serve sets feed_cancel
+    // to a check of the command queue; a read that is cancelled ends after the layer it is in (a layer-major batch) or
+    // the pass it is in, and feed_done says how many of the feed's tokens were read COMPLETELY - the batch being read is
+    // abandoned (its rings restored to the batch's start; the rows it wrote lie past that point and are overwritten
+    // later), so the conversation stays loaded up to feed_done and the next request continues from there.
+    std::function<bool()> feed_cancel;
+    int feed_done = 0;
+    bool feed_cancelled = false;
     // STRATA_VRAM_TRACE=1: every allocation-relevant step prints the free VRAM (debugging a shared card)
     const bool vram_trace = std::getenv("STRATA_VRAM_TRACE") != nullptr;
     auto vram_log = [&](const char * where, int a) {
@@ -1259,10 +1267,25 @@ int main(int argc, char ** argv) {
     };
     auto feed = [&](const int * ids, int n, int pos0, const std::function<void(int)> & progress,
                     std::vector<float> * all_logits) -> bool {
+        feed_done = 0;
+        feed_cancelled = false;
+        auto give_up = [&](int done, bool restore_rings) -> bool {   // a cancel: leave feed() as its normal end does
+            if (restore_rings) dense.restore();
+            feed_done = done;
+            feed_cancelled = true;
+            ferr = "cancelled";
+            if (dc.elastic_cols && dense.set_columns(0) && rdev1) rdev1 = dense.routed_dev();
+            tier.release_chunk();
+            return false;
+        };
         for (int c0 = 0; c0 < n; ) {
             if (PB > 1 && n - c0 >= 2) {
                 // ---- layer-major: up to B tokens of every layer, the experts run once per layer over the whole batch
                 int B = std::min(pb_cap, n - c0);
+                // never leave ONE column for the end: it takes the sequential chunk path below, which does not capture the
+                // DSpark seed rows, so a prompt of 8192 k + 1 tokens failed with "DSpark batch seed captured nothing"
+                // (found 2026-10-22 with a 16385-token prompt; ~1 in 8192 big reads)
+                if (B > 2 && n - c0 - B == 1) --B;
                 // The batch must FIT: its state columns (~0.31 MiB a column) and its graph (~0.17 MiB a column,
                 // 8192 -> 1424 MiB) come out of whatever is left after everything else sharing the card (a
                 // desktop's STT server, DSpark's 2.9 GB, the dense half).  A batch that does not fit is retried at
@@ -1306,8 +1329,10 @@ int main(int argc, char ** argv) {
                     cut = (cut / SB) * SB;
                     if (!enc_reported) { enc_reported = true; std::fprintf(stderr, "enc-skip: first batch B=%d, cut=%d (phase A %d cols, phase B %d)\n", B, cut, cut, B - cut); }
                 }
+                if (feed_cancel) dense.snapshot(pos0 + c0);   // the rings at this batch's start (a cancel inside it restores them)
                 double t0 = now_ms();
                 for (int l = 0; l < n_layer; ++l) {
+                    if (feed_cancel && l > 0 && feed_cancel()) return give_up(c0, true);
                     if (l < 4) vram_log("batch layer", l);
                     // layer 20 is the last kv source: for phase A only its persistent KV writes run; layers 21-39 run
                     // nothing at all for phase A (their output columns are never read, and no later layer reads state
@@ -1359,7 +1384,9 @@ int main(int argc, char ** argv) {
                             if (!dense.read_state_cols(B - cn, cn, vx)) { ferr = dense.last_error(); return false; }
                             const size_t HC = vx.size() / ((size_t) cn * n_embd);
                             for (int t = 0; t < cn; ++t) {
-                                float * dst = bcap_vh.data() + (size_t) (bcap_n - cn + t) * 3 * n_embd + (size_t) j * n_embd;
+                                // rows [0, cn): the consumer reads them from the start (they used to sit at the END of the
+                                // bcap_n rows, so a final batch narrower than bcap_n seeded the drafter from zeros)
+                                float * dst = bcap_vh.data() + (size_t) t * 3 * n_embd + (size_t) j * n_embd;
                                 for (size_t h = 0; h < HC; ++h) {
                                     const float * xs = vx.data() + ((size_t) t * HC + h) * n_embd;
                                     for (int64_t d = 0; d < n_embd; ++d) dst[d] += xs[d] / (float) HC;
@@ -1382,6 +1409,7 @@ int main(int argc, char ** argv) {
                     if (!capture_tail(n, c0 + s, std::min(SB, B - s), s)) return false;
                 fd_logits += now_ms() - tl;
                 c0 += B;
+                if (feed_cancel && c0 < n && feed_cancel()) return give_up(c0, false);
             } else {
                 // ---- the sequential chunk path (unchanged): one pass of up to NP tokens through every layer
                 const int m = std::min(NP, n - c0);
@@ -1425,9 +1453,11 @@ int main(int argc, char ** argv) {
                 if (!capture_tail(n, c0, m, 0)) return false;
                 fd_logits += now_ms() - tl;
                 c0 += m;
+                if (feed_cancel && c0 < n && feed_cancel()) return give_up(c0, false);
             }
             progress(c0);
         }
+        feed_done = n;
         if (dc.elastic_cols) {   // back to S columns
             if (!dense.set_columns(0)) { ferr = dense.last_error(); return false; }
             if (rdev1) rdev1 = dense.routed_dev();
@@ -1453,7 +1483,7 @@ int main(int argc, char ** argv) {
             eof = true;
             qc.notify_all();
         }).detach();
-        auto next_line = [&](std::string & out) -> bool {
+        auto next_line = [&](std::string & out) -> bool {   // idle: wait for a line
             std::unique_lock<std::mutex> lk(qm);
             qc.wait(lk, [&] { return !q.empty() || eof; });
             if (q.empty()) return false;
@@ -1461,46 +1491,252 @@ int main(int argc, char ** argv) {
             q.pop_front();
             return true;
         };
-        auto stop_pending = [&]() -> bool {
+        auto try_line = [&](std::string & out) -> bool {    // between two passes: whatever has arrived, if anything
+            std::lock_guard<std::mutex> lk(qm);
+            if (q.empty()) return false;
+            out = q.front();
+            q.pop_front();
+            return true;
+        };
+        auto at_eof = [&]() -> bool { std::lock_guard<std::mutex> lk(qm); return eof && q.empty(); };
+        auto stop_pending = [&]() -> bool {   // a STOP line anywhere in the queue (consumed): the request being read is cancelled
             std::lock_guard<std::mutex> lk(qm);
             for (auto it = q.begin(); it != q.end(); ++it)
                 if (*it == "STOP") { q.erase(it); return true; }
             return false;
         };
+        feed_cancel = stop_pending;
         auto is_stop = [&](int t) { return std::find(a.stop.begin(), a.stop.end(), t) != a.stop.end() || t == (int) G.eos; };
         const int ctxv = (int) ctx;
+        // ---- the LIVE conversation: the one whose rows and rings are on the device.  (A request parked in the middle of
+        // its answer - several run at once, see the slots below - carries these in its Req meanwhile.)
         std::vector<int> hist;
-        int snap_len = -1;
-        std::vector<float> snap_logits;   // the last prompt row's logits at the snapshot (a repeated prompt samples from them)
+        int snap_len = -1;                 // its prompt's end (Ds41Dense::snapshot there): a regen / tail resume restarts there
+        int live_end = 0;                  // where a continuation restarts: hist.size(), or one less when the last verify pass
+                                           // left an open compressor group at an odd end (see end_req)
+        std::vector<float> snap_logits;    // the last prompt row's logits at the snapshot (a repeated prompt samples from them)
         // s6: DSpark's seed rows (main_hidden) of the snapshot's prompt tail - a repeated prompt (regenerate / a client
         // retry) feeds no new tokens, so without them DSpark had nothing to seed from and the whole answer decoded
         // without drafts (measured: 21.9 vs 31.8 tok/s on the same 1200-token edit).  cur_seed = this prompt's tail.
         std::vector<float> snap_seed, cur_seed;
         int snap_seed_n = 0, cur_seed_n = 0;
+        // the prompt-end snapshot rings as host bytes (Ds41Dense::rings_out at the snapshot), and whether the device's
+        // snapshot rings still hold them: a park of the conversation's END or of a request's decode position reuses
+        // Ds41Dense::snapshot, so before a regen / tail resume they are put back (ensure_snap_rings)
+        std::vector<uint8_t> snap_rings;
+        bool snap_rings_dev = false;
         int n_req = 0;
         // STRATA_SERVE_PARK (default on): an agent harness sends short UNRELATED requests between the turns of its main
         // conversation (titles, summaries).  Each wrote its own positions from 0 over the main conversation's caches, so
         // the next main turn re-read the whole prompt (2026-10-15 harness: a 454-token side call -> the 20,736-token
-        // system prompt again, 69.5 s).  Now the main conversation is parked (Ds41Dense::park: the snapshot rings + the
-        // rows the side request can write, to host memory) and unparked when a request continues it.
-        // STRATA_SERVE_PARK_MIN: only conversations of >= this many tokens (default 2048); STRATA_SERVE_PARK_MAX: the
-        // most positions a side request may write (prompt + max tokens, default 65536 ~ 1 GB of host memory).
+        // system prompt again, 69.5 s).  Now the main conversation is parked (a host copy) and put back when a request
+        // continues it.  STRATA_SERVE_PARK_MIN: only conversations of >= this many tokens (default 2048).
         const bool park_on = !(std::getenv("STRATA_SERVE_PARK") && std::getenv("STRATA_SERVE_PARK")[0] == '0');
+        // STRATA_SERVE_TAIL_RESUME (default on, =0 off): a request whose prompt leaves the snapshot's within its last
+        // dense.rollback_max() tokens restarts there instead of re-reading everything (see the reuse rules below)
+        const bool tail_resume = !(std::getenv("STRATA_SERVE_TAIL_RESUME") && std::getenv("STRATA_SERVE_TAIL_RESUME")[0] == '0');
         const int park_min = std::getenv("STRATA_SERVE_PARK_MIN") ? std::atoi(std::getenv("STRATA_SERVE_PARK_MIN")) : 2048;
-        const int64_t park_max = std::getenv("STRATA_SERVE_PARK_MAX") ? std::atoll(std::getenv("STRATA_SERVE_PARK_MAX")) : 65536;
-        std::vector<int> park_hist;       // the parked conversation's tokens (its snapshot length)
-        std::vector<float> park_logits;
-        int64_t park_rows = 0;            // positions saved: a request writing past this invalidates the park
+        // 2026-10-22, several agents at once (a parent and its subagents on this one engine): the old park kept ONE
+        // conversation and only the rows one unrelated request could write (prompt + max tokens), so it was dropped as soon as
+        // the next request of the other conversation reached a few hundred positions further - dsh asks for 256K output tokens
+        // - and every switch re-read a whole prompt (10K tokens 45 s, a 190K conversation 8 minutes).  Now every parked
+        // conversation is a COMPLETE host copy (Ds41Dense::park_out: every row up to its END and the rings there, ~0.9 KB a
+        // token, 170 MB at 190K) plus its prompt-end rings and logits, up to STRATA_SERVE_PARK_SLOTS (default 12) of them
+        // within STRATA_SERVE_PARK_GIB (default 8); the least recently used goes first.  A request that continues one swaps it
+        // in (the live conversation is parked first) - at its END (the next turn of a conversation reads only the new text,
+        // not the answer again), at its prompt end (the same prompt again, or a cancel-and-resend that leaves it within
+        // rollback_max() tokens), or within rollback_max() of its end.
+        // 2026-10-22 evening, SHARED PREFIXES: every subagent of an agent harness starts with the same system prompt + tools
+        // (dsh: ~9.3K tokens, 44 s to read), and every one read it in full - the parked conversations hold it, but a resume
+        // needs the window rings AT the point of divergence, which no park had.  Now, when a prompt shares at least
+        // STRATA_SERVE_PREFIX_MIN tokens (default 1024, 0 = off) beyond what it resumes from with any conversation the engine
+        // knows, its read is split there and the state at that point is parked as a SHARED PREFIX: served by copy (never
+        // consumed), kept while it is used (up to STRATA_SERVE_PREFIX_SLOTS, default 4, least recently used first), evicted
+        // after every ordinary park.  The next request that starts with it restarts right there.
+        struct ParkEntry {
+            Ds41Dense::ParkedPtr p;              // every row up to hist.size() + the rings at that END (snapshot pos = hist.size())
+            std::vector<int> hist;               // the prompt, and what was decoded after it (all but a token that would start an open group)
+            int snap_len = 0;                    // the prompt's end (== hist.size() when nothing was decoded, and for a prefix)
+            std::vector<uint8_t> prompt_rings;   // the rings at snap_len (empty when snap_len == hist.size(): the END rings are those)
+            std::vector<float> logits;           // the last prompt row's logits at snap_len
+            std::vector<float> seed;             // DSpark seed rows of the prompt's tail (a regen re-seeds the drafter from them)
+            int seed_n = 0;
+            std::vector<uint8_t> dsp_win;        // the drafter window at the END: a continuation keeps its drafts (empty: none saved)
+            std::vector<int> dsp_filled;
+            bool prefix = false;                 // a shared prefix (see above)
+            uint64_t stamp = 0;                  // when parked / last used (LRU)
+            int hits = 0;
+            std::string file;                    // the shared-prefix file it came from / went to (STRATA_SERVE_PREFIX_DIR; "" = none)
+        };
+        std::vector<ParkEntry> parks;
+        uint64_t park_clock = 0;
+        const size_t park_slots = std::getenv("STRATA_SERVE_PARK_SLOTS") ? (size_t) std::max(0, std::atoi(std::getenv("STRATA_SERVE_PARK_SLOTS"))) : 12;
+        const double park_cap = (std::getenv("STRATA_SERVE_PARK_GIB") ? std::atof(std::getenv("STRATA_SERVE_PARK_GIB")) : 8.0) * 1073741824.0;
+        const int prefix_min = std::getenv("STRATA_SERVE_PREFIX_MIN") ? std::atoi(std::getenv("STRATA_SERVE_PREFIX_MIN")) : 1024;
+        const size_t prefix_slots = std::getenv("STRATA_SERVE_PREFIX_SLOTS") ? (size_t) std::max(0, std::atoi(std::getenv("STRATA_SERVE_PREFIX_SLOTS"))) : 4;
+        auto parks_bytes = [&]() -> double {
+            double b = 0;
+            for (const auto & e : parks) b += (double) Ds41Dense::parked_bytes(e.p) + (double) e.prompt_rings.size() + (double) e.seed.size() * 4;
+            return b;
+        };
+        // STRATA_SERVE_PREFIX_DIR=<dir> (OPT-IN, unset = off): shared-prefix parks are also kept as files there (one per
+        // prefix: its token ids, the last-row logits, the DSpark seed rows and the park's rows, ~20 MiB at 9K tokens;
+        // 0600 in a 0700 directory) and loaded at the next start, so a restart does not cost each prefix's read again.
+        // A file holds the prefix's TOKENS - the harness's system prompt - so the user decides whether to turn it on.
+        // The files are keyed by the model file (size + mtime), the context size and the cache layout; one that does
+        // not match this engine is skipped.  Dropped prefixes take their file along.
+        const char * prefix_dir = std::getenv("STRATA_SERVE_PREFIX_DIR");
+        if (prefix_dir && !*prefix_dir) prefix_dir = nullptr;
+        uint64_t model_size = 0, model_mtime = 0;
+        if (prefix_dir) {
+            std::error_code ec;
+            model_size = (uint64_t) std::filesystem::file_size(a.model, ec);
+            model_mtime = (uint64_t) std::filesystem::last_write_time(a.model, ec).time_since_epoch().count();
+            std::filesystem::create_directories(prefix_dir, ec);
+            std::filesystem::permissions(prefix_dir, std::filesystem::perms::owner_all, std::filesystem::perm_options::replace, ec);
+        }
+        auto prefix_file_name = [&](const std::vector<int> & ids) -> std::string {   // FNV-1a 64 of the ids
+            uint64_t h = 1469598103934665603ull;
+            for (int t : ids) for (int k = 0; k < 4; ++k) { h ^= (uint64_t) ((((uint32_t) t) >> (8 * k)) & 255u); h *= 1099511628211ull; }
+            char nb[48];
+            std::snprintf(nb, sizeof(nb), "/pfx-%016llx.bin", (unsigned long long) h);
+            return std::string(prefix_dir) + nb;
+        };
+        auto prefix_file_save = [&](ParkEntry & e) {
+            if (!prefix_dir || !e.prefix) return;
+            std::vector<uint8_t> blob;
+            if (!dense.park_to_bytes(e.p, blob)) return;
+            const std::string path = prefix_file_name(e.hist), tmp = path + ".tmp";
+            {
+                std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
+                if (!f) { std::fprintf(stderr, "serve: prefix file: cannot write %s\n", tmp.c_str()); return; }
+                auto w64 = [&](uint64_t v) { f.write((const char *) &v, 8); };
+                f.write("DS41PFX1", 8);
+                w64(model_size); w64(model_mtime); w64((uint64_t) ctxv);
+                w64((uint64_t) e.hist.size()); w64((uint64_t) e.logits.size()); w64((uint64_t) n_embd); w64((uint64_t) e.seed_n);
+                w64((uint64_t) e.hist.size() + 64); w64((uint64_t) blob.size());
+                f.write((const char *) e.hist.data(), (std::streamsize) (e.hist.size() * 4));
+                f.write((const char *) e.logits.data(), (std::streamsize) (e.logits.size() * 4));
+                f.write((const char *) e.seed.data(), (std::streamsize) (e.seed.size() * 4));
+                f.write((const char *) blob.data(), (std::streamsize) blob.size());
+                if (!f) { std::fprintf(stderr, "serve: prefix file: write failed: %s\n", tmp.c_str()); return; }
+            }
+            std::error_code ec;
+            std::filesystem::permissions(tmp, std::filesystem::perms::owner_read | std::filesystem::perms::owner_write, std::filesystem::perm_options::replace, ec);
+            std::filesystem::rename(tmp, path, ec);
+            if (ec) { std::fprintf(stderr, "serve: prefix file: rename failed: %s\n", ec.message().c_str()); return; }
+            e.file = path;
+            std::fprintf(stderr, "serve: shared prefix of %zu tokens saved to %s (%.0f MiB)\n", e.hist.size(), path.c_str(),
+                         (double) std::filesystem::file_size(path, ec) / 1048576.0);
+        };
+        auto prefix_file_drop = [&](const ParkEntry & e) {
+            if (e.file.empty()) return;
+            std::error_code ec;
+            std::filesystem::remove(e.file, ec);
+        };
+        auto prefix_files_load = [&]() {
+            if (!prefix_dir) return;
+            std::error_code ec;
+            std::vector<std::pair<std::filesystem::file_time_type, std::string>> files;
+            for (const auto & de : std::filesystem::directory_iterator(prefix_dir, ec)) {
+                const std::string nm = de.path().filename().string();
+                if (nm.rfind("pfx-", 0) == 0 && nm.size() > 8 && nm.compare(nm.size() - 4, 4, ".bin") == 0)
+                    files.emplace_back(de.last_write_time(ec), de.path().string());
+            }
+            std::sort(files.begin(), files.end(), [](const auto & x, const auto & y) { return x.first > y.first; });
+            size_t loaded = 0;
+            for (const auto & fe : files) {
+                if (loaded >= prefix_slots) break;
+                std::ifstream f(fe.second, std::ios::binary);
+                char magic[8] = {0};
+                uint64_t h[9] = {0};
+                f.read(magic, 8);
+                f.read((char *) h, 72);
+                if (!f || std::memcmp(magic, "DS41PFX1", 8) != 0 || h[0] != model_size || h[1] != model_mtime || h[2] != (uint64_t) ctxv ||
+                    h[4] != (uint64_t) nv || h[5] != (uint64_t) n_embd || h[3] < 16 || h[3] > (uint64_t) ctxv || h[7] != h[3] + 64) {
+                    std::fprintf(stderr, "serve: prefix file skipped (another model / context / engine): %s\n", fe.second.c_str());
+                    continue;
+                }
+                ParkEntry e;
+                e.hist.resize((size_t) h[3]);
+                e.logits.resize((size_t) h[4]);
+                e.seed.resize((size_t) h[6] * 3 * (size_t) n_embd);
+                e.seed_n = (int) h[6];
+                std::vector<uint8_t> blob((size_t) h[8]);
+                f.read((char *) e.hist.data(), (std::streamsize) (e.hist.size() * 4));
+                f.read((char *) e.logits.data(), (std::streamsize) (e.logits.size() * 4));
+                f.read((char *) e.seed.data(), (std::streamsize) (e.seed.size() * 4));
+                f.read((char *) blob.data(), (std::streamsize) blob.size());
+                std::string perr;
+                if (!f || !(e.p = dense.park_from_bytes(blob.data(), blob.size(), (int64_t) h[7], perr))) {
+                    std::fprintf(stderr, "serve: prefix file skipped (%s): %s\n", perr.empty() ? "short" : perr.c_str(), fe.second.c_str());
+                    continue;
+                }
+                e.snap_len = (int) e.hist.size();
+                e.prefix = true;
+                e.stamp = 0;   // older than anything parked in this run: used ones move up, unused ones go first
+                e.file = fe.second;
+                parks.push_back(std::move(e));
+                ++loaded;
+            }
+            if (loaded) std::fprintf(stderr, "serve: %zu shared prefix(es) loaded from %s\n", loaded, prefix_dir);
+        };
+        auto evict_parks = [&](double need) {   // room for one more entry of `need` bytes: the least recently used first, prefixes last
+            while (!parks.empty() && (parks.size() >= park_slots || parks_bytes() + need > park_cap)) {
+                auto pick = parks.end();
+                for (auto it = parks.begin(); it != parks.end(); ++it)
+                    if (!it->prefix && (pick == parks.end() || it->stamp < pick->stamp)) pick = it;
+                if (pick == parks.end())
+                    for (auto it = parks.begin(); it != parks.end(); ++it)
+                        if (pick == parks.end() || it->stamp < pick->stamp) pick = it;
+                std::fprintf(stderr, "serve: park full - dropped the %zu-token %s\n", pick->hist.size(), pick->prefix ? "shared prefix" : "conversation");
+                prefix_file_drop(*pick);
+                parks.erase(pick);
+            }
+        };
+        auto ensure_snap_rings = [&]() {   // the device's snapshot rings = the live conversation's prompt-end rings (regen / tail resume)
+            if (!snap_rings_dev && snap_len > 0 && !snap_rings.empty() && dense.rings_in(snap_rings, snap_len)) snap_rings_dev = true;
+        };
         bool cache_open = !defer_vram;   // deferred: the arena only until the first decode
 #if defined(DS41_HAVE_DSPARK)
         // STRATA_SERVE_DSPARK: DSpark's window (main_hidden of the last <= 128 positions) is seeded by running a
         // request's last min(128, new) prompt tokens through pass_v instead of the passes / batch (no extra work), and
         // it carries over when the next request continues this one (dsp_next = the position its ring expects next);
-        // any other reuse resets it (lower acceptance for a while, never a different output).
+        // any other reuse resets it (lower acceptance for a while, never a different output) - unless the park kept the
+        // window (ParkEntry::dsp_win), which a continuation at the END puts back.
         int dsp_next = -1;
         const int sp_depth_serve = std::getenv("STRATA_DSPARK_DEPTH") ? std::max(1, std::min(5, std::atoi(std::getenv("STRATA_DSPARK_DEPTH")))) : 4;
         long sv_pass = 0, sv_acc = 0;
 #endif
+        // the conversation on the device into a park slot: its rows up to its END and the rings there, its prompt-end rings
+        // (a regen / tail resume at the prompt), the drafter window.  `end_len` = live_end: where a continuation restarts.
+        auto park_conv = [&](int end_len) -> bool {
+            if (!park_on || park_slots == 0 || snap_len < park_min || hist.size() < (size_t) snap_len || end_len < snap_len ||
+                end_len > (int) hist.size()) return false;
+            if (!dense.snapshot(end_len)) return false;   // the live rings are the END's
+            snap_rings_dev = false;
+            Ds41Dense::ParkedPtr p = dense.park_out((int64_t) end_len + 64);
+            if (!p) return false;
+            const double need = (double) Ds41Dense::parked_bytes(p) + (double) snap_rings.size() + (double) snap_seed.size() * 4;
+            if (need > park_cap) { std::fprintf(stderr, "serve: the %d-token conversation (%.0f MiB) does not fit the park\n", end_len, need / 1048576.0); return false; }
+            evict_parks(need);
+            ParkEntry e;
+            e.p = std::move(p);
+            e.hist.assign(hist.begin(), hist.begin() + end_len);
+            e.snap_len = snap_len;
+            if (end_len != snap_len) e.prompt_rings = snap_rings;
+            e.logits = snap_logits;
+            e.seed = snap_seed;
+            e.seed_n = snap_seed_n;
+#if defined(DS41_HAVE_DSPARK)
+            if (dsp && dsp_next == end_len) dsp->window_out(e.dsp_win, e.dsp_filled);
+#endif
+            e.stamp = ++park_clock;
+            parks.push_back(std::move(e));
+            std::fprintf(stderr, "serve: parked the %d-token conversation (prompt %d; %.0f MiB; %zu parked, %.0f MiB)\n", end_len, snap_len,
+                         need / 1048576.0, parks.size(), parks_bytes() / 1048576.0);
+            return true;
+        };
         // STRATA_SERVE_STEP_MAX: new prompt tokens up to which a request runs on the decode side - passes of
         // STRATA_SERVE_PASS_M tokens with the VRAM cache and the decode biases (~40 tok/s) - instead of the exact
         // layer-major batch (~16.8 s + n / 250 tok/s; measured crossover ~765 tokens); 0 = always the batch (every prompt
@@ -1508,11 +1744,65 @@ int main(int argc, char ** argv) {
         const int step_max = std::getenv("STRATA_SERVE_STEP_MAX") ? std::atoi(std::getenv("STRATA_SERVE_STEP_MAX")) : 768;
         // STRATA_SERVE_PASS_BIAS=0: those passes route exactly (the decode biases only while decoding)
         const bool pass_bias = !(std::getenv("STRATA_SERVE_PASS_BIAS") && std::getenv("STRATA_SERVE_PASS_BIAS")[0] == '0');
+        // ---- several requests at once: the server's batch slots (INFO batch_slots=N; BGEN <slot> ... / BT <slot> <id> /
+        // BDONE <slot> ... / BSTOP <slot>, see serve/server.py generate_batched).  This engine holds ONE conversation on the
+        // device, so the slots take turns: each runs STRATA_SERVE_SLICE verify passes (default 6, ~1.3 s), then its rows,
+        // rings, drafter window and sampler state go to host memory and the next one's come back (~10-20 ms a switch).  Every
+        // request streams from its start and none waits behind another's answer; the engine's total speed does not change
+        // (a pass is bound by the expert bytes it streams, which a second sequence only adds to), and a prompt read still
+        // runs alone (one layer-major batch).  STRATA_SERVE_SLOTS (default 4; 0 = one request at a time, GEN only).
+        const int n_slots = std::getenv("STRATA_SERVE_SLOTS") ? std::max(0, std::min(16, std::atoi(std::getenv("STRATA_SERVE_SLOTS")))) : 4;
+        const int slice_passes = std::max(1, std::getenv("STRATA_SERVE_SLICE") ? std::atoi(std::getenv("STRATA_SERVE_SLICE")) : 6);
+        struct Req {
+            int slot = -1;                     // -1: a solo request (GEN: T / DONE lines); >= 0: a batch slot (BT / BDONE)
+            bool active = false, live = false, stop_req = false;
+            // the conversation while it is not on the device (the live state above, moved here by park_req)
+            std::vector<int> hist;
+            int snap_len = -1, live_end = 0;
+            std::vector<float> snap_logits, snap_seed;
+            int snap_seed_n = 0;
+            std::vector<uint8_t> snap_rings;
+            int dsp_next = -1;
+            Ds41Dense::ParkedPtr park;         // rows + the rings at the decode position
+            std::vector<uint8_t> dsp_win;
+            std::vector<int> dsp_filled;
+            bool dsp_saved = false;
+            // sampling and routing
+            float temp = 0, top_p = 1, min_p = 0;
+            int tk = 0;
+            std::mt19937_64 rng;
+            PenaltyState pen;
+            float route_bias = 0, route_bias_file = 0;
+            int rprot = 0, rpool = 0;
+            // the request
+            int max_new = 0, total = 0, reused = 0, gen = 0;
+            double prompt_ms = 0, td0 = 0;
+            const char * finish = "length";
+            // the DSpark loop (as the one-shot loop: P = the last fed position, t = the token for P+1, sp_ids = drafts for P+2..)
+            bool spec = false;
+            int P = 0, t = -1, prev = 0;
+            bool dirty = false;
+            int sp_ids[5] = {0};
+            float sp_conf[5] = {0};
+            long rq_pass = 0, rq_acc = 0, lk_pass = 0, lk_dr = 0, lk_acc = 0;
+            int lk_cool = 0, lk_back = 1;
+            // the plain loop (no drafts): the next token to feed, its position
+            std::vector<float> lg;
+            int pos = 0, ptok = -1;
+            int slice = 0;                     // passes run in the current turn
+        };
+        std::vector<Req> reqs((size_t) n_slots + 1);   // the last one is the solo request
+        for (size_t i = 0; i < reqs.size(); ++i) reqs[i].slot = i + 1 < reqs.size() ? (int) i : -1;
+        Req * live_req = nullptr;              // the ACTIVE request whose conversation is on the device (null: a finished one, or none)
+        auto any_active = [&]() -> bool { for (const auto & r : reqs) if (r.active) return true; return false; };
+        prefix_files_load();
         std::printf("INFO ctx=%d experts_vram=%lld arena_experts=%lld\n", ctxv, (long long) tier.resident(),
                     (long long) tier.arena_experts());
+        if (n_slots > 0) std::printf("INFO batch_slots=%d\n", n_slots);
         std::printf("READY %d stop\n", ctxv);
         std::fflush(stdout);
-        std::fprintf(stderr, "serve: ready (ctx %d, prefill chunk %d)\n", ctxv, NP);
+        std::fprintf(stderr, "serve: ready (ctx %d, prefill chunk %d, %d request slots, slice %d passes, prefix parks >= %d tokens)\n",
+                     ctxv, NP, n_slots, slice_passes, prefix_min);
         // per-request decode biases (GEN keys route_bias= / route_bias_file=, from the server's "strata_tune"): a request
         // that names neither gets the --route-bias / --route-bias-file the engine started with, so one server can answer
         // exact-routing requests (both 0) beside the fast default without a restart.  apply_bias() writes zeros over a
@@ -1523,28 +1813,278 @@ int main(int argc, char ** argv) {
         auto env_rank = [](const char * k) { const char * e = std::getenv(k); return e ? std::max(0, std::atoi(e)) : 0; };
         const int cfg_rprot = env_rank("STRATA_RB_PROTECT"), cfg_rpool = env_rank("STRATA_RB_POOL");
         int cur_rprot = cfg_rprot, cur_rpool = cfg_rpool;
-        std::string line;
         bool previous_vision = false;
-        while (next_line(line)) {
-            if (line == "QUIT") break;
-            if (line == "STOP" || line.empty()) continue;
-            dense.clear_vision();
-            if (previous_vision) {
+        // ---- the live request off the device (into r), and back
+        auto park_req = [&](Req & r) {
+            const int top = (int) hist.size() + 32;   // a verify pass may have written rows past the accepted ones
+            dense.snapshot(std::min(top, ctxv - 1));
+            snap_rings_dev = false;
+            r.park = dense.park_out((int64_t) top + 64);
+#if defined(DS41_HAVE_DSPARK)
+            r.dsp_saved = dsp && dsp->window_out(r.dsp_win, r.dsp_filled);
+            r.dsp_next = dsp_next;
+            dsp_next = -1;
+#endif
+            r.hist = std::move(hist);
+            hist.clear();
+            r.snap_len = snap_len;
+            r.live_end = live_end;
+            snap_len = -1;
+            live_end = 0;
+            r.snap_logits = std::move(snap_logits);
+            r.snap_seed = std::move(snap_seed);
+            r.snap_seed_n = snap_seed_n;
+            r.snap_rings = std::move(snap_rings);
+            snap_rings.clear();
+            r.rng = rng;
+            r.pen = g_pen;
+            r.live = false;
+            live_req = nullptr;
+        };
+        auto make_live = [&](Req & r) -> bool {
+            if (r.live) return true;
+            if (live_req) park_req(*live_req);
+            else if (snap_len > 0 && !hist.empty()) park_conv(live_end);   // a finished conversation: kept for its next turn
+            hist.clear();
+            snap_len = -1;
+            if (!r.park || !dense.park_in(r.park) || !dense.restore()) { ferr = "the parked request could not be put back"; return false; }
+            r.park.reset();
+#if defined(DS41_HAVE_DSPARK)
+            if (dsp && r.dsp_saved) dsp->window_in(r.dsp_win, r.dsp_filled);
+            dsp_next = r.dsp_next;
+#endif
+            hist = std::move(r.hist);
+            snap_len = r.snap_len;
+            live_end = r.live_end;
+            snap_logits = std::move(r.snap_logits);
+            snap_seed = std::move(r.snap_seed);
+            snap_seed_n = r.snap_seed_n;
+            snap_rings = std::move(r.snap_rings);
+            snap_rings_dev = false;
+            rng = r.rng;
+            g_pen = r.pen;
+            if (!hist.empty()) dense.prime_history(hist.data(), std::max<int64_t>(0, (int64_t) hist.size() - 16), (int64_t) hist.size());
+            if (r.route_bias != a.route_bias || r.route_bias_file != a.route_bias_file) {
+                a.route_bias = r.route_bias;
+                a.route_bias_file = r.route_bias_file;
+                bias_now = true;
+                apply_bias();
+            }
+            if ((r.rprot != cur_rprot || r.rpool != cur_rpool) && dense.set_route_select(r.rprot, r.rpool)) {
+                cur_rprot = r.rprot;
+                cur_rpool = r.rpool;
+            }
+            r.live = true;
+            live_req = &r;
+            return true;
+        };
+        auto emit_tok = [&](Req & r, int tok) -> bool {   // false = the request ends with this token
+            if (r.slot >= 0) std::printf("BT %d %d\n", r.slot, tok); else std::printf("T %d\n", tok);
+            std::fflush(stdout);
+            ++r.gen;
+            if (is_stop(tok)) { r.finish = "stop"; return false; }
+            if (r.max_new > 0 && r.gen >= r.max_new) return false;
+            return true;
+        };
+        // the request is over (it is live): its figures, the conversation's END, the DONE / BDONE line
+        auto end_req = [&](Req & r, bool at_admission) {
+            const double dec_ms = now_ms() - r.td0;
+            const Ds41MoeStats st = tier.stats();
+            if (std::strcmp(r.finish, "error") == 0) {
+                std::fprintf(stderr, "serve: decode failed: %s\n", ferr.c_str());
                 hist.clear();
                 snap_len = -1;
-                previous_vision = false;
+                live_end = 0;
+                r.finish = "length";
+#if defined(DS41_HAVE_DSPARK)
+                dsp_next = -1;
+#endif
+            } else {
+                // where a continuation restarts: after an open compressor group (a verify pass with rejected drafts fed rows past
+                // the accepted ones, and the next position is odd) the token that starts the group is fed again - as the loop's
+                // own refeed does
+                live_end = (r.spec && r.dirty && (hist.size() & 1)) ? (int) hist.size() - 1 : (int) hist.size();
+#if defined(DS41_HAVE_DSPARK)
+                if (r.spec) dsp_next = live_end;   // the ring holds every position <= P (the last emitted token is not fed)
+#endif
             }
-            // GENI = GEN with an image-embedding file: GENI <max_new> [k=v ..] <embeddings file> <ids csv> (the file
-            // holds one strata-vision record per image, in prompt order; the engine lands them on the image_token runs).
-            const bool geni = line.rfind("GENI ", 0) == 0;
-            if (!geni && line.rfind("GEN ", 0) != 0) { std::printf("ERR unsupported command\n"); std::fflush(stdout); continue; }
+            std::fprintf(stderr, "serve: %d tokens in %.2f s = %.2f tok/s (%s%s); experts: %lld hit, %lld cpu, %lld pcie, %lld file%s\n",
+                         r.gen, dec_ms / 1000.0, 1000.0 * std::max(0, r.gen - 1) / std::max(dec_ms, 1e-9), r.finish,
+                         r.slot >= 0 ? (", slot " + std::to_string(r.slot)).c_str() : "",
+                         (long long) st.hits, (long long) st.cpu, (long long) st.pcie, (long long) st.file_tier,
+                         st.skipped > 0 ? (", skipped " + std::to_string(st.skipped)).c_str() : "");
+            if (const Ds41Dense::RouteMeter rm = dense.route_meter(false); rm.on && rm.slots > 0)
+                std::fprintf(stderr, "serve: routing vs exact: %.2f%% of expert picks swapped, %.2f%% of router weight kept (%lld slots)\n",
+                             100.0 * (double) rm.swaps / (double) rm.slots, 100.0 * rm.weight_kept, rm.slots);
+            if (vram_trace) {   // who holds the card while decoding (the expert slots are the rest)
+                size_t tf = 0, tt = 0;
+                ggml_backend_dev_memory(ggml_backend_get_device(be), &tf, &tt);
+                double dsp_gib = 0.0;
+#if defined(DS41_HAVE_DSPARK)
+                if (dsp) dsp_gib = (double) dsp->weight_bytes() / 1073741824.0;
+#endif
+                std::fprintf(stderr, "vram ledger: %s; DSpark weights %.2f GiB; free %.2f of %.2f GiB\n",
+                             dense.vram_ledger().c_str(), dsp_gib, tf / 1073741824.0, tt / 1073741824.0);
+            }
+#if defined(DS41_HAVE_DSPARK)
+            if (r.lk_pass > 0)
+                std::fprintf(stderr, "serve: lookup %ld/%ld drafts accepted in %ld passes\n", r.lk_acc, r.lk_dr, r.lk_pass);
+            sv_pass += r.rq_pass; sv_acc += r.rq_acc;
+            if (r.rq_pass > 0) {
+                if (dsp) dsp->write_counts();
+                std::fprintf(stderr, "serve: DSpark %ld passes, %.2f tokens/pass (all requests %.2f)\n", r.rq_pass,
+                             1.0 + (double) r.rq_acc / r.rq_pass, 1.0 + (double) sv_acc / std::max(1L, sv_pass));
+            }
+#endif
+            r.active = false;
+            r.live = false;
+            live_req = nullptr;
+            tier.rebalance_tick(!any_active());   // the gap until the next request: retire a large batch for the reader
+            if (r.slot >= 0) {
+                if (!at_admission) std::printf("BDONE %d %d %s %.1f\n", r.slot, r.gen, r.finish, dec_ms);
+            } else {
+                std::printf("DONE %d %d %.1f %.1f %s 0 0 %d %lld %lld 0 %lld 0 %d\n", r.gen, r.total, r.prompt_ms, dec_ms, r.finish, r.reused,
+                            (long long) st.hits, (long long) st.lookups(), (long long) st.file_tier, r.total - r.reused);
+            }
+            std::fflush(stdout);
+            if (g_routes.on()) {   // after DONE: the client already has its answer
+                std::string rerr;
+                if (!g_routes.write(rerr)) std::fprintf(stderr, "routes: %s\n", rerr.c_str());
+            }
+        };
+#if defined(DS41_HAVE_DSPARK)
+        // ---- DSpark speculative sampling, one verify pass of the live request r (as the one-shot loop: P = last fed position,
+        // t = the token for P+1, sp_ids = drafts for P+2..; each verify row's distribution is sample_p's, spec_accept keeps it
+        // exact).  false = the request ended (r.finish says how).
+        // STRATA_SERVE_LOOKUP=L (s6, opt-in until measured; mab776/Strata-DS4 M11's design): when the context's
+        // last G+1 tokens (STRATA_LOOKUP_NGRAM=G, default 3) occurred earlier in this request (prompt + output),
+        // the tokens that followed them there are the verify pass's drafts instead of DSpark's - an agent's output
+        // copies its context (edits, rewrites, quoted tool results).  spec_accept treats every draft as a
+        // deterministic token (accept with p, else resample without it), so the output distribution is unchanged.
+        // A match of M tokens drafts M - G + 1 (<= L, <= the pass width).  STRATA_LOOKUP_AGREE (default 1): only
+        // when the copy's first token is DSpark's own first draft.  A lookup pass with less than half accepted
+        // sits the lookup out 1, 2, 4 .. 64 passes.  DSpark steps on the verified rows either way.
+        // kVerify (s6): rows one verify pass may take - 16, as the prompt passes (pass_v splits the tier calls at
+        // kMaxMulti - 8 then, 16 now - and the pass buffers hold 17).  A copy is accepted ~96% on edits, so the
+        // draft length was the limit at the old kMaxMulti - 2 = 6 (s6: 932/972 accepted in 169 passes, only +3%
+        // over DSpark's own).
+        constexpr int kVerify = 16;
+        static const int lk_max = std::getenv("STRATA_SERVE_LOOKUP") ? std::max(0, std::min(kVerify - 2, std::atoi(std::getenv("STRATA_SERVE_LOOKUP")))) : 0;
+        static const int lk_g = std::getenv("STRATA_LOOKUP_NGRAM") ? std::max(1, std::atoi(std::getenv("STRATA_LOOKUP_NGRAM"))) : 3;
+        static const bool lk_agree = !(std::getenv("STRATA_LOOKUP_AGREE") && std::getenv("STRATA_LOOKUP_AGREE")[0] == '0');
+        // STRATA_DSPARK_CONF=<tau>, as the one-shot loop: verify only the leading drafts whose confidence-head
+        // probability is >= tau (the emitted tokens are still the trunk's - only the verify width changes)
+        static const float conf_tau_s = std::getenv("STRATA_DSPARK_CONF") ? (float) std::atof(std::getenv("STRATA_DSPARK_CONF")) : -1.0f;
+        std::vector<int> vt;
+        std::vector<std::pair<int, double>> dist;
+        auto run_pass = [&](Req & r) -> bool {
+            if (r.stop_req) { r.finish = "cancel"; return false; }
+            int k = sp_depth_serve;
+            if (r.max_new > 0) k = std::min(k, r.max_new - r.gen);
+            k = std::min(k, ctxv - (r.P + 3));   // the pass writes P+1 .. P+1+k
+            if (k < 0) return false;
+            if (conf_tau_s >= 0) {
+                int kk = 0;
+                while (kk < k && 1.0f / (1.0f + std::exp(-r.sp_conf[kk])) >= conf_tau_s) ++kk;
+                k = kk;
+            }
+            const bool refeed = r.dirty && ((r.P + 1) & 1);
+            int dr[kVerify] = {0};
+            for (int i = 0; i < k; ++i) dr[i] = r.sp_ids[i];
+            bool is_lk = false;
+            if (lk_max > 0 && r.lk_cool > 0) --r.lk_cool;
+            else if (lk_max > 0) {
+                // the sequence is hist + t (t = the token for P+1, not in hist yet); find the latest earlier q with
+                // seq[q-G .. q] == seq[n-G .. n] (G+1 tokens, the last being t), then copy seq[q+1 ..]
+                const int n = (int) hist.size();
+                const int t = r.t;
+                auto sq = [&](int i) { return i == n ? t : hist[(size_t) i]; };
+                int cap = std::min(lk_max, kVerify - 1 - (refeed ? 1 : 0));
+                if (r.max_new > 0) cap = std::min(cap, r.max_new - r.gen);
+                cap = std::min(cap, ctxv - (r.P + 3));
+                if (cap >= 2 && n > lk_g + 1) {
+                    for (int q2 = n - 1; q2 >= lk_g; --q2) {
+                        if (hist[(size_t) q2] != t) continue;
+                        int m = 1;
+                        while (m < 64 && q2 - m >= 0 && hist[(size_t) (q2 - m)] == sq(n - m)) ++m;
+                        if (m < lk_g + 1) continue;
+                        const int L = std::min({cap, m - lk_g + 1, n - q2});
+                        if (L < 2) break;   // the latest match copies too little: not worth a pass
+                        if (lk_agree && sq(q2 + 1) != r.sp_ids[0]) break;
+                        for (int i = 0; i < L; ++i) dr[i] = sq(q2 + 1 + i);
+                        k = L;
+                        is_lk = true;
+                        break;
+                    }
+                }
+            }
+            vt.clear();
+            if (refeed) vt.push_back(r.prev);
+            vt.push_back(r.t);
+            for (int i = 0; i < k; ++i) vt.push_back(dr[i]);
+            const int r0 = refeed ? 1 : 0, p0 = refeed ? r.P : r.P + 1;
+            if (!pass_v(vt.data(), (int) vt.size(), p0)) { r.finish = "error"; return false; }
+            int acc = 0, tn = -1;
+            for (; acc < k; ++acc) {
+                sample_dist(vlog.data() + (size_t) (r0 + acc) * nv, nv, r.temp, r.tk, r.top_p, r.min_p, dist);
+                if (!spec_accept(dist, dr[acc], rng, tn)) break;
+            }
+            if (acc == k) tn = sample_p(vlog.data() + (size_t) (r0 + k) * nv, nv, r.temp, r.tk, r.top_p, r.min_p, rng);
+            ++r.rq_pass; r.rq_acc += acc;
+            if (is_lk) {
+                ++r.lk_pass; r.lk_dr += k; r.lk_acc += acc;
+                if (2 * acc < k) { r.lk_cool = r.lk_back; r.lk_back = std::min(64, r.lk_back * 2); }
+                else r.lk_back = 1;
+            }
+            int spos[kVerify + 1];
+            for (int i = 0; i <= acc; ++i) spos[i] = r.P + 1 + i;
+            int drafts[kVerify];
+            for (int i = 0; i < k; ++i) drafts[i] = dr[i];
+            if (!dsp->step(vh.data() + (size_t) r0 * 3 * n_embd, spos, acc + 1, tn, r.sp_ids, r.sp_conf)) {
+                ferr = "DSpark step: " + dsp->last_error(); r.finish = "error"; return false;
+            }
+            hist.push_back(r.t); pen_record(r.t);
+            bool more = true;
+            for (int i = 0; i < acc && more; ++i) { hist.push_back(drafts[i]); pen_record(drafts[i]); more = emit_tok(r, drafts[i]); }
+            r.prev = acc == 0 ? r.t : drafts[acc - 1];
+            r.dirty = acc < k;
+            r.P += 1 + acc;
+            r.t = tn;
+            tier.rebalance_tick();
+            if (!more) return false;
+            return emit_tok(r, r.t);
+        };
+#endif
+        // ---- one plain decode step of the live request r (no drafts): feed the token emitted last, sample and emit the next
+        auto run_step = [&](Req & r) -> bool {
+            if (r.stop_req) { r.finish = "cancel"; return false; }
+            if (r.pos + 1 >= ctxv) return false;
+            if (!step(r.ptok, r.pos) || !dense.logits(0, 1, r.lg.data())) { r.finish = "error"; return false; }
+            hist.push_back(r.ptok); pen_record(r.ptok);
+            ++r.pos;
+            tier.rebalance_tick();
+            r.ptok = sample_p(r.lg.data(), nv, r.temp, r.tk, r.top_p, r.min_p, rng);
+            return emit_tok(r, r.ptok);
+        };
+        // ---- a request: GEN <max_new> [k=v ..] <ids csv> (solo) or BGEN <slot> <max_new> [k=v ..] <ids csv> (a batch slot);
+        // GENI / BGENI carry an image-embedding file before the csv (GENI <max_new> [k=v ..] <embeddings file> <ids csv>: the
+        // file holds one strata-vision record per image, in prompt order; the engine lands them on the image_token runs).
+        // The prompt is read (reusing what the live conversation and the parks hold), the first token is emitted; a slot
+        // request then gets its DONE and BADM lines and decodes in turns with the other slots, a solo request runs on alone.
+        auto admit = [&](const std::string & line, bool bg) {
+            const bool geni = line.rfind("GENI ", 0) == 0 || line.rfind("BGENI ", 0) == 0;
             std::istringstream ss(line);
             std::string w, csv, emb_file;
-            int max_new = 0, tk = 0;
+            int slot = -1, max_new = 0, tk = 0;
             float temp = a.temp, top_p = 1.0f, min_p = 0.0f;
             float req_rb = cfg_route_bias, req_rbf = cfg_route_bias_file;
             int req_rprot = cfg_rprot, req_rpool = cfg_rpool;
-            ss >> w >> max_new;
+            PenaltyState pen;   // the request's own penalties (none unless its keys say so)
+            uint64_t seed = 0;
+            bool seeded = false;
+            ss >> w;
+            if (bg) ss >> slot;
+            ss >> max_new;
             while (ss >> w) {
                 const size_t eq = w.find('=');
                 if (eq == std::string::npos) {   // the two positionals: GENI's embeddings file then the csv (GEN: just the csv)
@@ -1556,15 +2096,46 @@ int main(int argc, char ** argv) {
                 else if (k == "top_p") top_p = (float) std::atof(v.c_str());
                 else if (k == "top_k") tk = std::atoi(v.c_str());
                 else if (k == "min_p") min_p = (float) std::atof(v.c_str());
-                else if (k == "penalty_repeat") g_pen.repeat = (float) std::atof(v.c_str());
-                else if (k == "penalty_freq") g_pen.freq = (float) std::atof(v.c_str());
-                else if (k == "penalty_present") g_pen.present = (float) std::atof(v.c_str());
-                else if (k == "penalty_last_n") g_pen.last_n = std::max(0, std::atoi(v.c_str()));
-                else if (k == "seed") rng.seed((uint64_t) std::atoll(v.c_str()));
+                else if (k == "penalty_repeat") pen.repeat = (float) std::atof(v.c_str());
+                else if (k == "penalty_freq") pen.freq = (float) std::atof(v.c_str());
+                else if (k == "penalty_present") pen.present = (float) std::atof(v.c_str());
+                else if (k == "penalty_last_n") pen.last_n = std::max(0, std::atoi(v.c_str()));
+                else if (k == "seed") { seed = (uint64_t) std::atoll(v.c_str()); seeded = true; }
                 else if (k == "route_bias") req_rb = std::max(0.0f, (float) std::atof(v.c_str()));
                 else if (k == "route_bias_file") req_rbf = std::max(0.0f, (float) std::atof(v.c_str()));
                 else if (k == "route_protect") req_rprot = std::max(0, std::atoi(v.c_str()));
                 else if (k == "route_pool") req_rpool = std::max(0, std::atoi(v.c_str()));
+            }
+            if (bg && (slot < 0 || slot >= n_slots || reqs[(size_t) slot].active)) {
+                std::printf("ERR BGEN: no such free slot (--batch %d) or a bad max_new\n", n_slots);
+                std::fflush(stdout);
+                return;
+            }
+            if (!bg && reqs.back().active) { std::printf("ERR GEN: a request is still running\n"); std::fflush(stdout); return; }
+            std::vector<int> ids = csv.empty() ? std::vector<int>() : parse_csv(csv);
+            if (ids.empty()) { std::printf("ERR empty prompt\n"); std::fflush(stdout); return; }
+            if ((int64_t) ids.size() + std::max(0, max_new) > ctxv) {
+                std::printf("ERR prompt (%zu) + max tokens (%d) exceed the context (%d)\n", ids.size(), max_new, ctxv);
+                std::fflush(stdout);
+                return;
+            }
+            Req & r = bg ? reqs[(size_t) slot] : reqs.back();
+            r = Req();
+            r.slot = bg ? slot : -1;
+            r.max_new = max_new;
+            r.temp = temp; r.top_p = top_p; r.min_p = min_p; r.tk = tk;
+            r.route_bias = req_rb; r.route_bias_file = req_rbf; r.rprot = req_rprot; r.rpool = req_rpool;
+            // the device: an active request's conversation goes to its Req first; a finished one stays for the reuse rules
+            if (live_req) park_req(*live_req);
+            g_pen = pen;
+            if (seeded) rng.seed(seed);
+            ensure_snap_rings();
+            dense.clear_vision();
+            if (previous_vision) {
+                hist.clear();
+                snap_len = -1;
+                live_end = 0;
+                previous_vision = false;
             }
             // a changed bias is applied again just before the decode: a repeated prompt (regenerate) runs no prompt pass,
             // and the passes are what turn the decode bias on - without this it decoded with the previous request's
@@ -1582,112 +2153,186 @@ int main(int argc, char ** argv) {
                 std::fprintf(stderr, "serve: smart routing: exact top %d always kept, picks inside the exact top %d%s\n",
                              req_rprot, req_rpool, (req_rprot == 0 && req_rpool == 0) ? " (off: the flat bias)" : "");
             }
-            std::vector<int> ids = csv.empty() ? std::vector<int>() : parse_csv(csv);
-            if (ids.empty()) { std::printf("ERR empty prompt\n"); std::fflush(stdout); continue; }
-            if ((int64_t) ids.size() + std::max(0, max_new) > ctxv) {
-                std::printf("ERR prompt (%zu) + max tokens (%d) exceed the context (%d)\n", ids.size(), max_new, ctxv);
-                std::fflush(stdout);
-                continue;
-            }
             // vision: resolve this request's image rows onto its image_token runs and hand them to the dense layers
             std::vector<float> vis_rows;
             std::vector<int64_t> vis_pos;
             const bool is_vision = geni;
             if (is_vision) {
-                if (!dense.vision()) { std::printf("ERR image input requires --vision\n"); std::fflush(stdout); continue; }
+                if (!dense.vision()) { std::printf("ERR image input requires --vision\n"); std::fflush(stdout); return; }
                 std::string verr;
                 std::vector<std::vector<float>> recs;
                 std::vector<int64_t> counts;
                 const int64_t ne = dense.geom().n_embd;
                 if (!read_sve1(emb_file, recs, counts, ne, (int64_t) ids.size(), verr)
                     || !map_vision(ids, a.image_token, recs, counts, vis_rows, vis_pos, verr)) {
-                    std::printf("ERR %s\n", verr.c_str()); std::fflush(stdout); continue;
+                    std::printf("ERR %s\n", verr.c_str()); std::fflush(stdout); return;
                 }
-                if (vis_rows.empty()) { std::printf("ERR GENI prompt has no image tokens\n"); std::fflush(stdout); continue; }
+                if (vis_rows.empty()) { std::printf("ERR GENI prompt has no image tokens\n"); std::fflush(stdout); return; }
                 // an image prompt prefills fresh: every image span is the same run of image_token, so a token-only reuse
                 // test would "continue" a different image (same ids, different embeddings).  Empty hist / no snapshot / no park.
-                dense.drop_park();
-                park_hist.clear();
+                park_conv(live_end);   // the text conversation goes to a slot (its rows are about to be overwritten)
                 hist.clear();
                 snap_len = -1;
+                live_end = 0;
                 dense.set_vision(vis_rows.data(), vis_pos.data(), (int) vis_pos.size());
                 previous_vision = true;
-            } else {
-                dense.clear_vision();
             }
             size_t lcp = 0;
             while (lcp < hist.size() && lcp < ids.size() && hist[lcp] == ids[lcp]) ++lcp;
+            size_t div = lcp;          // the longest start this prompt shares with any conversation the engine knows
+            for (const auto & o : reqs) {   // ... the requests running in the other slots included
+                if (!o.active || o.live) continue;
+                size_t l2 = 0;
+                while (l2 < o.hist.size() && l2 < ids.size() && o.hist[l2] == ids[l2]) ++l2;
+                div = std::max(div, l2);
+            }
             bool unparked = false;
-            int reuse_override = -1;   // a partial unpark: resume at the longest common prefix (see below)
-            size_t lp_show = 0;        // how far this request actually continues the PARKED conversation (logged)
-            if (dense.parked()) {   // does this request continue the parked conversation (better than the live one)?
-                size_t lp = 0;
-                while (lp < park_hist.size() && lp < ids.size() && park_hist[lp] == ids[lp]) ++lp;
-                lp_show = lp;
-                // STRATA_SERVE_PARK_PARTIAL (default on): a request that continues MOST of the parked conversation is
-                // worth restoring, not only one that continues ALL of it.  A chat template that re-renders its tail -
-                // or an EMPTY assistant turn, as the s13 harness produces - leaves lp just under park_hist.size(), and
-                // requiring an exact prefix threw away a 21,349-token cache over a 27-token difference: run8/run15 both
-                // logged "reuse lcp=27 hist=0 snap=-1 prompt=23531 -> reused=0" and re-read the whole prompt.
-                // Positional caches make a partial resume safe: unpark() restores positions [0, park_size) and the
-                // forward pass then re-feeds from lp, overwriting the stale tail (that is the documented fix: "resume
-                // at the longest common prefix even when it is below the snapshot").
+            int reuse_override = -1;   // a resume below a park's end (the tail rules): the position to restart at
+            size_t lp_show = 0;        // how far this request continues the PARKED conversation it took (logged)
+            if (!parks.empty() && !is_vision) {   // does a parked conversation serve this request better than the live one?
+                // what the live conversation gives it (the rules below, evaluated early): its whole history, the snapshot's
+                // prompt, or - the tail rule - an even restart no further than rollback_max() below the snapshot's end
+                const int rb = dense.rollback_max();
+                size_t live_reuse = 0;
+                if (!hist.empty() && lcp == hist.size() && lcp < ids.size()) live_reuse = (size_t) live_end;
+                else if (snap_len > 0 && lcp >= (size_t) snap_len) live_reuse = (size_t) snap_len;
+                else if (tail_resume && snap_len > 0 && (lcp & ~(size_t) 1) >= 16 && snap_len - (int) (lcp & ~(size_t) 1) <= rb)
+                    live_reuse = lcp & ~(size_t) 1;
+                // STRATA_SERVE_PARK_PARTIAL (default on): a request that continues all but the last few tokens of a parked
+                // conversation (a harness that re-renders its tail, or cancels and sends again with a note appended) resumes
+                // it too.  The window ring and the ratio-2 compressor state are NOT position-indexed (see Ds41Dense::
+                // snapshot): the resume restores the rings kept at the park's END or at its prompt end and starts at an EVEN
+                // position no further than rollback_max() below that point, whose older rows are still in them.
                 static const bool park_partial = !(std::getenv("STRATA_SERVE_PARK_PARTIAL") && std::getenv("STRATA_SERVE_PARK_PARTIAL")[0] == '0');
-                const size_t lp_min = (size_t) std::max<int64_t>(park_min, (int64_t) park_hist.size() * 3 / 4);
-                if (park_partial && lp < park_hist.size() && lp >= lp_min && lp > lcp && dense.unpark()) {
-                    std::fprintf(stderr, "serve: unparked the %zu-token conversation at lcp %zu (partial: re-feeds from there)\n",
-                                 park_hist.size(), lp);
-                    hist = park_hist;
-                    snap_len = -1;        // the tail under the park's end is re-fed, so no snapshot survives this
-                    reuse_override = (int) lp;
-                    lcp = lp;
-                    unparked = true;
+                // STRATA_SERVE_PARK_NO_REGEN=1 (tests only): a parked copy of the IDENTICAL prompt is not served from the park (it would
+                // answer from its saved logits instead of computing the request, which a numerics test needs)
+                static const bool park_no_regen = std::getenv("STRATA_SERVE_PARK_NO_REGEN") && std::getenv("STRATA_SERVE_PARK_NO_REGEN")[0] == '1';
+                enum { M_NONE, M_END, M_END_TAIL, M_SNAP, M_SNAP_TAIL };
+                int best = -1, best_mode = M_NONE;
+                size_t best_reuse = live_reuse, best_lp = 0;
+                for (size_t i = 0; i < parks.size(); ++i) {
+                    const ParkEntry & e = parks[i];
+                    const std::vector<int> & ph = e.hist;
+                    size_t lp = 0;
+                    while (lp < ph.size() && lp < ids.size() && ph[lp] == ids[lp]) ++lp;
+                    div = std::max(div, lp);
+                    const size_t E = ph.size(), Sn = (size_t) e.snap_len;
+                    size_t reuse = 0;
+                    int mode = M_NONE;
+                    if (lp == E) {
+                        if (lp < ids.size()) { reuse = E; mode = M_END; }                        // continues it: restart at its END
+                        else if (Sn == E && !park_no_regen && !e.logits.empty()) { reuse = E; mode = M_END; }   // the same prompt again: its logits are saved
+                        else if (E >= 18) { reuse = (E - 2) & ~(size_t) 1; mode = M_END_TAIL; }   // identical to a decoded one: just below its end
+                    } else if (lp > Sn) {                                                       // the prompt, and part of what followed
+                        const size_t R = lp & ~(size_t) 1;
+                        if (park_partial && R >= 16 && E - R <= (size_t) rb) { reuse = R; mode = M_END_TAIL; }
+                        else { reuse = Sn; mode = M_SNAP; }
+                    } else if (lp == Sn) { reuse = Sn; mode = M_SNAP; }
+                    else if (park_partial && (lp & ~(size_t) 1) >= 16 && Sn - (lp & ~(size_t) 1) <= (size_t) rb) { reuse = lp & ~(size_t) 1; mode = M_SNAP_TAIL; }
+                    if (reuse > best_reuse) { best = (int) i; best_reuse = reuse; best_lp = lp; best_mode = mode; }
+                }
+                lp_show = best_lp;
+                if (best >= 0) {
+                    const bool is_pfx = parks[(size_t) best].prefix;
+                    ParkEntry e;
+                    if (is_pfx) {   // a shared prefix is served by copy and stays
+                        e = parks[(size_t) best];
+                        parks[(size_t) best].stamp = ++park_clock;
+                        ++parks[(size_t) best].hits;
+                    } else {
+                        e = std::move(parks[(size_t) best]);
+                        parks.erase(parks.begin() + best);
+                    }
+                    park_conv(live_end);   // the live conversation first: swapping in overwrites its rows
+                    const bool at_prompt = best_mode == M_SNAP || best_mode == M_SNAP_TAIL;
+                    bool ok = dense.park_in(e.p);
+                    if (ok && at_prompt && !e.prompt_rings.empty()) ok = dense.rings_in(e.prompt_rings, e.snap_len);
+                    if (!ok) {
+                        hist.clear();
+                        snap_len = -1;
+                        live_end = 0;
+                        std::fprintf(stderr, "serve: unpark failed - reading in full\n");
+                    } else {
+                        hist = std::move(e.hist);
+                        snap_logits = std::move(e.logits);
+                        snap_seed = std::move(e.seed);
+                        snap_seed_n = e.seed_n;
+                        // the live snapshot rings from here: the prompt-end ones for a resume at the prompt, else the END's (a
+                        // continuation takes a new snapshot at its own prompt end anyway)
+                        if (at_prompt && !e.prompt_rings.empty()) snap_rings = std::move(e.prompt_rings); else dense.rings_out(snap_rings);
+                        snap_rings_dev = true;
+                        unparked = true;   // the live rings are another conversation's: resume through restore()
 #if defined(DS41_HAVE_DSPARK)
-                    dsp_next = -1;        // DSpark's window holds the side request's states
+                        dsp_next = -1;     // DSpark's window holds the other conversation's states, unless the park kept this one's
 #endif
-                } else if (lp == park_hist.size() && lp > lcp && dense.unpark()) {
-                    std::fprintf(stderr, "serve: unparked the %zu-token conversation\n", park_hist.size());
-                    hist = park_hist;
-                    snap_len = (int) park_hist.size();
-                    snap_logits = park_logits;
-                    snap_seed_n = 0;
-                    lcp = lp;
-                    unparked = true;   // the live rings are the side request's: resume through restore()
+                        const char * what = is_pfx ? "shared prefix" : "conversation";
+                        if (best_mode == M_END) {
+                            snap_len = (int) hist.size();   // the generic rules below: continue at (or regenerate from) the END
+                            live_end = snap_len;
+                            lcp = best_lp;
 #if defined(DS41_HAVE_DSPARK)
-                    dsp_next = -1;     // DSpark's window holds the side request's states
+                            if (dsp && !e.dsp_win.empty() && dsp->window_in(e.dsp_win, e.dsp_filled)) dsp_next = snap_len;
 #endif
-                } else if ((int64_t) ids.size() + std::max(0, max_new) > park_rows) {
-                    dense.drop_park();   // this request writes past the saved rows
-                    std::fprintf(stderr, "serve: park dropped (request reaches past %lld positions)\n", (long long) park_rows);
+                            std::fprintf(stderr, "serve: unparked the %zu-token %s%s (%zu left parked)\n", hist.size(), what,
+                                         is_pfx ? (" (hit " + std::to_string(parks[(size_t) best].hits) + ")").c_str() : "", parks.size());
+                        } else if (best_mode == M_SNAP) {
+                            snap_len = e.snap_len;          // the generic rules: continue at the prompt end / the same prompt again
+                            live_end = (int) hist.size();
+                            lcp = best_lp;
+                            std::fprintf(stderr, "serve: unparked the %zu-token %s at its prompt end %d (%zu left parked)\n", hist.size(), what,
+                                         e.snap_len, parks.size());
+                        } else {   // M_END_TAIL / M_SNAP_TAIL: the rings of that point, an even restart below it, re-fed from there
+                            const size_t R = best_reuse;
+                            const bool ring_ok = dense.restore();
+                            std::fprintf(stderr, "serve: unparked the %zu-token %s at lcp %zu (tail: re-feeds from %zu below %s, %zu left parked)\n",
+                                         hist.size(), what, best_lp, R, best_mode == M_END_TAIL ? "its end" : "its prompt end", parks.size());
+                            if (ring_ok) { hist.resize(R); reuse_override = (int) R; lcp = R; }
+                            else { hist.clear(); lcp = 0; }
+                            snap_len = -1;   // the tail under that point is re-fed, so no snapshot survives this
+                            live_end = (int) hist.size();
+                        }
+                    }
                 }
             }
             int reused = 0;
             bool regen = false;   // the snapshot's own prompt again: nothing new to feed
-            if (reuse_override >= 0) reused = reuse_override;   // a partial unpark: positions [0, lp) are the parked one's
-            else if (!unparked && !hist.empty() && lcp == hist.size() && lcp < ids.size()) reused = (int) lcp;
-            else if (snap_len > 0 && lcp >= (size_t) snap_len && (size_t) snap_len == ids.size() && dense.restore()) {
+            if (reuse_override >= 0) reused = reuse_override;   // a tail resume through the park: positions [0, R) are the parked one's
+            else if (!unparked && !hist.empty() && lcp == hist.size() && lcp < ids.size()) {
+                reused = live_end;   // continue the live conversation (after an open compressor group: the group's first token again)
+                if ((size_t) live_end < hist.size()) hist.resize((size_t) live_end);
+            } else if (snap_len > 0 && lcp >= (size_t) snap_len && (size_t) snap_len == ids.size() && !snap_logits.empty() && (ensure_snap_rings(), dense.restore())) {
                 hist.resize((size_t) snap_len);   // the same prompt again (regenerate): its end state + saved logits
                 reused = snap_len;
                 last_logits = snap_logits;
                 regen = true;
-            } else if (snap_len > 0 && lcp >= (size_t) snap_len && (size_t) snap_len < ids.size() && dense.restore()) {
+            } else if (snap_len > 0 && lcp >= (size_t) snap_len && (size_t) snap_len < ids.size() && (ensure_snap_rings(), dense.restore())) {
                 hist.resize((size_t) snap_len);
                 reused = snap_len;
+            } else if (tail_resume && snap_len > 0 && !is_vision && lcp < (size_t) snap_len &&
+                       snap_len - (int) (lcp & ~(size_t) 1) <= dense.rollback_max() && (int) (lcp & ~(size_t) 1) >= 16 &&
+                       (ensure_snap_rings(), dense.restore())) {
+                // STRATA_SERVE_TAIL_RESUME (default on): the prompt differs from the snapshot's within its last few tokens
+                // (the harness cancelled a request and sent it again with something appended: the last token of
+                // "</tool_result>" merges with the next characters and the generation header goes after the new text).
+                // The snapshot ring holds RAW = SWA + 16 rows, so the window of a query up to rollback_max() positions
+                // below the snapshot is still there; the position-indexed caches below R are the same tokens' rows.  R is
+                // made even so no ratio-2 compressor group is open at R.  2026-10-22: four such resends re-read 77-111K
+                // tokens each (15.7 min of the day) because rule 3 needs lcp >= snap_len.
+                const int r_even = (int) (lcp & ~(size_t) 1);
+                std::fprintf(stderr, "serve: tail resume: the prompt leaves the snapshot's %d tokens %d before its end - restart at %d\n",
+                             snap_len, snap_len - (int) lcp, r_even);
+                hist.resize((size_t) r_even);
+                reused = r_even;
+                snap_len = -1;   // rows from r_even on are rewritten by this request: the old snapshot is stale
             } else {
                 // an unrelated request: park the conversation it would overwrite (see STRATA_SERVE_PARK)
-                const int64_t rows = (int64_t) ids.size() + (max_new > 0 ? max_new : park_max) + 64;
-                if (park_on && !dense.parked() && snap_len >= park_min && hist.size() >= (size_t) snap_len && rows <= park_max
-                    && dense.park(rows)) {
-                    park_hist.assign(hist.begin(), hist.begin() + snap_len);
-                    park_logits = snap_logits;
-                    park_rows = rows;
-                    std::fprintf(stderr, "serve: parked the %d-token conversation (%lld positions saved)\n", snap_len, (long long) rows);
-                }
+                park_conv(live_end);
                 hist.clear();
                 snap_len = -1;
             }
-            std::fprintf(stderr, "serve: reuse lcp=%zu park=%zu lp=%zu hist=%zu snap=%d prompt=%zu -> reused=%d\n", lcp,
-                         park_hist.size(), lp_show, hist.size(), snap_len, ids.size(), reused);
+            if (reused > 0) dense.prime_history(ids.data(), std::max(0, reused - 16), reused);   // the n-gram look-back of the first re-fed tokens
+            std::fprintf(stderr, "serve: reuse lcp=%zu park=%zu lp=%zu hist=%zu snap=%d prompt=%zu div=%zu -> reused=%d\n", lcp,
+                         parks.size(), lp_show, hist.size(), snap_len, ids.size(), div, reused);
             if (reused > 0) { std::printf("RESUME %d\n", reused); std::fflush(stdout); }
             const int total = (int) ids.size();
             // a long prompt runs layer-major without the VRAM cache (its pass / chunk buffers need that VRAM) and with
@@ -1719,13 +2364,20 @@ int main(int argc, char ** argv) {
             // 7.7 (1.7), +150 17.6 (1.4) / 9.8 (1.6).  Decode right after a batch starts colder (the VRAM cache is
             // re-seeded), hence the margin above the ~80-token crossover.
             static const int batch_min = std::getenv("STRATA_SERVE_BATCH_MIN") ? std::atoi(std::getenv("STRATA_SERVE_BATCH_MIN")) : 128;
-            bool force_batch = false;
             if (batch_min > 0 && batch_tail && sp_tail > 0 && bcap == 0 && delta >= batch_min && PB > 1 && delta >= 2) {
-                bcap = sp_tail; dh = delta; force_batch = true; by_step = false;
+                bcap = sp_tail; dh = delta; by_step = false;
             }
-            (void) force_batch;
+            static const int dump_tail = std::getenv("STRATA_SERVE_DUMP_TAIL") ? std::atoi(std::getenv("STRATA_SERVE_DUMP_TAIL")) : 0;
+            // the shared-prefix park (see ParkEntry): this read is split at `pfx`, the state there goes to a park slot
+            int pfx = -1;
+            if (prefix_min > 0 && !by_step && !is_vision && dh >= 2 && PB > 1 && dump_tail == 0) {
+                const int d = (int) (div & ~(size_t) 1);
+                bool have = false;
+                for (const auto & e : parks) if (e.prefix && (int) e.hist.size() == d) have = true;
+                if (!have && d - reused >= prefix_min && d >= 16 && reused + dh - d >= 2) pfx = d;
+            }
             if (by_step && !cache_open) {
-                if (!open_cache()) { std::printf("ERR VRAM seed failed: %s\n", err.c_str()); std::fflush(stdout); continue; }
+                if (!open_cache()) { std::printf("ERR VRAM seed failed: %s\n", err.c_str()); std::fflush(stdout); return; }
                 cache_open = true;
             }
             // exact passes (STRATA_SERVE_PASS_BIAS=0): the decode-side prompt tokens route with the model's own
@@ -1739,8 +2391,10 @@ int main(int argc, char ** argv) {
             // tokens (default 4096) gives back only the VRAM its batch needs (the calibrated need(B) below) - the cache's
             // lowest-ranked tail - instead of the whole cache, so the hot experts serve the batch from VRAM (no PCIe) and
             // the decode after it skips the re-seed (regrow_cache refills just the tail).  The prompt still routes exactly.
-            // s6 A/B: it never engages with the default --vram-lru (the LRU reorders slots, so "the tail" is not the
-            // coldest experts and a batch-time admission could duplicate a saved one) - it needs --no-vram-lru for now.
+            // s6 A/B: it never engaged with the default --vram-lru (the LRU reorders slots, so "the tail" was not the
+            // coldest experts); since 2026-10-23 shrink_cache_for gathers the LRU-hottest experts below the shrink point
+            // first (Ds41MoeTier::shrink_cache_for, ExpertCache::swap_slots), so it works with the LRU: no re-seed after
+            // the batch (p50 2 s, p90 6 s per read on 2026-10-22) and the decode after it starts with the warm set.
             bool kept = false;
             if (Ds41MoeTier::keep_cache_mode() && !by_step && dh >= 2 && !(defer_vram && cache_open))
                 std::fprintf(stderr, "serve: keep-cache: not applicable (deferred VRAM %d, cache open %d)\n", (int) defer_vram,
@@ -1748,8 +2402,9 @@ int main(int argc, char ** argv) {
             if (!by_step && defer_vram && cache_open && dh >= 2) {
                 static const int keep_max = std::getenv("STRATA_SERVE_KEEP_MAX") ? std::atoi(std::getenv("STRATA_SERVE_KEEP_MAX")) : 4096;
                 if (Ds41MoeTier::keep_cache_mode() && dh <= keep_max && !mc.cpu_only) {
+                    // the same fit as pb_cap's below, incl. the long-context attention term (S * total * 10 B)
                     const double need = (4.3 * 1073741824.0 + 0.95 * 1048576.0 * (double) std::min(dh, PB)) +
-                                        a.vram_margin_gib * 1073741824.0;
+                                        (double) S * (double) total * 10.0 + std::max(1.0, a.vram_margin_gib) * 1073741824.0;
                     std::string kerr;
                     const int64_t g = tier.shrink_cache_for((int64_t) need, kerr);
                     if (g >= 0) {
@@ -1792,6 +2447,8 @@ int main(int argc, char ** argv) {
             };
             auto feed_steps = [&]() -> bool {   // the short-turn path: passes of up to pass_max tokens (a lone token: a step)
                 int last_rows = 1;
+                feed_done = 0;
+                feed_cancelled = false;
                 for (int i = 0; i < dh; ) {
                     const int m = std::min(pass_max, dh - i);
                     if (!(m == 1 ? step(ids[(size_t) (reused + i)], reused + i) : pass_m(ids.data() + reused + i, m, reused + i))) return false;
@@ -1799,13 +2456,14 @@ int main(int argc, char ** argv) {
                     const int before = i;
                     i += m;
                     last_rows = m;
+                    if (i < dh && stop_pending()) { feed_done = i; feed_cancelled = true; ferr = "cancelled"; return false; }
                     if (i / 64 != before / 64 && i < dh) pp(i);
                 }
+                feed_done = dh;
                 if (!dense.logits(last_rows - 1, 1, last_logits.data())) { ferr = dense.last_error(); return false; }
                 pp(dh);
                 return true;
             };
-            static const int dump_tail = std::getenv("STRATA_SERVE_DUMP_TAIL") ? std::atoi(std::getenv("STRATA_SERVE_DUMP_TAIL")) : 0;
             tail_keep = dump_tail > 0 ? std::min(dump_tail, delta) : 0;
             tail_logits.clear();
             // VRAM-aware batch width for this turn (feed() halves it again if even this does not fit): the batch's
@@ -1848,9 +2506,69 @@ int main(int argc, char ** argv) {
             }
             const double tph0 = now_ms();
             const double fd0[3] = { fd_dense, fd_tier, fd_logits };   // this request's batch split (stderr)
-            bcap_n = bcap; bcap_got = 0;
-            if (bcap > 0) bcap_vh.assign((size_t) bcap * 3 * n_embd, 0.0f);
-            bool ok = total == reused || dh == 0 || (by_step ? feed_steps() : feed(ids.data() + reused, dh, reused, pp, nullptr));
+            bool ok = true;
+            int read_upto = reused;   // tokens of the prompt read completely (a cancelled read keeps the conversation up to here)
+            if (total == reused || dh == 0) {
+            } else if (by_step) {
+                ok = feed_steps();
+            } else if (pfx > reused && pfx < reused + dh) {
+                // the shared prefix as a batch of its own: the rings, rows, logits and DSpark seed rows at its end go to a park
+                // slot, then the rest of the prompt (the park is taken once per engine run; the next request that starts the
+                // same way restarts at pfx instead of reading it)
+                const int n1 = pfx - reused;
+                bcap_n = std::min(128, n1); bcap_got = 0;
+                bcap_vh.assign((size_t) bcap_n * 3 * n_embd, 0.0f);
+                const double tx0 = now_ms();
+                ok = feed(ids.data() + reused, n1, reused, pp, nullptr);
+                if (!ok) read_upto = reused + feed_done;
+                if (ok) {
+                    Ds41Dense::ParkedPtr p = dense.snapshot(pfx) ? dense.park_out((int64_t) pfx + 64) : nullptr;
+                    snap_rings_dev = false;
+                    if (p) {
+                        ParkEntry e;
+                        e.p = std::move(p);
+                        e.hist.assign(ids.begin(), ids.begin() + pfx);
+                        e.snap_len = pfx;
+                        e.logits = last_logits;   // feed() left the prefix's last row there
+                        if (bcap_got > 0) {
+                            e.seed.assign(bcap_vh.begin(), bcap_vh.begin() + (size_t) bcap_got * 3 * n_embd);
+                            e.seed_n = bcap_got;
+                        }
+                        e.prefix = true;
+                        e.stamp = ++park_clock;
+                        const double need = (double) Ds41Dense::parked_bytes(e.p) + (double) e.seed.size() * 4;
+                        size_t n_pfx = 0;
+                        for (const auto & x : parks) n_pfx += x.prefix ? 1 : 0;
+                        while (n_pfx >= prefix_slots && n_pfx > 0) {   // the least recently used prefix makes room
+                            auto pick = parks.end();
+                            for (auto it = parks.begin(); it != parks.end(); ++it)
+                                if (it->prefix && (pick == parks.end() || it->stamp < pick->stamp)) pick = it;
+                            std::fprintf(stderr, "serve: prefix slots full - dropped the %zu-token shared prefix (%d hits)\n", pick->hist.size(), pick->hits);
+                            prefix_file_drop(*pick);
+                            parks.erase(pick);
+                            --n_pfx;
+                        }
+                        if (need <= park_cap) {
+                            evict_parks(need);
+                            prefix_file_save(e);
+                            parks.push_back(std::move(e));
+                            std::fprintf(stderr, "serve: shared prefix of %d tokens parked (%.0f MiB, %.2f s to read; %zu parked, %.0f MiB)\n", pfx,
+                                         need / 1048576.0, (now_ms() - tx0) / 1000.0, parks.size(), parks_bytes() / 1048576.0);
+                        }
+                    }
+                    bcap_n = bcap; bcap_got = 0;
+                    if (bcap > 0) bcap_vh.assign((size_t) bcap * 3 * n_embd, 0.0f);
+                    auto pp2 = [&](int done) { pp(n1 + done); };
+                    ok = feed(ids.data() + pfx, reused + dh - pfx, pfx, pp2, nullptr);
+                    if (!ok) read_upto = pfx + feed_done;
+                }
+            } else {
+                bcap_n = bcap; bcap_got = 0;
+                if (bcap > 0) bcap_vh.assign((size_t) bcap * 3 * n_embd, 0.0f);
+                ok = feed(ids.data() + reused, dh, reused, pp, nullptr);
+                if (!ok) read_upto = reused + feed_done;
+            }
+            if (!ok && by_step) read_upto = reused + feed_done;
             bcap_n = 0;
             if (kept) {   // the batch is done: the tail slots back (exactly the evicted experts), decode biases on
                 std::string kerr;
@@ -1867,7 +2585,7 @@ int main(int argc, char ** argv) {
             double ph_feed = now_ms() - tph0, ph_open = 0, ph_tail = 0;   // the request's prompt phases (stderr)
             int sp_t = -1;   // DSpark: the first decode token (sampled from the last prompt row), its drafts in sp_ids
             int sp_ids[5] = {0}, sp_tmp[5];
-            float sp_conf[5];
+            float sp_conf[5] = {0};
 #if defined(DS41_HAVE_DSPARK)
             if (ok && sp_tail > 0) {   // the tail through pass_v (chunks of <= 16), the cache open; routing as the passes
                 const double to0 = now_ms();
@@ -1957,20 +2675,55 @@ int main(int argc, char ** argv) {
                 }
             }
             tail_keep = 0;
+            if (!ok && feed_cancelled) {
+                // the read was cancelled (STOP): keep the conversation up to read_upto (the rings there, a snapshot, no
+                // logits) and end the request as cancelled; the resend continues from there
+                feed_cancelled = false;
+                if (read_upto >= 16 && dense.snapshot(read_upto)) {
+                    hist.assign(ids.begin(), ids.begin() + read_upto);
+                    snap_len = read_upto;
+                    live_end = read_upto;
+                    snap_logits.clear();   // none at this point: the same prompt again re-feeds from here
+                    snap_seed.clear();
+                    snap_seed_n = 0;
+                    dense.rings_out(snap_rings);
+                    snap_rings_dev = true;
+                } else {
+                    hist.clear();
+                    snap_len = -1;
+                    live_end = 0;
+                }
+#if defined(DS41_HAVE_DSPARK)
+                dsp_next = -1;
+#endif
+                cur_seed_n = 0;
+                if (defer_vram && !cache_open && open_cache()) cache_open = true;   // decode next: the cache back
+                const double pms = now_ms() - tp0;
+                std::fprintf(stderr, "serve: prompt read cancelled after %d of %d tokens (%.2f s): the conversation stays loaded to %d\n",
+                             read_upto, total, pms / 1000.0, (int) hist.size());
+                std::printf("DONE 0 %d %.1f 0.0 cancel 0 0 %d 0 0 0 0 0 %d\n", total, pms, reused, read_upto - reused);
+                if (bg) std::printf("BADM %d 0\n", slot);
+                std::fflush(stdout);
+                return;
+            }
             if (!ok) {
                 std::printf("ERR prefill failed: %s\n", ferr.c_str());
                 std::fflush(stdout);
                 hist.clear();
                 snap_len = -1;
-                continue;
+                live_end = 0;
+                return;
             }
             hist = ids;
+            live_end = total;
             // no snapshot for an image prompt: a text request with the same ids (all image_token) would restore its embeddings
             if (total > reused && !is_vision && dense.snapshot(total)) {
                 snap_len = total;
                 snap_logits = last_logits;
                 snap_seed.swap(cur_seed);   // this prompt's DSpark tail rows (0 rows when DSpark is off / no tail ran)
                 snap_seed_n = cur_seed_n;
+                dense.rings_out(snap_rings);
+                snap_rings_dev = true;
             }
             cur_seed_n = 0;
             if (const char * dd = std::getenv("STRATA_SERVE_DUMP")) {   // exactness checks: request N's last-row logits
@@ -1994,195 +2747,98 @@ int main(int argc, char ** argv) {
                 if (!open_cache()) {
                     std::printf("ERR VRAM seed failed: %s\n", err.c_str());
                     std::fflush(stdout);
-                    continue;
+                    return;
                 }
                 cache_open = true;
                 std::fprintf(stderr, "serve: VRAM %.2f GiB free -> %lld experts in VRAM (seed %.2f s)\n", seed_free,
                              (long long) tier.resident(), seed_s);
             }
-            if (ok) tier.rebalance_plan();
+            tier.rebalance_plan();
             if (bias_changed) {   // decode: this request's route bias + file penalty (see bias_changed)
                 bias_now = true;
                 apply_bias();
             }
             tier.reset_stats();
             dense.route_meter(true);
-            const double td0 = now_ms();
-            int gen = 0, pos = total;
-            const char * finish = "length";
-            std::vector<float> lg = last_logits;
-#if defined(DS41_HAVE_DSPARK)
-            // ---- DSpark speculative sampling (as the one-shot loop: P = last fed position, t = the token for P+1,
-            // sp_ids = drafts for P+2..; each verify row's distribution is sample_p's, spec_accept keeps it exact)
-            long rq_pass = 0, rq_acc = 0;
-            if (sp_t >= 0) {
-                int P = total - 1, t = sp_t, prev = ids.back();
-                bool dirty = false;
-                std::vector<int> vt;
-                std::vector<std::pair<int, double>> dist;
-                // STRATA_SERVE_LOOKUP=L (s6, opt-in until measured; mab776/Strata-DS4 M11's design): when the context's
-                // last G+1 tokens (STRATA_LOOKUP_NGRAM=G, default 3) occurred earlier in this request (prompt + output),
-                // the tokens that followed them there are the verify pass's drafts instead of DSpark's - an agent's output
-                // copies its context (edits, rewrites, quoted tool results).  spec_accept treats every draft as a
-                // deterministic token (accept with p, else resample without it), so the output distribution is unchanged.
-                // A match of M tokens drafts M - G + 1 (<= L, <= the pass width).  STRATA_LOOKUP_AGREE (default 1): only
-                // when the copy's first token is DSpark's own first draft.  A lookup pass with less than half accepted
-                // sits the lookup out 1, 2, 4 .. 64 passes.  DSpark steps on the verified rows either way.
-                // kVerify (s6): rows one verify pass may take - 16, as the prompt passes (pass_v splits the tier calls at
-                // kMaxMulti - 8 then, 16 now - and the pass buffers hold 17).  A copy is accepted ~96% on edits, so the
-                // draft length was the limit at the old kMaxMulti - 2 = 6 (s6: 932/972 accepted in 169 passes, only +3%
-                // over DSpark's own).
-                constexpr int kVerify = 16;
-                static const int lk_max = std::getenv("STRATA_SERVE_LOOKUP") ? std::max(0, std::min(kVerify - 2, std::atoi(std::getenv("STRATA_SERVE_LOOKUP")))) : 0;
-                static const int lk_g = std::getenv("STRATA_LOOKUP_NGRAM") ? std::max(1, std::atoi(std::getenv("STRATA_LOOKUP_NGRAM"))) : 3;
-                static const bool lk_agree = !(std::getenv("STRATA_LOOKUP_AGREE") && std::getenv("STRATA_LOOKUP_AGREE")[0] == '0');
-                int lk_cool = 0, lk_back = 1;
-                long lk_pass = 0, lk_dr = 0, lk_acc = 0;
-                int dr[kVerify] = {0};
-                auto emit = [&](int tok) -> bool {   // false = stop here
-                    std::printf("T %d\n", tok);
-                    std::fflush(stdout);
-                    ++gen;
-                    if (is_stop(tok)) { finish = "stop"; return false; }
-                    if (max_new > 0 && gen >= max_new) return false;
-                    return true;
-                };
-                while (emit(t)) {
-                    if (stop_pending()) { finish = "cancel"; break; }
-                    int k = sp_depth_serve;
-                    if (max_new > 0) k = std::min(k, max_new - gen);
-                    k = std::min(k, ctxv - (P + 3));   // the pass writes P+1 .. P+1+k
-                    if (k < 0) break;
-                    // STRATA_DSPARK_CONF=<tau>, as the one-shot loop: verify only the leading drafts whose confidence-head
-                    // probability is >= tau (the emitted tokens are still the trunk's - only the verify width changes)
-                    static const float conf_tau_s = std::getenv("STRATA_DSPARK_CONF") ? (float) std::atof(std::getenv("STRATA_DSPARK_CONF")) : -1.0f;
-                    if (conf_tau_s >= 0) {
-                        int kk = 0;
-                        while (kk < k && 1.0f / (1.0f + std::exp(-sp_conf[kk])) >= conf_tau_s) ++kk;
-                        k = kk;
-                    }
-                    const bool refeed = dirty && ((P + 1) & 1);
-                    for (int i = 0; i < k; ++i) dr[i] = sp_ids[i];
-                    bool is_lk = false;
-                    if (lk_max > 0 && lk_cool > 0) --lk_cool;
-                    else if (lk_max > 0) {
-                        // the sequence is hist + t (t = the token for P+1, not in hist yet); find the latest earlier q with
-                        // seq[q-G .. q] == seq[n-G .. n] (G+1 tokens, the last being t), then copy seq[q+1 ..]
-                        const int n = (int) hist.size();
-                        auto sq = [&](int i) { return i == n ? t : hist[(size_t) i]; };
-                        int cap = std::min(lk_max, kVerify - 1 - (refeed ? 1 : 0));
-                        if (max_new > 0) cap = std::min(cap, max_new - gen);
-                        cap = std::min(cap, ctxv - (P + 3));
-                        if (cap >= 2 && n > lk_g + 1) {
-                            for (int q = n - 1; q >= lk_g; --q) {
-                                if (hist[(size_t) q] != t) continue;
-                                int m = 1;
-                                while (m < 64 && q - m >= 0 && hist[(size_t) (q - m)] == sq(n - m)) ++m;
-                                if (m < lk_g + 1) continue;
-                                const int L = std::min({cap, m - lk_g + 1, n - q});
-                                if (L < 2) break;   // the latest match copies too little: not worth a pass
-                                if (lk_agree && sq(q + 1) != sp_ids[0]) break;
-                                for (int i = 0; i < L; ++i) dr[i] = sq(q + 1 + i);
-                                k = L;
-                                is_lk = true;
-                                break;
-                            }
-                        }
-                    }
-                    vt.clear();
-                    if (refeed) vt.push_back(prev);
-                    vt.push_back(t);
-                    for (int i = 0; i < k; ++i) vt.push_back(dr[i]);
-                    const int r0 = refeed ? 1 : 0, p0 = refeed ? P : P + 1;
-                    if (!pass_v(vt.data(), (int) vt.size(), p0)) { finish = "error"; break; }
-                    int acc = 0, tn = -1;
-                    for (; acc < k; ++acc) {
-                        sample_dist(vlog.data() + (size_t) (r0 + acc) * nv, nv, temp, tk, top_p, min_p, dist);
-                        if (!spec_accept(dist, dr[acc], rng, tn)) break;
-                    }
-                    if (acc == k) tn = sample_p(vlog.data() + (size_t) (r0 + k) * nv, nv, temp, tk, top_p, min_p, rng);
-                    ++rq_pass; rq_acc += acc;
-                    if (is_lk) {
-                        ++lk_pass; lk_dr += k; lk_acc += acc;
-                        if (2 * acc < k) { lk_cool = lk_back; lk_back = std::min(64, lk_back * 2); }
-                        else lk_back = 1;
-                    }
-                    int spos[kVerify + 1];
-                    for (int i = 0; i <= acc; ++i) spos[i] = P + 1 + i;
-                    int drafts[kVerify];
-                    for (int i = 0; i < k; ++i) drafts[i] = dr[i];
-                    if (!dsp->step(vh.data() + (size_t) r0 * 3 * n_embd, spos, acc + 1, tn, sp_ids, sp_conf)) {
-                        ferr = "DSpark step: " + dsp->last_error(); finish = "error"; break;
-                    }
-                    hist.push_back(t); pen_record(t);
-                    bool more = true;
-                    for (int i = 0; i < acc && more; ++i) { hist.push_back(drafts[i]); pen_record(drafts[i]); more = emit(drafts[i]); }
-                    prev = acc == 0 ? t : drafts[acc - 1];
-                    dirty = acc < k;
-                    P += 1 + acc;
-                    t = tn;
-                    tier.rebalance_tick();
-                    if (!more) break;
-                }
-                if (lk_pass > 0)
-                    std::fprintf(stderr, "serve: lookup %ld/%ld drafts accepted in %ld passes\n", lk_acc, lk_dr, lk_pass);
-                dsp_next = P + 1;   // the ring holds every position <= P (the last emitted token is not fed)
-                if (std::strcmp(finish, "error") == 0) dsp_next = -1;
-                sv_pass += rq_pass; sv_acc += rq_acc;
+            // ---- the request is admitted: its first token, then its decode state (the slots take turns from here)
+            r.total = total;
+            r.reused = reused;
+            r.prompt_ms = prompt_ms;
+            r.td0 = now_ms();
+            r.active = true;
+            r.live = true;
+            live_req = &r;
+            r.spec = sp_t >= 0;
+            r.P = total - 1;
+            r.t = sp_t;
+            r.prev = ids.back();
+            for (int i = 0; i < 5; ++i) { r.sp_ids[i] = sp_ids[i]; r.sp_conf[i] = sp_conf[i]; }
+            r.pos = total;
+            bool more;
+            if (r.spec) more = emit_tok(r, r.t);
+            else {
+                r.lg = last_logits;
+                r.ptok = sample_p(r.lg.data(), nv, temp, tk, top_p, min_p, rng);
+                more = emit_tok(r, r.ptok);
             }
-#endif
-            while (sp_t < 0 && (gen < max_new || max_new <= 0)) {
-                if (stop_pending()) { finish = "cancel"; break; }
-                const int tok = sample_p(lg.data(), nv, temp, tk, top_p, min_p, rng);
-                std::printf("T %d\n", tok);
+            if (bg) {   // the admission's own figures, then whether the slot goes on (the server reads BT / BDONE from here)
+                const bool cont = more;
+                std::printf("DONE %d %d %.1f 0.0 %s 0 0 %d %lld %lld 0 %lld 0 %d\n", r.gen, total, prompt_ms, more ? "length" : r.finish, reused,
+                            (long long) pst.hits, (long long) pst.lookups(), (long long) pst.file_tier, total - reused);
+                std::printf("BADM %d %d\n", slot, cont ? 1 : 0);
                 std::fflush(stdout);
-                ++gen;
-                if (is_stop(tok)) { finish = "stop"; break; }
-                if ((max_new > 0 && gen >= max_new) || pos + 1 >= ctxv) break;
-                if (!step(tok, pos) || !dense.logits(0, 1, lg.data())) { finish = "error"; break; }
-                hist.push_back(tok); pen_record(tok);
-                ++pos;
-                tier.rebalance_tick();
+                if (!cont) end_req(r, true);
+                return;
             }
-            const double dec_ms = now_ms() - td0;
-            const Ds41MoeStats st = tier.stats();
-            if (std::strcmp(finish, "error") == 0) {
-                std::fprintf(stderr, "serve: decode failed: %s\n", ferr.c_str());
-                hist.clear();
-                snap_len = -1;
-                finish = "length";
+            if (!more) end_req(r, false);
+        };
+        // ---- the loop: commands as they come; between them, one pass of the next active request (round robin,
+        // slice_passes passes each).  Idle = wait for a line.
+        std::string line;
+        size_t rr = 0;
+        for (;;) {
+            bool have = false;
+            if (any_active()) have = try_line(line);
+            else { if (!next_line(line)) break; have = true; }
+            if (have) {
+                if (line == "QUIT") break;
+                if (line.empty()) continue;
+                if (line == "STOP") {   // the solo request's
+                    if (reqs.back().active) reqs.back().stop_req = true;
+                    continue;
+                }
+                if (line.rfind("BSTOP ", 0) == 0) {
+                    const int s = std::atoi(line.c_str() + 6);
+                    if (s >= 0 && s < n_slots && reqs[(size_t) s].active) reqs[(size_t) s].stop_req = true;
+                    continue;
+                }
+                if (line.rfind("BYIELD ", 0) == 0) continue;   // a prompt read is one batch here: it never gives way (the server copes)
+                const bool bg = line.rfind("BGEN ", 0) == 0 || line.rfind("BGENI ", 0) == 0;
+                if (!bg && line.rfind("GEN ", 0) != 0 && line.rfind("GENI ", 0) != 0) { std::printf("ERR unsupported command\n"); std::fflush(stdout); continue; }
+                admit(line, bg);
+                continue;
             }
-            std::fprintf(stderr, "serve: %d tokens in %.2f s = %.2f tok/s (%s); experts: %lld hit, %lld cpu, %lld pcie, %lld file%s\n",
-                         gen, dec_ms / 1000.0, 1000.0 * std::max(0, gen - 1) / std::max(dec_ms, 1e-9), finish,
-                         (long long) st.hits, (long long) st.cpu, (long long) st.pcie, (long long) st.file_tier,
-                         st.skipped > 0 ? (", skipped " + std::to_string(st.skipped)).c_str() : "");
-            if (const Ds41Dense::RouteMeter rm = dense.route_meter(false); rm.on && rm.slots > 0)
-                std::fprintf(stderr, "serve: routing vs exact: %.2f%% of expert picks swapped, %.2f%% of router weight kept (%lld slots)\n",
-                             100.0 * (double) rm.swaps / (double) rm.slots, 100.0 * rm.weight_kept, rm.slots);
-            if (vram_trace) {   // who holds the card while decoding (the expert slots are the rest)
-                size_t tf = 0, tt = 0;
-                ggml_backend_dev_memory(ggml_backend_get_device(be), &tf, &tt);
-                double dsp_gib = 0.0;
+            if (at_eof() && !any_active()) break;
+            // the next active request: the current one until its slice is used up, then round robin
+            Req * cur = (rr < reqs.size() && reqs[rr].active && reqs[rr].slice < slice_passes) ? &reqs[rr] : nullptr;
+            if (!cur) {
+                if (rr < reqs.size()) reqs[rr].slice = 0;
+                for (size_t k2 = 1; k2 <= reqs.size() && !cur; ++k2) {
+                    const size_t i = (rr + k2) % reqs.size();
+                    if (reqs[i].active) { cur = &reqs[i]; rr = i; }
+                }
+                if (!cur) continue;
+                cur->slice = 0;
+            }
+            Req & r = *cur;
+            if (!make_live(r)) { r.finish = "error"; end_req(r, false); continue; }
+            ++r.slice;
 #if defined(DS41_HAVE_DSPARK)
-                if (dsp) dsp_gib = (double) dsp->weight_bytes() / 1073741824.0;
+            const bool more = r.spec ? run_pass(r) : run_step(r);
+#else
+            const bool more = run_step(r);
 #endif
-                std::fprintf(stderr, "vram ledger: %s; DSpark weights %.2f GiB; free %.2f of %.2f GiB\n",
-                             dense.vram_ledger().c_str(), dsp_gib, tf / 1073741824.0, tt / 1073741824.0);
-            }
-#if defined(DS41_HAVE_DSPARK)
-            if (rq_pass > 0)
-                if (dsp) dsp->write_counts();
-                std::fprintf(stderr, "serve: DSpark %ld passes, %.2f tokens/pass (all requests %.2f)\n", rq_pass,
-                             1.0 + (double) rq_acc / rq_pass, 1.0 + (double) sv_acc / std::max(1L, sv_pass));
-#endif
-            tier.rebalance_tick(true);   // the gap until the next request: retire a large batch for the reader
-            std::printf("DONE %d %d %.1f %.1f %s 0 0 %d %lld %lld 0 %lld 0 %d\n", gen, total, prompt_ms, dec_ms, finish, reused,
-                        (long long) st.hits, (long long) st.lookups(), (long long) st.file_tier, total - reused);
-            std::fflush(stdout);
-            if (g_routes.on()) {   // after DONE: the client already has its answer
-                std::string rerr;
-                if (!g_routes.write(rerr)) std::fprintf(stderr, "routes: %s\n", rerr.c_str());
-            }
+            if (!more) end_req(r, false);
         }
         tier.close();
         // the stdin reader thread (detached) sits in getline holding cin's lock: a normal exit's stream teardown waits

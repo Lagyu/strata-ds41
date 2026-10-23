@@ -28,6 +28,18 @@ namespace ty {
 constexpr uint32_t F32 = 0, F16 = 1, Q8_0 = 8, Q3_K = 11, I8 = 24, I32 = 26, Q2_0 = 42, PTQ1_0 = 143;
 }
 
+/// The types a mixed file's expert tiers may use: v41_gguf.py's GSQ tiers (Q3_K, Q2_0, PTQ1_0) and what a residency
+/// splice writes (tools/v41/splice_b.py): MXFP4 kept from the source, or a requantized Q2_K / Q4_K / IQ2_XXS / IQ2_XS /
+/// IQ3_XXS / IQ3_S / IQ2_S / IQ4_XS.  The grouped expert kernels (iq_kernels.cu is_iq) and ggml-cpu take each of them.
+inline bool ds41_expert_tier_type(int t) {
+    switch (t) {
+    case 10: case 11: case 12: case 16: case 17: case 18: case 21: case 22: case 23: case 39: case 42: case 143:
+        return true;
+    default:
+        return false;
+    }
+}
+
 /// One layer's routed experts: the type of each expert's gate+up and of its down, and where each expert's rows are
 /// (tensor name + slot inside it).  Uniform roles have a single tensor (slot == expert id).
 struct Ds41ExpertMap {
@@ -371,7 +383,7 @@ inline std::string ds41_check_tensors(const GgufModel & m, Ds41Geometry & G, con
             std::map<int, int> count;
             for (uint64_t e = 0; e < NE; ++e) { tv[e] = mv[e]; sv[e] = count[mv[e]]++; }
             for (const auto & [t, n] : count) {
-                if (t != (int) ty::Q2_0 && t != (int) ty::Q3_K && t != (int) ty::PTQ1_0)
+                if (!ds41_expert_tier_type(t))
                     return mapn + ": type " + std::to_string(t) + " is not an expert tier";
                 std::string tn = ggml_type_name((uint32_t) t);
                 for (char & c : tn) c = (char) std::tolower((unsigned char) c);

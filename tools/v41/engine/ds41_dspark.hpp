@@ -48,6 +48,11 @@ public:
     bool step(const float * main_hidden, const int * pos, int k, int bonus, int * ids, float * conf);
     /// Forget the window (a new conversation / a rewind past it).
     void reset();
+    /// The window as host bytes (every block's ring + which position each slot holds): a conversation parked in the
+    /// middle of its answer takes its drafter window along and continues with the same drafts (serve, several
+    /// requests at once).  window_in puts one back; a size that is not this stack's is refused.
+    bool window_out(std::vector<uint8_t> & bytes, std::vector<int> & filled) const;
+    bool window_in(const std::vector<uint8_t> & bytes, const std::vector<int> & filled);
     double last_ms() const;             ///< wall time of the last step's graph
     void write_counts() const;          ///< STRATA_DSPARK_COUNT: write the routed-expert counts now (also at exit)
     size_t weight_bytes() const;        ///< device bytes of the stack's weights

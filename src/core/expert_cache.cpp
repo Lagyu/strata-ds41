@@ -595,7 +595,50 @@ bool ExpertCache::open_sized(const std::vector<int64_t>& slot_bytes, int64_t n_l
     return true;
 }
 
+bool ExpertCache::swap_slots(int32_t a, int32_t b, std::string& err) {
+    if (!off_.empty()) { err = "ExpertCache::swap_slots: the slots are sized per layer (uniform slots only)"; return false; }
+    if (base_ == nullptr || a < 0 || b < 0 || a >= live_slots_ || b >= live_slots_) {
+        err = "ExpertCache::swap_slots: slot outside the live arena";
+        return false;
+    }
+    if (a == b) return true;
+    const size_t none = residency_.size();
+    size_t ia = none, ib = none;   // the residency entries that hold a and b (at most one each)
+    for (size_t i = 0; i < residency_.size(); ++i) {
+        if (residency_[i] == a) ia = i;
+        else if (residency_[i] == b) ib = i;
+    }
+    if (ia == none && ib == none) return true;
+    const size_t n = (size_t) blob_;
+    uint8_t* pa = base_ + (size_t) a * n;
+    uint8_t* pb = base_ + (size_t) b * n;
+    cudaError_t e = cudaSuccess;
+    if (ia != none && ib != none) {
+        if (!swap_tmp_ && cudaMalloc((void**) &swap_tmp_, n) != cudaSuccess) {
+            swap_tmp_ = nullptr;
+            err = "ExpertCache::swap_slots: no room for the spare blob";
+            return false;
+        }
+        e = cudaMemcpy(swap_tmp_, pa, n, cudaMemcpyDeviceToDevice);
+        if (e == cudaSuccess) e = cudaMemcpy(pa, pb, n, cudaMemcpyDeviceToDevice);
+        if (e == cudaSuccess) e = cudaMemcpy(pb, swap_tmp_, n, cudaMemcpyDeviceToDevice);
+    } else if (ia != none) {
+        e = cudaMemcpy(pb, pa, n, cudaMemcpyDeviceToDevice);   // into the empty slot b
+    } else {
+        e = cudaMemcpy(pa, pb, n, cudaMemcpyDeviceToDevice);
+    }
+    if (e != cudaSuccess) {
+        err = std::string("ExpertCache::swap_slots: ") + cudaGetErrorString(e);
+        return false;
+    }
+    if (ia != none) residency_[ia] = b;
+    if (ib != none) residency_[ib] = a;
+    return true;
+}
+
 void ExpertCache::close() {
+    if (swap_tmp_) (void) cudaFree(swap_tmp_);
+    swap_tmp_ = nullptr;
 #if defined(STRATA_USE_HIP)
     if (blocking_staging_) (void) cudaFreeHost(blocking_staging_);
     blocking_staging_ = nullptr;

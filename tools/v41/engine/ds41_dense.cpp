@@ -2293,6 +2293,14 @@ bool Ds41Dense::restore() {
 
 int Ds41Dense::snapshot_pos() const { return p_->snap_pos; }
 
+int Ds41Dense::rollback_max() const { return (int) (p_->RAW - p_->SWA + 1); }
+
+void Ds41Dense::prime_history(const int * ids, int64_t from, int64_t to) {
+    Impl & im = *p_;
+    if (!im.engram.enabled()) return;
+    for (int64_t q = std::max<int64_t>(0, from); q < to; ++q) im.engram.set_token(q, ids[q]);
+}
+
 bool Ds41Dense::park(int64_t positions) {
     Impl & im = *p_;
     if (im.snap_pos < 0 || positions < 1) return false;
@@ -2336,6 +2344,138 @@ void Ds41Dense::drop_park() {
 }
 
 bool Ds41Dense::parked() const { return p_->parked_pos >= 0; }
+
+struct Ds41Dense::Parked {
+    std::vector<Impl::ParkedRows> rows;
+    int pos = -1;
+    size_t bytes = 0;
+};
+
+// the rows a park of `positions` positions takes, in order: the snapshot rings, then per kv-source layer the compressed
+// rows / indexer keys up to the position and the spare row (open compressor groups write it)
+template <class F> static void park_walk(const Ds41Dense::Impl & im, int64_t positions, F && put) {
+    for (const auto & L : im.ly) {
+        for (ggml_tensor * t : { L.raw_snap, L.st_kv_snap, L.st_sc_snap })
+            if (t) put(t, (size_t) 0, (size_t) ggml_nbytes(t));
+        for (ggml_tensor * t : { L.comp, L.idxk }) {   // a ratio-r cache holds one row per r positions
+            if (!t) continue;
+            const int64_t rows = t->ne[1], per = std::max<int64_t>(1, L.ratio);
+            const int64_t n = std::min<int64_t>(rows - 1, (positions + per - 1) / per + 1);
+            put(t, (size_t) 0, (size_t) n * t->nb[1]);
+            put(t, (size_t) (rows - 1) * t->nb[1], (size_t) t->nb[1]);
+        }
+    }
+}
+
+Ds41Dense::ParkedPtr Ds41Dense::park_out(int64_t positions) {
+    Impl & im = *p_;
+    if (im.snap_pos < 0 || positions < 1) return nullptr;
+    ggml_backend_synchronize(im.backend);
+    auto pk = std::make_shared<Parked>();
+    park_walk(im, positions, [&](ggml_tensor * t, size_t off, size_t n) {
+        Impl::ParkedRows r{ t, off, std::vector<uint8_t>(n) };
+        ggml_backend_tensor_get(t, r.b.data(), off, n);
+        pk->bytes += n;
+        pk->rows.push_back(std::move(r));
+    });
+    pk->pos = im.snap_pos;
+    return pk;
+}
+
+bool Ds41Dense::park_to_bytes(const ParkedPtr & pk, std::vector<uint8_t> & out) const {
+    if (!pk || pk->pos < 0) return false;
+    size_t total = 8 + 8;
+    for (const auto & r : pk->rows) total += 16 + r.b.size();
+    out.resize(total);
+    uint8_t * w = out.data();
+    auto put64 = [&](uint64_t v) { std::memcpy(w, &v, 8); w += 8; };
+    put64((uint64_t) pk->pos);
+    put64((uint64_t) pk->rows.size());
+    for (const auto & r : pk->rows) {
+        put64((uint64_t) r.off);
+        put64((uint64_t) r.b.size());
+        std::memcpy(w, r.b.data(), r.b.size());
+        w += r.b.size();
+    }
+    return true;
+}
+
+Ds41Dense::ParkedPtr Ds41Dense::park_from_bytes(const uint8_t * data, size_t n, int64_t positions, std::string & err) const {
+    const Impl & im = *p_;
+    if (n < 16) { err = "park_from_bytes: short"; return nullptr; }
+    const uint8_t * r = data;
+    auto get64 = [&](uint64_t & v) -> bool { if ((size_t) (r - data) + 8 > n) return false; std::memcpy(&v, r, 8); r += 8; return true; };
+    uint64_t pos = 0, nrows = 0;
+    if (!get64(pos) || !get64(nrows)) { err = "park_from_bytes: short header"; return nullptr; }
+    auto pk = std::make_shared<Parked>();
+    bool ok = true;
+    size_t seen = 0;
+    park_walk(im, positions, [&](ggml_tensor * t, size_t off, size_t len) {
+        if (!ok) return;
+        uint64_t roff = 0, rlen = 0;
+        if (seen >= nrows || !get64(roff) || !get64(rlen) || roff != off || rlen != len || (size_t) (r - data) + len > n) { ok = false; return; }
+        Impl::ParkedRows row{ t, off, std::vector<uint8_t>(len) };
+        std::memcpy(row.b.data(), r, len);
+        r += len;
+        pk->bytes += len;
+        pk->rows.push_back(std::move(row));
+        ++seen;
+    });
+    if (!ok || seen != nrows) { err = "park_from_bytes: the rows do not match this engine's caches"; return nullptr; }
+    pk->pos = (int) pos;
+    return pk;
+}
+
+bool Ds41Dense::park_in(const ParkedPtr & pk) {
+    Impl & im = *p_;
+    if (!pk || pk->pos < 0) return false;
+    ggml_backend_synchronize(im.backend);
+    for (auto & r : pk->rows) ggml_backend_tensor_set(r.t, r.b.data(), r.off, r.b.size());
+    ggml_backend_synchronize(im.backend);
+    im.snap_pos = pk->pos;
+    return true;
+}
+
+size_t Ds41Dense::parked_bytes(const ParkedPtr & pk) { return pk ? pk->bytes : 0; }
+
+bool Ds41Dense::rings_out(std::vector<uint8_t> & bytes) const {
+    const Impl & im = *p_;
+    if (im.snap_pos < 0) return false;
+    ggml_backend_synchronize(im.backend);
+    size_t total = 0;
+    for (const auto & L : im.ly)
+        for (ggml_tensor * t : { L.raw_snap, L.st_kv_snap, L.st_sc_snap })
+            if (t) total += ggml_nbytes(t);
+    bytes.resize(total);
+    size_t off = 0;
+    for (const auto & L : im.ly)
+        for (ggml_tensor * t : { L.raw_snap, L.st_kv_snap, L.st_sc_snap }) {
+            if (!t) continue;
+            ggml_backend_tensor_get(t, bytes.data() + off, 0, ggml_nbytes(t));
+            off += ggml_nbytes(t);
+        }
+    return true;
+}
+
+bool Ds41Dense::rings_in(const std::vector<uint8_t> & bytes, int pos) {
+    Impl & im = *p_;
+    size_t total = 0;
+    for (const auto & L : im.ly)
+        for (ggml_tensor * t : { L.raw_snap, L.st_kv_snap, L.st_sc_snap })
+            if (t) total += ggml_nbytes(t);
+    if (bytes.size() != total || pos < 0) { im.err = "rings_in: the bytes are not this engine's snapshot rings"; return false; }
+    ggml_backend_synchronize(im.backend);
+    size_t off = 0;
+    for (auto & L : im.ly)
+        for (ggml_tensor * t : { L.raw_snap, L.st_kv_snap, L.st_sc_snap }) {
+            if (!t) continue;
+            ggml_backend_tensor_set(t, bytes.data() + off, 0, ggml_nbytes(t));
+            off += ggml_nbytes(t);
+        }
+    ggml_backend_synchronize(im.backend);
+    im.snap_pos = pos;
+    return true;
+}
 
 bool Ds41Dense::read_sel(int il, std::vector<int> & sel, std::vector<float> & mask, int * K) {
     Impl & im = *p_;

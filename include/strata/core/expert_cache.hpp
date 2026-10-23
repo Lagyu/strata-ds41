@@ -160,6 +160,11 @@ public:
     /// full - **it never evicts**, because eviction policy is a measured question (`R4.1`'s LFU-decay vs LRU
     /// sweep) and a placeholder policy would set the hit rate that everything downstream is then sized against.
     int32_t admit(int64_t layer, int64_t expert);
+    /// Serve keep-cache under the LRU (2026-10-23): exchange what two UNIFORM slots hold - the device bytes and the
+    /// residency entries - so the experts to keep can be gathered below a shrink point and the tail evicted as before.
+    /// Either slot may be empty (then the blob moves).  Sized slots: false with `err`.  The caller has waited for the
+    /// device; the copies go through one spare device blob kept until close().
+    bool swap_slots(int32_t a, int32_t b, std::string& err);
     /// Xolotl s6: put `expert` into a SPECIFIC free slot (one `evict_from` emptied) - how a shrunk cache gets the
     /// experts it evicted back into exactly the slots they had (a sized cache's slot fits only its own blob class).
     /// Not on the per-layer path.  Returns the slot, or kNotResident when the slot is out of range / taken / the
@@ -275,6 +280,7 @@ private:
     std::vector<int32_t> layer_next_;   ///< [n_layers] -> that layer's next free slot
     std::vector<uint64_t> off_;         ///< plan v0.3 P6: slot offsets (slots + 1 entries) when sized
     int64_t admitted_ = 0;
+    uint8_t* swap_tmp_ = nullptr;        ///< swap_slots: one spare device blob (freed by close)
 };
 
 }  // namespace strata::core

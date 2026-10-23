@@ -181,6 +181,17 @@ public:
     std::string vram_ledger() const;
     bool restore();
     int snapshot_pos() const;
+    /// How far below the snapshot a resume may start and still be exact.  After restore() the window ring holds the rows
+    /// of positions [snap - RAW, snap) (RAW = SWA + 16, the headroom DSpark's rejected drafts need), and a query at R
+    /// reads [R - SWA + 1, R): R >= snap - (RAW - SWA + 1).  R must also be EVEN: the ratio-2 compressor's state ring
+    /// keeps only the last two positions, so an open group (odd R) cannot be rebuilt, a fresh one (even R) needs none.
+    int rollback_max() const;
+    /// Re-record the tokens of positions [from, to) in the Engram's n-gram history.  That history is indexed by position
+    /// and every request rewrites it from position 0, so after another conversation ran (a swap-in from the park, or any
+    /// resume below the end of what ran last) the previous tokens a resumed prompt's first n-grams look back at belonged
+    /// to the other conversation: the first N-1 re-fed tokens hashed the wrong context.  The caller passes the request's
+    /// ids (the same tokens as the resumed conversation up to the resume point).
+    void prime_history(const int * ids, int64_t from, int64_t to);
     /// Serve: keep a conversation through an UNRELATED request.  An unrelated request writes its own positions from 0, so
     /// it overwrites the start of every position-indexed cache (compressed KV, indexer keys) and the snapshot rings.
     /// park(n) copies the snapshot rings + the first n positions' rows of those caches (and their spare rows) to host
@@ -190,6 +201,27 @@ public:
     bool unpark();
     void drop_park();
     bool parked() const;
+    /// Serve, several conversations at once (parent agent + subagents on one engine): a conversation kept in host memory
+    /// WHOLE - the snapshot rings and every row of the position-indexed caches up to `positions` (the ratio-2 caches only
+    /// half as many rows) - so nothing another request writes can invalidate it.  park() above keeps just the rows one
+    /// unrelated request may write and is dropped as soon as the next request reaches further (dsh asks for 256K output
+    /// tokens, so that was the second request of every other conversation).
+    struct Parked;
+    using ParkedPtr = std::shared_ptr<Parked>;
+    ParkedPtr park_out(int64_t positions);      ///< a copy; the device state is untouched.  Null without a snapshot.
+    bool park_in(const ParkedPtr & p);          ///< write it back and re-arm the snapshot there: restore() resumes it
+    static size_t parked_bytes(const ParkedPtr & p);
+    /// A park as one byte string (its snapshot position, then every row: offset, size, bytes) and back.  park_in_bytes
+    /// rebuilds the rows park_out(positions) would take on THIS engine and refuses bytes whose rows differ (another KV
+    /// layout, context size or model): the serve loop keeps shared-prefix parks in files this way (STRATA_SERVE_PREFIX_DIR).
+    bool park_to_bytes(const ParkedPtr & p, std::vector<uint8_t> & out) const;
+    ParkedPtr park_from_bytes(const uint8_t * data, size_t n, int64_t positions, std::string & err) const;
+    /// The snapshot rings alone (raw window ring + ratio-2 compressor state of every layer, ~11 MB) as host bytes.
+    /// Serve keeps a conversation's prompt-end rings this way while snapshot() is reused for its decode position (a
+    /// request parked in the middle of its answer, so another one can run), and puts them back with rings_in(bytes, pos)
+    /// - which re-arms the snapshot at `pos`, as a snapshot() taken there would.  rings_out needs a snapshot.
+    bool rings_out(std::vector<uint8_t> & bytes) const;
+    bool rings_in(const std::vector<uint8_t> & bytes, int pos);
     /// Debug / gate taps: the hc state after the last finish (n * hc * n_embd floats, token-major) and the pre mix.
     bool read_state(std::vector<float> & x, std::vector<float> & pre);
     /// The hc state of state columns [c0, c0 + n) (token-major, n * hc * n_embd floats) - a layer-major batch's columns
