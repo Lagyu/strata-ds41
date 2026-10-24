@@ -3105,8 +3105,9 @@ void Ds41Dense::drop_park() {
 bool Ds41Dense::parked() const { return p_->parked_pos >= 0; }
 
 struct Ds41Dense::Parked {
-    std::vector<Impl::ParkedRows> rows;
+    std::vector<Impl::ParkedRows> rows;   // ParkedRows::t = the tensor of the slot the park was taken from (park_in ignores it)
     int pos = -1;
+    int64_t positions = 0;                // park_walk(positions) names the same rows in every slot: park_in re-walks the bound one
     size_t bytes = 0;
 };
 
@@ -3171,6 +3172,7 @@ Ds41Dense::ParkedPtr Ds41Dense::park_out(int64_t positions) {
         pk->rows.push_back(std::move(r));
     });
     pk->pos = im.snap_pos;
+    pk->positions = positions;
     return pk;
 }
 
@@ -3215,6 +3217,7 @@ Ds41Dense::ParkedPtr Ds41Dense::park_from_bytes(const uint8_t * data, size_t n, 
     });
     if (!ok || seen != nrows) { err = "park_from_bytes: the rows do not match this engine's caches"; return nullptr; }
     pk->pos = (int) pos;
+    pk->positions = positions;
     return pk;
 }
 
@@ -3222,7 +3225,18 @@ bool Ds41Dense::park_in(const ParkedPtr & pk) {
     Impl & im = *p_;
     if (!pk || pk->pos < 0) return false;
     ggml_backend_synchronize(im.backend);
-    for (auto & r : pk->rows) ggml_backend_tensor_set(r.t, r.b.data(), r.off, r.b.size());
+    // into the BOUND slot's tensors, whichever slot the park was taken from (batch slots: a conversation parked from one slot
+    // comes back where it is bound now): the rows a park of `positions` positions takes are the same in every slot, in
+    // park_walk's order, so the bound slot is walked again and the saved bytes go to its tensors row by row
+    size_t i = 0;
+    bool ok = true;
+    park_walk(im, pk->positions, [&](ggml_tensor * t, size_t off, size_t n) {
+        if (!ok) return;
+        if (i >= pk->rows.size() || pk->rows[i].off != off || pk->rows[i].b.size() != n) { ok = false; return; }
+        ggml_backend_tensor_set(t, pk->rows[i].b.data(), off, n);
+        ++i;
+    });
+    if (!ok || i != pk->rows.size()) { im.err = "park_in: the park's rows do not match this engine's caches"; return false; }
     ggml_backend_synchronize(im.backend);
     im.snap_pos = pk->pos;
     return true;
