@@ -1,0 +1,10 @@
+chain-mayas report 2026-10-24 00:43:20
+held-out 8x1024 (ppl / top-1 / KL top-256 vs the FP8 teacher):
+  mayas-abl  {"tokens": 8184, "ppl": 9.587016582520794, "top1_agree": 0.8176930596285436, "kl_top256": 0.2173029318965175}
+  base-3gpu  {"tokens": 8184, "ppl": 8.626284674485438, "top1_agree": 0.9356060606060606, "kl_top256": 0.04483545063783652}
+security set (KL(prod || mayas-abl), top-1 vs production, both ppl):
+  {"tokens": 32764, "ppl": 1.7568109609545515, "ref_ppl": 1.649679383525656, "top1_agree": 0.9390489561714076, "kl_top256": 0.08926735292199808}
+speed (bench.py rows, thinking off):
+label               code prefill  code decode prose prefill prose decode    ja prefill    ja decode    4k prefill    4k decode   accept(code/prose/ja/4k)
+M-prod                       3.9          9.7           4.6          9.3           7.1         10.7          97.6          7.2   -/-/-/-
+M-mayas                     14.6         15.1          19.8         13.9           9.5         14.7         142.2         12.7   -/-/-/-

@@ -1,0 +1,133 @@
+{
+ "heldout_8x1024_vs_fp8": {
+  "stock-mxfp4": {
+   "model": "original weights (no ABL), MXFP4 experts",
+   "tokens": 8184,
+   "ppl": 8.600551534884548,
+   "top1_agree": 0.9431818181818182,
+   "kl_top256": 0.03702199069377403
+  },
+  "base-3gpu": {
+   "model": "production MXFP4+ABL (exact)",
+   "tokens": 8184,
+   "ppl": 8.626284674485438,
+   "top1_agree": 0.9356060606060606,
+   "kl_top256": 0.04483545063783652
+  },
+  "skip10": {
+   "model": "production MXFP4+ABL + --skip-file 0.10",
+   "tokens": 8184,
+   "ppl": 8.62661513574957,
+   "top1_agree": 0.9152003910068426,
+   "kl_top256": 0.05889401894314503
+  },
+  "orca-mix256": {
+   "model": "orcarouter Mix-256G (exact)",
+   "tokens": 8184,
+   "ppl": 8.818292915419507,
+   "top1_agree": 0.884286412512219,
+   "kl_top256": 0.0915725172315969
+  },
+  "orca-mix256-skip10": {
+   "model": "orcarouter Mix-256G + --skip-file 0.10",
+   "tokens": 8184,
+   "ppl": 8.835198438406232,
+   "top1_agree": 0.876099706744868,
+   "kl_top256": 0.10007398448455802
+  },
+  "mayas-abl": {
+   "model": "Maya-S + our ABL dense",
+   "tokens": 8184,
+   "ppl": 9.587016582520794,
+   "top1_agree": 0.8176930596285436,
+   "kl_top256": 0.2173029318965175
+  },
+  "gsq-iq2xs-abl": {
+   "model": "GSQ-RCO IQ2_XS + our ABL dense",
+   "tokens": 8184,
+   "ppl": 9.63765322913084,
+   "top1_agree": 0.8031524926686217,
+   "kl_top256": 0.23371209546263955
+  },
+  "unsloth-q4": {
+   "model": "unsloth UD-Q4_K_XL (stock, 2026-10-21)",
+   "tokens": 8184,
+   "ppl": 8.54474831979312,
+   "top1_agree": 0.9428152492668622,
+   "kl_top256": 0.0363323307484914
+  }
+ },
+ "security_16x2048": {
+  "orca-sec": {
+   "model": "orcarouter Mix-256G",
+   "vs_production": {
+    "tokens": 32764,
+    "ppl": 1.6670648842350546,
+    "ref_ppl": 1.649679383525656,
+    "top1_agree": 0.9611769014772311,
+    "kl_top256": 0.038150180557143476
+   },
+   "vs_original": {
+    "tokens": 32764,
+    "ppl": 1.6670648842350546,
+    "ref_ppl": 1.6387497467114924,
+    "top1_agree": 0.961756806250763,
+    "kl_top256": 0.03592729786712801
+   }
+  },
+  "prod-sec": {
+   "model": "production MXFP4+ABL (test binary)",
+   "vs_production": {
+    "tokens": 32764,
+    "ppl": 1.6494789266881946,
+    "ref_ppl": 1.649679383525656,
+    "top1_agree": 0.9995727017458186,
+    "kl_top256": 0.0023802663904639956
+   },
+   "vs_original": {
+    "tokens": 32764,
+    "ppl": 1.6494789266881946,
+    "ref_ppl": 1.6387497467114924,
+    "top1_agree": 0.9734159443291417,
+    "kl_top256": 0.019992700206496107
+   }
+  },
+  "mayas-abl": {
+   "model": "Maya-S + our ABL dense",
+   "vs_production": {
+    "tokens": 32764,
+    "ppl": 1.7568109609545515,
+    "ref_ppl": 1.649679383525656,
+    "top1_agree": 0.9390489561714076,
+    "kl_top256": 0.08926735292199808
+   }
+  },
+  "gsq-iq2xs-abl": {
+   "model": "GSQ-RCO IQ2_XS + our ABL dense",
+   "vs_production": {
+    "tokens": 32764,
+    "ppl": 1.7810636776878672,
+    "ref_ppl": 1.649679383525656,
+    "top1_agree": 0.9306250763032596,
+    "kl_top256": 0.10801237502772419
+   }
+  },
+  "skip10": {
+   "model": "production MXFP4+ABL + --skip-file 0.10",
+   "vs_production": {
+    "tokens": 32764,
+    "ppl": 1.6478741393699738,
+    "ref_ppl": 1.649679383525656,
+    "top1_agree": 0.9764375534122818,
+    "kl_top256": 0.016647773611698724
+   }
+  },
+  "stock-ref": {
+   "model": "original weights (no ABL): the reference run",
+   "own": {
+    "tokens": 32764,
+    "ppl": 1.6387497467114924
+   }
+  }
+ }
+}

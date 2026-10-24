@@ -1,0 +1,15 @@
+chain-qtest gsq-iq2xs report 2026-10-24 12:46:30
+held-out 8x1024 (ppl / top-1 / KL top-256 vs the FP8 teacher):
+  gsq-iq2xs-abl  {"tokens": 8184, "ppl": 9.63765322913084, "top1_agree": 0.8031524926686217, "kl_top256": 0.23371209546263955}
+  base-3gpu  {"tokens": 8184, "ppl": 8.626284674485438, "top1_agree": 0.9356060606060606, "kl_top256": 0.04483545063783652}
+  mayas-abl  {"tokens": 8184, "ppl": 9.587016582520794, "top1_agree": 0.8176930596285436, "kl_top256": 0.2173029318965175}
+security set (KL(prod || candidate), top-1 vs production, both ppl):
+  gsq-iq2xs-abl  {"tokens": 32764, "ppl": 1.7810636776878672, "ref_ppl": 1.649679383525656, "top1_agree": 0.9306250763032596, "kl_top256": 0.10801237502772419}
+  mayas-abl  {"tokens": 32764, "ppl": 1.7568109609545515, "ref_ppl": 1.649679383525656, "top1_agree": 0.9390489561714076, "kl_top256": 0.08926735292199808}
+speed (bench.py rows, thinking off):
+label               code prefill  code decode prose prefill prose decode    ja prefill    ja decode    4k prefill    4k decode   accept(code/prose/ja/4k)
+G-prod                       4.0          9.7           4.7          9.4           7.4          8.8          82.6          7.0   -/-/-/-
+G-gsq-iq2xs                  2.2         11.4          23.2         17.0          27.6         19.4          91.0         14.7   -/-/-/-
+M-prod                       3.9          9.7           4.6          9.3           7.1         10.7          97.6          7.2   -/-/-/-
+M-mayas                     14.6         15.1          19.8         13.9           9.5         14.7         142.2         12.7   -/-/-/-
+refusal check (thinking off): candidate 4/4 answered, production 4/4 answered

@@ -119,5 +119,10 @@ out/
 /local/secprof/eval/
 /local/longctx/results.jsonl
 /local/maya-s/*.ok
+/local/qtest/*.ok
+/local/qtest/*.end
+/local/qtest/*.FAILED
+/local/qtest/orca-mix-flags.txt
+/local/qtest/tools/common/results.jsonl
 # replays a private agent-harness session, so it stays on the machine
 /local/resume-test/

@@ -19,7 +19,7 @@ t = np.load('$E/heldout_8x1024.npy')
 for i, s in enumerate(t): s.astype(np.int32).tofile('$O/seq%d.i32' % i)"
 for i in 0 1 2 3 4 5 6 7; do
   env HIP_VISIBLE_DEVICES=0,1,2 STRATA_PF_NO_DUMMY=1 STRATA_NO_LARGEPAGES=1 STRATA_PEER_GIB=28,20 STRATA_PEER_FILL=file \
-    "${ENVS[@]}" "$BIN" \
+    "${ENVS[@]}" timeout -k 20 "${TMO:-1500}" "$BIN" \
     -m "$MODEL" --ids-file "$O/seq$i.i32" -n 1 --temp 0 \
     --backend cuda --experts gpu --arena-gib 95 --arena-adapt --peer-device 1,2 --ctx 4096 --kv-fp4 --threads 12 \
     --rank /home/yuya/models/dsv41-1017-strata/rank-lucebox.bin \

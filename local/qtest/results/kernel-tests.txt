@@ -1,0 +1,64 @@
+# Expert kernel tests of the candidate builds (engine test tools test_ds41_moe_gpu / native_grouped_parity; rel = worst relative
+# error against a dequantized F32 reference, tolerance 3e-2).
+
+## Mix-256G (2026-10-25)
+Mix-256G expert test, beside production, 2026-10-25 01:12-01:27: kernel parity PASS on HIP 1 and 2; decode + 32-token chunk PASS on HIP 1 (worst rel 1.64e-2) and HIP 2 (1.64e-2); prompt MMQ chunk PASS on HIP 1 (gfx1201). NOT completed beside production: the MMQ chunk on HIP 2 (gfx1100) hung at its start (killed 03:24 after 2 h, 7 GB held; production was OOM-killed 03:21 and restarted 03:31) and the CPU tier; both are re-run with timeouts inside the quality window (mmq_preflight, cpu_preflight in orca-lib.sh), production stopped.
+
+### prompt-path MMQ chunk on the XTX (gfx1100), production stopped (chain-orca.sh part 1 preflight)
+layer 0: exit 0  40 layers, 8 classes: 22/18 18/22 18/18 18/21 18/39 21/39 39/39 39/21 ok   L0 chunk 32 tokens: 0 rows off, 0 non-finite, worst rel 1.147e-02 stats: 33 hit, 2 cpu, 163 pcie, 12 file; worst rel 1.286e-0
+layer 4: exit 0  40 layers, 8 classes: 22/18 18/22 18/18 18/21 18/39 21/39 39/39 39/21 ok   L4 chunk 32 tokens: 0 rows off, 0 non-finite, worst rel 1.154e-02 stats: 33 hit, 2 cpu, 163 pcie, 22 file; worst rel 1.477e-0
+layer 5: exit 0  40 layers, 8 classes: 22/18 18/22 18/18 18/21 18/39 21/39 39/39 39/21 ok   L5 chunk 32 tokens: 0 rows off, 0 non-finite, worst rel 1.174e-02 stats: 33 hit, 2 cpu, 163 pcie, 28 file; worst rel 1.444e-0
+layer 13: exit 0  40 layers, 8 classes: 22/18 18/22 18/18 18/21 18/39 21/39 39/39 39/21 ok   L13 chunk 32 tokens: 0 rows off, 0 non-finite, worst rel 1.142e-02 stats: 33 hit, 2 cpu, 163 pcie, 32 file; worst rel 1.505e-
+layer 15: exit 0  40 layers, 8 classes: 22/18 18/22 18/18 18/21 18/39 21/39 39/39 39/21 ok   L15 chunk 32 tokens: 0 rows off, 0 non-finite, worst rel 1.176e-02 stats: 33 hit, 2 cpu, 163 pcie, 40 file; worst rel 1.176e-
+layer 23: exit 0  40 layers, 8 classes: 22/18 18/22 18/18 18/21 18/39 21/39 39/39 39/21 ok   L23 chunk 32 tokens: 0 rows off, 0 non-finite, worst rel 1.145e-02 stats: 33 hit, 2 cpu, 163 pcie, 53 file; worst rel 1.169e-
+layer 24: exit 0  40 layers, 8 classes: 22/18 18/22 18/18 18/21 18/39 21/39 39/39 39/21 ok   L24 chunk 32 tokens: 0 rows off, 0 non-finite, worst rel 1.143e-02 stats: 33 hit, 2 cpu, 163 pcie, 67 file; worst rel 1.143e-
+layer 34: exit 0  40 layers, 8 classes: 22/18 18/22 18/18 18/21 18/39 21/39 39/39 39/21 ok   L34 chunk 32 tokens: 0 rows off, 0 non-finite, worst rel 1.168e-02 stats: 33 hit, 2 cpu, 163 pcie, 59 file; worst rel 1.369e-
+
+### CPU tier
+40 layers, 8 classes: 22/18 18/22 18/18 18/21 18/39 21/39 39/39 39/21
+ok   L0 tok 0 classes 0 0 0 0 0 0  rel 1.785e-02
+ok   L0 tok 1 classes 0 0 0 0 0 0  rel 1.747e-02
+ok   L0 tok 2 classes 0 0 0 0 0 0  rel 1.831e-02
+ok   L0 tok 3 classes 0 0 0 0 0 0  rel 1.811e-02
+ok   L4 tok 0 classes 1 1 1 1 1 1  rel 1.647e-02
+ok   L4 tok 1 classes 1 1 1 1 1 1  rel 1.799e-02
+ok   L4 tok 2 classes 1 1 1 1 1 1  rel 1.862e-02
+ok   L4 tok 3 classes 1 1 1 1 1 1  rel 1.918e-02
+ok   L5 tok 0 classes 2 2 2 2 2 2  rel 1.764e-02
+ok   L5 tok 1 classes 2 2 2 2 2 2  rel 1.755e-02
+ok   L5 tok 2 classes 2 2 2 2 2 2  rel 1.879e-02
+ok   L5 tok 3 classes 2 2 2 2 2 2  rel 1.755e-02
+ok   L13 tok 0 classes 3 3 3 3 3 3  rel 1.626e-02
+ok   L13 tok 1 classes 3 3 3 3 3 3  rel 1.714e-02
+ok   L13 tok 2 classes 3 3 3 3 3 3  rel 1.807e-02
+ok   L13 tok 3 classes 3 3 3 3 3 3  rel 1.746e-02
+ok   L15 tok 0 classes 4 4 4 4 4 4  rel 1.325e-02
+ok   L15 tok 1 classes 4 4 4 4 4 4  rel 1.255e-02
+ok   L15 tok 2 classes 4 4 4 4 4 4  rel 1.243e-02
+ok   L15 tok 3 classes 4 4 4 4 4 4  rel 1.292e-02
+ok   L23 tok 0 classes 5 5 5 5 5 5  rel 1.216e-02
+ok   L23 tok 1 classes 5 5 5 5 5 5  rel 1.346e-02
+ok   L23 tok 2 classes 5 5 5 5 5 5  rel 1.281e-02
+ok   L23 tok 3 classes 5 5 5 5 5 5  rel 1.294e-02
+ok   L24 tok 0 classes 6 6 6 6 6 6  rel 1.119e-02
+ok   L24 tok 1 classes 6 6 6 6 6 6  rel 1.129e-02
+ok   L24 tok 2 classes 6 6 6 6 6 6  rel 1.142e-02
+ok   L24 tok 3 classes 6 6 6 6 6 6  rel 1.080e-02
+ok   L34 tok 0 classes 7 7 7 7 7 7  rel 1.680e-02
+ok   L34 tok 1 classes 7 7 7 7 7 7  rel 1.536e-02
+ok   L34 tok 2 classes 7 7 7 7 7 7  rel 1.681e-02
+ok   L34 tok 3 classes 7 7 7 7 7 7  rel 1.668e-02
+stats: 0 hit, 192 cpu, 0 pcie, 192 file; worst rel 1.918e-02 -> PASS
+
+## GSQ-RCO IQ2_XS (2026-10-24)
+GSQ-RCO IQ2_XS expert test PASSED 2026-10-24 12:03:18 (layers 0,8,9,11,17,23,24,25,30,31; parity + CPU + HIP decode/chunk/MMQ on HIP 1 and 2; HIP 2 rerun alone)
+stats: 0 hit, 480 cpu, 0 pcie, 480 file; worst rel 1.948e-02 -> PASS
+stats: 32 hit, 6 cpu, 2002 pcie, 1454 file; worst rel 1.456e-02 -> PASS
+stats: 32 hit, 29 cpu, 2339 pcie, 1766 file; worst rel 1.728e-02 -> PASS
+stats: 32 hit, 6 cpu, 2002 pcie, 1454 file; worst rel 1.456e-02 -> PASS
+stats: 32 hit, 29 cpu, 2339 pcie, 1766 file; worst rel 1.728e-02 -> PASS
+
+## Maya-S (2026-10-23)
+native_grouped_parity passed 2026-10-23 09:38 on HIP 1 (R9700 gfx1201) and HIP 2 (XTX gfx1100), production running beside it; logs local/maya-s/parity-dev1.log, parity-dev2.log
+local/maya-s/parity-dev2.log:native_grouped_parity: 0 failures
+local/maya-s/parity-dev1.log:native_grouped_parity: 0 failures
