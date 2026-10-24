@@ -1740,7 +1740,7 @@ void Ds41Dense::Impl::reset_graphs() {
         ++al->epoch;
     }
     if (im.gctx) ggml_free(im.gctx);
-    const size_t gmul = std::max<size_t>(1, slots.size());   // batch slots: every slot's decode graphs live here
+    const size_t gmul = 1 + std::max<size_t>(1, slots.size());   // batch slots: every slot's decode graphs live here, plus one unit of pass-width graphs
     ggml_init_params gp = { ggml_tensor_overhead() * 200000 * gmul + ggml_graph_overhead_custom(8192, false) * 400 * gmul, nullptr, true };
     im.gctx = ggml_init(gp);
 }
@@ -2035,7 +2035,7 @@ bool Ds41Dense::init(const std::string & path, const Ds41DenseConfig & cfg, std:
         for (size_t i = 0; i < v.size(); ++i) v[i] = (float) i;
         ggml_backend_tensor_set(im.blk_ramp, v.data(), 0, v.size() * 4);
     }
-    const size_t gmul = std::max<size_t>(1, slots.size());   // batch slots: every slot's decode graphs live here
+    const size_t gmul = 1 + std::max<size_t>(1, im.slots.size());   // batch slots: every slot's decode graphs live here, plus one unit of pass-width graphs
     ggml_init_params gp = { ggml_tensor_overhead() * 200000 * gmul + ggml_graph_overhead_custom(8192, false) * 400 * gmul, nullptr, true };
     im.gctx = ggml_init(gp);
     im.allo_dec.a = ggml_gallocr_new(ggml_backend_get_default_buffer_type(im.backend));
