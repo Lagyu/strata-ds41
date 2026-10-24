@@ -168,6 +168,7 @@ struct Args {
     int n_predict = 64;
     std::string backend = "cuda", experts = "gpu";
     int64_t slots = 0;            // 0 = auto (free VRAM after the dense half, minus --vram-margin)
+    int dslots = 0;               // --serve: --batch-slots N (conversation slots on the device; 0 = STRATA_SERVE_DSLOTS or 1)
     // defaults = the measured best decode config on the 4090 (2026-10-11): --pcie 0.75 --pf-b 1.43 --vram-lru
     double vram_margin_gib = 1.0, pcie = 0.75, arena_gib = 60.0, pf_b = 1.43;
     double tier_batch_pcie = -1.0;   // < 0 = STRATA_TIER_BATCH_PCIE / 1.0
@@ -285,6 +286,7 @@ bool parse(int argc, char ** argv, Args & a) {
         else if (k == "--engram") { std::stringstream ss(next()); std::string d; while (std::getline(ss, d, ':')) a.engram.push_back(d); }
 #endif
         else if (k == "--slots") { const std::string v = next(); a.slots = v == "auto" ? 0 : std::atoll(v.c_str()); }
+        else if (k == "--batch-slots" || k == "--batch") a.dslots = std::atoi(next().c_str());
         else if (k == "--vram-margin") a.vram_margin_gib = std::atof(next().c_str());
         else if (k == "--arena-gib") a.arena_gib = std::atof(next().c_str());
         else if (k == "--rank") a.rank = next();
@@ -549,6 +551,16 @@ int main(int argc, char ** argv) {
     // grows them (the VRAM cache is released for it anyway) and gives them back.  s11: 2.6 GiB of slots = 10-20% of a
     // verify pass (one-shot, margin 1.0 / 2.3 / 3.6: python 131 / 136 / 145 ms, code 89 / 93 / 107 ms).
     dc.elastic_cols = a.serve && PB > 1 && !(std::getenv("STRATA_ELASTIC_COLS") && std::getenv("STRATA_ELASTIC_COLS")[0] == '0');
+    // --serve's conversation slots (--batch-slots N / --batch N, else STRATA_SERVE_DSLOTS; default 1 = the engine as before,
+    // byte for byte): N conversation states on the device (Ds41DenseConfig::n_slots, Xolotl's batch slots - docs/BATCHING.md).
+    // The requests running at once then keep their state resident instead of parking it in host memory at every turn of
+    // the slice, and decode TOGETHER in batch windows (one row of each per pass).  Each slot costs its full-context state
+    // (0.91 GiB at 1M with --kv-fp4), taken from the VRAM expert cache.
+    if (a.serve) {
+        int ds = a.dslots;
+        if (ds <= 0 && std::getenv("STRATA_SERVE_DSLOTS")) ds = std::atoi(std::getenv("STRATA_SERVE_DSLOTS"));
+        dc.n_slots = std::max(1, std::min(16, ds));
+    }
     // encoder-only prompt prefill (enc-skip): tokens before the last `enc_replay` need their layers past layer 20 only
     // through the per-layer 128-token window, so for a long prompt they can stop after the KV-writing part of layer
     // 20 (the layer-major batch path only; the chunk path has no per-layer column split, --ppl/--dump-logits need
@@ -927,7 +939,7 @@ int main(int argc, char ** argv) {
     // --dense-bench (and STRATA_TIER_SKIP=1, measurement only): the expert tier is not run - the routed sums stay
     // whatever the routed tensor holds (the bench zeroes it once), and no prefetch is issued.  Garbage text.
     bool tier_skip = std::getenv("STRATA_TIER_SKIP") && std::getenv("STRATA_TIER_SKIP")[0] == '1';
-    auto pass_v = [&](const int * toks, int m, int pos) -> bool {
+    auto pass_v = [&](const int * toks, int m, int pos, const Ds41Dense::Row * rows = nullptr) -> bool {
         // D3 (the batched per-class verify tier) is the default: correct (bias-off verify-vs-prefill gate, near-ties
         // only) and faster (verify 167.6 -> ~100 ms/pass).  STRATA_TIER_BATCH=0 = the per-token run_to_dev path.
         static const bool no_tier_batch = [] { const char* v = std::getenv("STRATA_TIER_BATCH"); return v && v[0] == '0'; }();
@@ -939,7 +951,8 @@ int main(int argc, char ** argv) {
         mids.resize((size_t) m * top_k);
         mw.resize((size_t) m * top_k);
         vh.assign((size_t) m * 3 * n_embd, 0.0f);
-        if (!dense.begin(toks, m, pos)) { ferr = dense.last_error(); return false; }
+        // a batch window (rows): rows of several conversation slots in one pass (Ds41Dense::begin_rows), else this conversation's
+        if (rows ? !dense.begin_rows(rows, m) : !dense.begin(toks, m, pos)) { ferr = dense.last_error(); return false; }
         lapd(0);
         if (d3_fpred) {
             for (int k = 0; k < 2; ++k) {
@@ -1790,11 +1803,70 @@ int main(int argc, char ** argv) {
             std::vector<float> lg;
             int pos = 0, ptok = -1;
             int slice = 0;                     // passes run in the current turn
+            // conversation slots (dslots > 1): the device slot holding this request's conversation while it is not live (-1: a
+            // host park, r.park), the prompt-end rings flag that went with it, whether its drafter window fell behind, the
+            // batch windows it decoded in, when it last ran (the eviction order), its admission number (dumps)
+            int dslot = -1;
+            bool snap_dev = false, dsp_stale = false;
+            long w_pass = 0, stamp = 0;
+            int id = 0;
         };
         std::vector<Req> reqs((size_t) n_slots + 1);   // the last one is the solo request
         for (size_t i = 0; i < reqs.size(); ++i) reqs[i].slot = i + 1 < reqs.size() ? (int) i : -1;
         Req * live_req = nullptr;              // the ACTIVE request whose conversation is on the device (null: a finished one, or none)
         auto any_active = [&]() -> bool { for (const auto & r : reqs) if (r.active) return true; return false; };
+        // ---- conversation slots on the device (Ds41Dense::n_slots; 1 = the engine as before).  The globals above (hist,
+        // snap_*, live_end) always describe the BOUND slot's conversation; a running request that is not live keeps its own in
+        // Req (host side) + its slot (device side, r.dslot >= 0) or a host park (r.dslot < 0).  A finished conversation is
+        // only known on the slot it ended on: leaving that slot parks it in host memory (park_conv), as an unrelated
+        // request would.
+        const int dslots = dense.n_slots();
+        long run_clock = 0;                                  // Req::stamp: the order requests last ran (eviction)
+        long win_n = 0, win_rows = 0; double win_ms = 0;     // batch windows run, their rows, their wall time
+        auto slot_owner = [&](int d) -> Req * {   // the running request whose conversation slot d holds (live or resident)
+            for (auto & q : reqs) if (q.active && (q.live ? dense.slot() == d : q.dslot == d)) return &q;
+            return nullptr;
+        };
+        auto free_slot = [&]() -> int {           // a slot no running request holds: the bound one first; -1 = all taken
+            if (!slot_owner(dense.slot())) return dense.slot();
+            for (int d = 0; d < dslots; ++d) if (!slot_owner(d)) return d;
+            return -1;
+        };
+        // bind slot d for the single-sequence path (no live request): the finished conversation on the bound slot goes to a
+        // host park first, the device conversation is then unknown (d's last one was parked the same way when it was left)
+        auto switch_slot = [&](int d) -> bool {
+            if (d == dense.slot()) return true;
+            if (!live_req && snap_len > 0 && !hist.empty()) park_conv(live_end);
+            hist.clear();
+            snap_len = -1;
+            live_end = 0;
+            snap_rings_dev = false;
+#if defined(DS41_HAVE_DSPARK)
+            dsp_next = -1;
+#endif
+            if (!dense.bind_slot(d)) { ferr = dense.last_error(); return false; }
+            return true;
+        };
+        // a resident request's conversation to a host park (its slot is needed): bind its slot, copy it out as park_req does
+        auto evict_req = [&](Req & r) -> bool {
+            if (r.live || r.dslot < 0 || !switch_slot(r.dslot)) return false;
+            const int top = (int) r.hist.size() + 32;
+            dense.snapshot(std::min(top, ctxv - 1));
+            r.park = dense.park_out((int64_t) top + 64);
+            r.dslot = -1;
+            r.snap_dev = false;
+            return r.park != nullptr;
+        };
+        // STRATA_SERVE_ROWDUMP=<dir> (exactness checks): every decode row's logits as {id, pos, fed token, n_vocab} + floats
+        static FILE * rowdump_f = std::getenv("STRATA_SERVE_ROWDUMP")
+            ? std::fopen((std::string(std::getenv("STRATA_SERVE_ROWDUMP")) + "/rows.bin").c_str(), "wb") : nullptr;
+        auto rowdump = [&](int id, int pos, int tok, const float * lg) {
+            if (!rowdump_f) return;
+            const int32_t h[4] = { id, pos, tok, nv };
+            std::fwrite(h, 4, 4, rowdump_f);
+            std::fwrite(lg, 4, (size_t) nv, rowdump_f);
+            std::fflush(rowdump_f);
+        };
         prefix_files_load();
         std::printf("INFO ctx=%d experts_vram=%lld arena_experts=%lld\n", ctxv, (long long) tier.resident(),
                     (long long) tier.arena_experts());
@@ -1803,6 +1875,9 @@ int main(int argc, char ** argv) {
         std::fflush(stdout);
         std::fprintf(stderr, "serve: ready (ctx %d, prefill chunk %d, %d request slots, slice %d passes, prefix parks >= %d tokens)\n",
                      ctxv, NP, n_slots, slice_passes, prefix_min);
+        if (dslots > 1)
+            std::fprintf(stderr, "serve: %d conversation slots on the device (%.0f MiB each): the requests running at once stay resident "
+                                 "and decode in batch windows\n", dslots, (double) dense.slot_bytes() / 1048576.0);
         // per-request decode biases (GEN keys route_bias= / route_bias_file=, from the server's "strata_tune"): a request
         // that names neither gets the --route-bias / --route-bias-file the engine started with, so one server can answer
         // exact-routing requests (both 0) beside the fast default without a restart.  apply_bias() writes zeros over a
@@ -1816,10 +1891,16 @@ int main(int argc, char ** argv) {
         bool previous_vision = false;
         // ---- the live request off the device (into r), and back
         auto park_req = [&](Req & r) {
-            const int top = (int) hist.size() + 32;   // a verify pass may have written rows past the accepted ones
-            dense.snapshot(std::min(top, ctxv - 1));
-            snap_rings_dev = false;
-            r.park = dense.park_out((int64_t) top + 64);
+            if (dslots > 1) {   // conversation slots: the state stays on the device, in this slot - only the host side moves
+                r.dslot = dense.slot();
+                r.snap_dev = snap_rings_dev;
+                snap_rings_dev = false;
+            } else {
+                const int top = (int) hist.size() + 32;   // a verify pass may have written rows past the accepted ones
+                dense.snapshot(std::min(top, ctxv - 1));
+                snap_rings_dev = false;
+                r.park = dense.park_out((int64_t) top + 64);
+            }
 #if defined(DS41_HAVE_DSPARK)
             r.dsp_saved = dsp && dsp->window_out(r.dsp_win, r.dsp_filled);
             r.dsp_next = dsp_next;
@@ -1844,11 +1925,29 @@ int main(int argc, char ** argv) {
         auto make_live = [&](Req & r) -> bool {
             if (r.live) return true;
             if (live_req) park_req(*live_req);
-            else if (snap_len > 0 && !hist.empty()) park_conv(live_end);   // a finished conversation: kept for its next turn
-            hist.clear();
-            snap_len = -1;
-            if (!r.park || !dense.park_in(r.park) || !dense.restore()) { ferr = "the parked request could not be put back"; return false; }
-            r.park.reset();
+            const bool resident = dslots > 1 && r.dslot >= 0;
+            if (resident) {   // its conversation is in its slot: bind it, nothing to copy
+                if (!switch_slot(r.dslot)) return false;
+                if (!hist.empty()) { if (snap_len > 0) park_conv(live_end); hist.clear(); snap_len = -1; live_end = 0; }
+            } else {
+                if (dslots > 1) {   // from a host park into a free slot (the least recently run resident request's when all are taken)
+                    int d = free_slot();
+                    if (d < 0) {
+                        Req * victim = nullptr;
+                        for (auto & q : reqs)
+                            if (q.active && !q.live && q.dslot >= 0 && &q != &r && (!victim || q.stamp < victim->stamp)) victim = &q;
+                        if (!victim || !evict_req(*victim)) { ferr = "no conversation slot for the parked request"; return false; }
+                        d = dense.slot();
+                    }
+                    if (!switch_slot(d)) return false;
+                }
+                if (snap_len > 0 && !hist.empty()) park_conv(live_end);   // a finished conversation: kept for its next turn
+                hist.clear();
+                snap_len = -1;
+                if (!r.park || !dense.park_in(r.park) || !dense.restore()) { ferr = "the parked request could not be put back"; return false; }
+                r.park.reset();
+            }
+            r.stamp = ++run_clock;
 #if defined(DS41_HAVE_DSPARK)
             if (dsp && r.dsp_saved) dsp->window_in(r.dsp_win, r.dsp_filled);
             dsp_next = r.dsp_next;
@@ -1860,9 +1959,16 @@ int main(int argc, char ** argv) {
             snap_seed = std::move(r.snap_seed);
             snap_seed_n = r.snap_seed_n;
             snap_rings = std::move(r.snap_rings);
-            snap_rings_dev = false;
+            snap_rings_dev = resident && r.snap_dev;   // a resident slot's device snapshot rings are as it left them
             rng = r.rng;
             g_pen = r.pen;
+#if defined(DS41_HAVE_DSPARK)
+            if (dsp && r.dsp_stale) {   // its drafter window fell behind in the batch windows: start the window over, no drafts
+                dsp->reset();           // until the next pass refills it (the first drafts would be guesses from an old window)
+                for (float & c : r.sp_conf) c = -1.0e9f;
+                r.dsp_stale = false;
+            }
+#endif
             if (!hist.empty()) dense.prime_history(hist.data(), std::max<int64_t>(0, (int64_t) hist.size() - 16), (int64_t) hist.size());
             if (r.route_bias != a.route_bias || r.route_bias_file != a.route_bias_file) {
                 a.route_bias = r.route_bias;
@@ -1905,7 +2011,7 @@ int main(int argc, char ** argv) {
                 // own refeed does
                 live_end = (r.spec && r.dirty && (hist.size() & 1)) ? (int) hist.size() - 1 : (int) hist.size();
 #if defined(DS41_HAVE_DSPARK)
-                if (r.spec) dsp_next = live_end;   // the ring holds every position <= P (the last emitted token is not fed)
+                if (r.spec && !r.dsp_stale) dsp_next = live_end;   // the ring holds every position <= P (the last emitted token is not fed)
 #endif
             }
             std::fprintf(stderr, "serve: %d tokens in %.2f s = %.2f tok/s (%s%s); experts: %lld hit, %lld cpu, %lld pcie, %lld file%s\n",
@@ -1916,6 +2022,9 @@ int main(int argc, char ** argv) {
             if (const Ds41Dense::RouteMeter rm = dense.route_meter(false); rm.on && rm.slots > 0)
                 std::fprintf(stderr, "serve: routing vs exact: %.2f%% of expert picks swapped, %.2f%% of router weight kept (%lld slots)\n",
                              100.0 * (double) rm.swaps / (double) rm.slots, 100.0 * rm.weight_kept, rm.slots);
+            if (r.w_pass > 0)
+                std::fprintf(stderr, "serve: batch windows: %ld of this request's passes; %ld windows so far, %.2f rows each, %.0f ms a window\n",
+                             r.w_pass, win_n, win_n ? (double) win_rows / (double) win_n : 0.0, win_n ? win_ms / (double) win_n : 0.0);
             if (vram_trace) {   // who holds the card while decoding (the expert slots are the rest)
                 size_t tf = 0, tt = 0;
                 ggml_backend_dev_memory(ggml_backend_get_device(be), &tf, &tt);
@@ -2030,6 +2139,7 @@ int main(int argc, char ** argv) {
                 if (!spec_accept(dist, dr[acc], rng, tn)) break;
             }
             if (acc == k) tn = sample_p(vlog.data() + (size_t) (r0 + k) * nv, nv, r.temp, r.tk, r.top_p, r.min_p, rng);
+            for (int i = 0; i <= acc && rowdump_f; ++i) rowdump(r.id, r.P + 1 + i, vt[(size_t) (r0 + i)], vlog.data() + (size_t) (r0 + i) * nv);
             ++r.rq_pass; r.rq_acc += acc;
             if (is_lk) {
                 ++r.lk_pass; r.lk_dr += k; r.lk_acc += acc;
@@ -2060,11 +2170,94 @@ int main(int argc, char ** argv) {
             if (r.stop_req) { r.finish = "cancel"; return false; }
             if (r.pos + 1 >= ctxv) return false;
             if (!step(r.ptok, r.pos) || !dense.logits(0, 1, r.lg.data())) { r.finish = "error"; return false; }
+            rowdump(r.id, r.pos, r.ptok, r.lg.data());
             hist.push_back(r.ptok); pen_record(r.ptok);
             ++r.pos;
             tier.rebalance_tick();
             r.ptok = sample_p(r.lg.data(), nv, r.temp, r.tk, r.top_p, r.min_p, rng);
             return emit_tok(r, r.ptok);
+        };
+        // ---- one batch window (dslots > 1; docs/BATCHING.md): a row of every resident running request through every layer in
+        // ONE pass (Ds41Dense::begin_rows: the dense weights, the shared expert and every routed expert two rows share are read
+        // once for all of them), each row sampled with its request's own sampler.  No drafts in a window - here a pass is bound
+        // by the expert bytes it streams, and a draft row would cost its experts for ~0.4 tokens - but a DSpark request's
+        // drafter window is kept fed (STRATA_SERVE_WIN_DSPARK=0: not), so it drafts again the moment it runs alone.  A request
+        // that ends in a window is made live first (end_req reads the live state).
+        std::vector<Ds41Dense::Row> w_rows;
+        std::vector<Req *> w_req;
+        std::vector<int> w_want;
+        auto run_window = [&]() {
+            if (live_req) park_req(*live_req);
+            w_rows.clear(); w_req.clear(); w_want.clear();
+            auto finish = [&](Req & q, const char * how) {
+                if (how) q.finish = how;
+                if (!make_live(q)) q.finish = "error";
+                end_req(q, false);
+            };
+            for (auto & q : reqs) {
+                if (!q.active || q.live || q.dslot < 0) continue;
+                if (q.stop_req) { finish(q, "cancel"); continue; }
+                if (q.spec ? ctxv - (q.P + 3) < 0 : q.pos + 1 >= ctxv) { finish(q, nullptr); continue; }
+                if ((int) w_rows.size() + 2 > Ds41Dense::kMaxRows) break;   // a window holds kMaxRows rows
+                if (q.spec) {
+                    if (q.dirty && ((q.P + 1) & 1)) w_rows.push_back(Ds41Dense::Row { q.dslot, q.P, q.prev });   // the refeed (run_pass)
+                    w_rows.push_back(Ds41Dense::Row { q.dslot, q.P + 1, q.t });
+                } else {
+                    w_rows.push_back(Ds41Dense::Row { q.dslot, q.pos, q.ptok });
+                }
+                w_want.push_back((int) w_rows.size() - 1);
+                w_req.push_back(&q);
+            }
+            if (w_req.empty()) return;
+            const double t0 = now_ms();
+            if (!pass_v(nullptr, (int) w_rows.size(), 0, w_rows.data())) {
+                std::fprintf(stderr, "serve: batch window failed: %s\n", ferr.c_str());
+                for (Req * q : w_req) finish(*q, "error");
+                return;
+            }
+            win_ms += now_ms() - t0;
+            ++win_n;
+            win_rows += (long) w_rows.size();
+            for (size_t i = 0; i < w_req.size(); ++i) {
+                Req & q = *w_req[i];
+                const int row = w_want[i];
+                const float * lg = vlog.data() + (size_t) row * nv;
+                q.stamp = ++run_clock;
+                std::swap(g_pen, q.pen);   // the request's own penalty window (pen_record / sample_p)
+                bool more;
+                if (q.spec) {
+                    rowdump(q.id, q.P + 1, q.t, lg);
+                    const int tn = sample_p(lg, nv, q.temp, q.tk, q.top_p, q.min_p, q.rng);
+#if defined(DS41_HAVE_DSPARK)
+                    static const bool win_dspark = !(std::getenv("STRATA_SERVE_WIN_DSPARK") && std::getenv("STRATA_SERVE_WIN_DSPARK")[0] == '0');
+                    if (dsp && win_dspark && !q.dsp_stale) {   // this position into its drafter window, drafts after tn
+                        const int spos1 = q.P + 1;
+                        bool ok = true;
+                        if (q.dsp_saved) ok = dsp->window_in(q.dsp_win, q.dsp_filled); else dsp->reset();
+                        ok = ok && dsp->step(vh.data() + (size_t) row * 3 * n_embd, &spos1, 1, tn, q.sp_ids, q.sp_conf);
+                        ok = ok && dsp->window_out(q.dsp_win, q.dsp_filled);
+                        q.dsp_saved = ok;
+                        if (!ok) q.dsp_stale = true;
+                    } else {
+                        q.dsp_stale = true;
+                    }
+#endif
+                    q.hist.push_back(q.t); pen_record(q.t);
+                    q.prev = q.t; q.dirty = false; q.P += 1; q.t = tn;
+                    ++q.rq_pass;
+                    more = emit_tok(q, tn);
+                } else {
+                    rowdump(q.id, q.pos, q.ptok, lg);
+                    q.hist.push_back(q.ptok); pen_record(q.ptok);
+                    ++q.pos;
+                    q.ptok = sample_p(lg, nv, q.temp, q.tk, q.top_p, q.min_p, q.rng);
+                    more = emit_tok(q, q.ptok);
+                }
+                std::swap(g_pen, q.pen);
+                ++q.w_pass;
+                if (!more) finish(q, nullptr);
+            }
+            tier.rebalance_tick();
         };
         // ---- a request: GEN <max_new> [k=v ..] <ids csv> (solo) or BGEN <slot> <max_new> [k=v ..] <ids csv> (a batch slot);
         // GENI / BGENI carry an image-embedding file before the csv (GENI <max_new> [k=v ..] <embeddings file> <ids csv>: the
@@ -2127,6 +2320,16 @@ int main(int argc, char ** argv) {
             r.route_bias = req_rb; r.route_bias_file = req_rbf; r.rprot = req_rprot; r.rpool = req_rpool;
             // the device: an active request's conversation goes to its Req first; a finished one stays for the reuse rules
             if (live_req) park_req(*live_req);
+            if (dslots > 1) {   // the prompt is read into a slot no running request holds (theirs stay resident)
+                int d = free_slot();
+                if (d < 0) {    // every slot holds a running request: the least recently run one goes to a host park
+                    Req * victim = nullptr;
+                    for (auto & q : reqs) if (q.active && !q.live && q.dslot >= 0 && (!victim || q.stamp < victim->stamp)) victim = &q;
+                    if (!victim || !evict_req(*victim)) { std::printf("ERR no conversation slot free\n"); std::fflush(stdout); return; }
+                    d = dense.slot();
+                }
+                if (!switch_slot(d)) { std::printf("ERR %s\n", ferr.c_str()); std::fflush(stdout); return; }
+            }
             g_pen = pen;
             if (seeded) rng.seed(seed);
             ensure_snap_rings();
@@ -2748,6 +2951,7 @@ int main(int argc, char ** argv) {
                 std::ofstream f(std::string(dd) + nb, std::ios::binary);
                 f.write((const char *) last_logits.data(), (std::streamsize) (last_logits.size() * 4));
             }
+            r.id = n_req;
             ++n_req;
             const double prompt_ms = now_ms() - tp0;
             if (exact_pass && cache_open) {   // decode: the biases back on, from the VRAM set as it is now
@@ -2835,6 +3039,13 @@ int main(int argc, char ** argv) {
                 continue;
             }
             if (at_eof() && !any_active()) break;
+            if (dslots > 1) {
+                // batch windows: 2+ running requests and every one of them resident -> one pass with a row of each; with a
+                // host-parked one among them the turns below, as with one slot
+                int n_res = 0, n_host = 0;
+                for (const auto & q : reqs) if (q.active) { if (q.live || q.dslot >= 0) ++n_res; else ++n_host; }
+                if (n_res >= 2 && n_host == 0) { run_window(); continue; }
+            }
             // the next active request: the current one until its slice is used up, then round robin
             Req * cur = (rr < reqs.size() && reqs[rr].active && reqs[rr].slice < slice_passes) ? &reqs[rr] : nullptr;
             if (!cur) {
