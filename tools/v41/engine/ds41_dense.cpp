@@ -633,7 +633,7 @@ static Ds41Dense::Impl::GSlot & pass_graph_slot(Ds41Dense::Impl & im, const Ds41
     auto it = im.gcache.find(key);
     if (it != im.gcache.end()) return it->second;
     for (auto e = im.gcache.begin(); e != im.gcache.end();) {
-        if (e->first.il == key.il && e->first.kind == key.kind && e->first.n == key.n && e->first.cap != key.cap) {
+        if (e->first.il == key.il && e->first.kind == key.kind && e->first.n == key.n && e->first.slot == key.slot && e->first.cap != key.cap) {
             im.allo_dec.forget(e->second.gf);
             ggml_free(e->second.ctx);
             e = im.gcache.erase(e);
@@ -1721,6 +1721,9 @@ bool Ds41Dense::set_columns(int nc) {
 
 void Ds41Dense::Impl::reset_graphs() {
     Impl & im = *this;
+    if (!im.graphs.empty() || !im.gcache.empty())   // (a stall of a few seconds while the next passes rebuild them)
+        std::fprintf(stderr, "dense: graph cache reset (%zu decode graphs, %zu pass graphs; context %zu of %zu MiB used)\n", im.graphs.size(),
+                     im.gcache.size(), im.gctx ? ggml_used_mem(im.gctx) >> 20 : 0, im.gctx ? ggml_get_mem_size(im.gctx) >> 20 : 0);
     im.graphs.clear();
     im.drop_gcache();
     im.logits_out.clear();
@@ -1737,7 +1740,8 @@ void Ds41Dense::Impl::reset_graphs() {
         ++al->epoch;
     }
     if (im.gctx) ggml_free(im.gctx);
-    ggml_init_params gp = { ggml_tensor_overhead() * 200000 + ggml_graph_overhead_custom(8192, false) * 400, nullptr, true };
+    const size_t gmul = std::max<size_t>(1, slots.size());   // batch slots: every slot's decode graphs live here
+    ggml_init_params gp = { ggml_tensor_overhead() * 200000 * gmul + ggml_graph_overhead_custom(8192, false) * 400 * gmul, nullptr, true };
     im.gctx = ggml_init(gp);
 }
 
@@ -2031,7 +2035,8 @@ bool Ds41Dense::init(const std::string & path, const Ds41DenseConfig & cfg, std:
         for (size_t i = 0; i < v.size(); ++i) v[i] = (float) i;
         ggml_backend_tensor_set(im.blk_ramp, v.data(), 0, v.size() * 4);
     }
-    ggml_init_params gp = { ggml_tensor_overhead() * 200000 + ggml_graph_overhead_custom(8192, false) * 400, nullptr, true };
+    const size_t gmul = std::max<size_t>(1, slots.size());   // batch slots: every slot's decode graphs live here
+    ggml_init_params gp = { ggml_tensor_overhead() * 200000 * gmul + ggml_graph_overhead_custom(8192, false) * 400 * gmul, nullptr, true };
     im.gctx = ggml_init(gp);
     im.allo_dec.a = ggml_gallocr_new(ggml_backend_get_default_buffer_type(im.backend));
     im.allo_pass.a = ggml_gallocr_new(ggml_backend_get_default_buffer_type(im.backend));
@@ -2740,7 +2745,7 @@ bool Ds41Dense::attn_router(int il, int * ids, float * wts, const float ** fn_ho
         gf = it->second;
     } else if (pass_graph_cache_on()) {
         const double tb0 = g_dprof_on ? dprof_now() : 0;
-        Impl::GSlot & s = pass_graph_slot(im, Impl::GKey { il, 1, cap, n });
+        Impl::GSlot & s = pass_graph_slot(im, Impl::GKey { il, 1, cap, n, im.cur_slot });   // per slot: the graph holds its tensors
         if (!s.gf) s.gf = build_attn(im, s.ctx, il, n);
         gf = s.gf;
         if (g_dprof_on) g_dprof[0] += dprof_now() - tb0;

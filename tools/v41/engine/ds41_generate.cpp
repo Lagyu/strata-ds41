@@ -1822,7 +1822,8 @@ int main(int argc, char ** argv) {
         // request would.
         const int dslots = dense.n_slots();
         long run_clock = 0;                                  // Req::stamp: the order requests last ran (eviction)
-        long win_n = 0, win_rows = 0; double win_ms = 0;     // batch windows run, their rows, their wall time
+        long win_n = 0, win_rows = 0; double win_ms = 0;     // batch windows run, their rows, their pass wall time
+        double win_post_ms = 0, win_dsp_ms = 0, win_slow_max = 0; long win_slow = 0;   // after the pass (sampling, the drafter), slow windows
         auto slot_owner = [&](int d) -> Req * {   // the running request whose conversation slot d holds (live or resident)
             for (auto & q : reqs) if (q.active && (q.live ? dense.slot() == d : q.dslot == d)) return &q;
             return nullptr;
@@ -1865,7 +1866,6 @@ int main(int argc, char ** argv) {
             const int32_t h[4] = { id, pos, tok, nv };
             std::fwrite(h, 4, 4, rowdump_f);
             std::fwrite(lg, 4, (size_t) nv, rowdump_f);
-            std::fflush(rowdump_f);
         };
         prefix_files_load();
         std::printf("INFO ctx=%d experts_vram=%lld arena_experts=%lld\n", ctxv, (long long) tier.resident(),
@@ -2023,8 +2023,11 @@ int main(int argc, char ** argv) {
                 std::fprintf(stderr, "serve: routing vs exact: %.2f%% of expert picks swapped, %.2f%% of router weight kept (%lld slots)\n",
                              100.0 * (double) rm.swaps / (double) rm.slots, 100.0 * rm.weight_kept, rm.slots);
             if (r.w_pass > 0)
-                std::fprintf(stderr, "serve: batch windows: %ld of this request's passes; %ld windows so far, %.2f rows each, %.0f ms a window\n",
-                             r.w_pass, win_n, win_n ? (double) win_rows / (double) win_n : 0.0, win_n ? win_ms / (double) win_n : 0.0);
+                std::fprintf(stderr, "serve: batch windows: %ld of this request's passes; %ld windows so far, %.2f rows each, %.0f ms a window + %.0f ms after it "
+                             "(drafter %.0f); %ld slow windows (max %.0f ms)\n", r.w_pass, win_n, win_n ? (double) win_rows / (double) win_n : 0.0,
+                             win_n ? win_ms / (double) win_n : 0.0, win_n ? win_post_ms / (double) win_n : 0.0, win_n ? win_dsp_ms / (double) win_n : 0.0,
+                             win_slow, win_slow_max);
+            if (rowdump_f) std::fflush(rowdump_f);
             if (vram_trace) {   // who holds the card while decoding (the expert slots are the rest)
                 size_t tf = 0, tt = 0;
                 ggml_backend_dev_memory(ggml_backend_get_device(be), &tf, &tt);
@@ -2215,7 +2218,8 @@ int main(int argc, char ** argv) {
                 for (Req * q : w_req) finish(*q, "error");
                 return;
             }
-            win_ms += now_ms() - t0;
+            const double t1 = now_ms();
+            win_ms += t1 - t0;
             ++win_n;
             win_rows += (long) w_rows.size();
             for (size_t i = 0; i < w_req.size(); ++i) {
@@ -2231,6 +2235,7 @@ int main(int argc, char ** argv) {
 #if defined(DS41_HAVE_DSPARK)
                     static const bool win_dspark = !(std::getenv("STRATA_SERVE_WIN_DSPARK") && std::getenv("STRATA_SERVE_WIN_DSPARK")[0] == '0');
                     if (dsp && win_dspark && !q.dsp_stale) {   // this position into its drafter window, drafts after tn
+                        const double td0 = now_ms();
                         const int spos1 = q.P + 1;
                         bool ok = true;
                         if (q.dsp_saved) ok = dsp->window_in(q.dsp_win, q.dsp_filled); else dsp->reset();
@@ -2238,6 +2243,7 @@ int main(int argc, char ** argv) {
                         ok = ok && dsp->window_out(q.dsp_win, q.dsp_filled);
                         q.dsp_saved = ok;
                         if (!ok) q.dsp_stale = true;
+                        win_dsp_ms += now_ms() - td0;
                     } else {
                         q.dsp_stale = true;
                     }
@@ -2258,6 +2264,13 @@ int main(int argc, char ** argv) {
                 if (!more) finish(q, nullptr);
             }
             tier.rebalance_tick();
+            const double tw = now_ms() - t0;
+            win_post_ms += tw - (t1 - t0);
+            if (tw > 1000.0) {   // a stall: graph rebuilds (a layout change, a full graph context), a cache rebalance, the drafter
+                ++win_slow;
+                win_slow_max = std::max(win_slow_max, tw);
+                std::fprintf(stderr, "serve: slow batch window: %.0f ms (pass %.0f, after it %.0f; %d rows)\n", tw, t1 - t0, tw - (t1 - t0), (int) w_rows.size());
+            }
         };
         // ---- a request: GEN <max_new> [k=v ..] <ids csv> (solo) or BGEN <slot> <max_new> [k=v ..] <ids csv> (a batch slot);
         // GENI / BGENI carry an image-embedding file before the csv (GENI <max_new> [k=v ..] <embeddings file> <ids csv>: the
