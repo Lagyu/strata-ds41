@@ -33,5 +33,7 @@ template<> struct Fmt<143> { static constexpr int qk = 128, ipb = 4, step = 1;
 #define STRATA_GU_FMTS_FORK(X) X(10) X(11) X(39) X(143)
 // 2026-10-23: IQ3_S (21) as a DOWN format too - peasantsmith's Maya-S DeepSeek-V4.1 quant has IQ3_S down on layers 0-3
 // and 36-39 (IQ2_S gate/up); Fmt<21> / Split<21> are upstream's (gate/up had it), only the list lacked it.
-#define STRATA_D_FMTS_FORK(X) X(10) X(11) X(12) X(18) X(21) X(22) X(39) X(143)
+// 2026-10-24: IQ2_XXS (16) and IQ2_XS (17) as DOWN formats - ISTA-DASLab's GSQ-RCO DeepSeek-V4.1 builds pick the down
+// type per layer from IQ2_XXS / IQ2_XS / IQ2_S / IQ3_XXS; Fmt<16> / Fmt<17> are upstream's (gate/up had them).
+#define STRATA_D_FMTS_FORK(X) X(10) X(11) X(12) X(16) X(17) X(18) X(21) X(22) X(39) X(143)
 #define STRATA_MMVQ_FMTS_FORK(X) X(10) X(39) X(143)

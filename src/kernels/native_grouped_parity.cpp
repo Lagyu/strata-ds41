@@ -370,6 +370,14 @@ int main(int argc, char** argv) {
     check(22, 18, 512, 256, s, rng);
     check(16, 18, 5120, 2304, s, rng);
     check(22, 21, 5120, 2304, s, rng);
+    // DeepSeek-V4.1 GSQ-RCO IQ2_XS (2026-10-24): every (gate=up, down) pair of the build, IQ2_XXS / IQ2_XS down being
+    // fork_fmt.cuh's addition; small shapes, then the model's own for the new down types
+    for (const auto& p : std::vector<std::pair<int, int>>{{16, 16}, {16, 22}, {16, 17}, {17, 17}, {17, 22}, {22, 17},
+                                                          {17, 18}, {22, 22}, {22, 16}, {17, 16}})
+        check(p.first, p.second, 512, 256, s, rng);
+    check(16, 16, 5120, 2304, s, rng);
+    check(17, 17, 5120, 2304, s, rng);
+    check(22, 16, 5120, 2304, s, rng);
     if (do_bench) bench(s, rng);
     std::printf("native_grouped_parity: %d failures\n", g_fail);
     cudaStreamDestroy(s);
