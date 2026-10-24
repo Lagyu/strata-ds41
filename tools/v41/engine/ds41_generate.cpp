@@ -2401,7 +2401,9 @@ int main(int argc, char ** argv) {
                              (int) cache_open);
             if (!by_step && defer_vram && cache_open && dh >= 2) {
                 static const int keep_max = std::getenv("STRATA_SERVE_KEEP_MAX") ? std::atoi(std::getenv("STRATA_SERVE_KEEP_MAX")) : 4096;
-                if (Ds41MoeTier::keep_cache_mode() && dh <= keep_max && !mc.cpu_only) {
+                // continuations only (2026-10-24, keepcache-ab2): the kept LRU set is the live conversation's; a new
+                // conversation's first decode ran 18% slower on it than on the fresh ranked seed, an append +5% faster
+                if (Ds41MoeTier::keep_cache_mode() && dh <= keep_max && !mc.cpu_only && reused > 0) {
                     // the same fit as pb_cap's below, incl. the long-context attention term (S * total * 10 B)
                     const double need = (4.3 * 1073741824.0 + 0.95 * 1048576.0 * (double) std::min(dh, PB)) +
                                         (double) S * (double) total * 10.0 + std::max(1.0, a.vram_margin_gib) * 1073741824.0;
@@ -2469,40 +2471,54 @@ int main(int argc, char ** argv) {
             // VRAM-aware batch width for this turn (feed() halves it again if even this does not fit): the batch's
             // state columns + graph are ~0.48 MiB a column, and the card is shared with whatever else the desktop
             // runs.  This is what lets a big --prompt-batch stay OPT-IN: the engine takes what is actually free.
-            pb_cap = PB;
-            if (!by_step && dh >= 2 && PB > 1 && !mc.cpu_only) {
-                size_t frb = 0, totb = 0;
-                ggml_backend_dev_memory(ggml_backend_get_device(be), &frb, &totb);
-                // The layer-major batch's own VRAM, CALIBRATED on four traced points (STRATA_VRAM_TRACE=1, s13
-                // run9/run13/run14, a 4 GiB foreign process): free 9.28 GiB with B=8192 failed, free 9.26 with
-                // B=5210 passed, free 5.92 with B=2411 failed, a free card with B=8192 passed - all four fit
-                //     need(B) ~= 4.3 GiB + 0.95 MiB * B
-                // 4.3 GiB fixed = the tier's two 1 GiB stage halves + a ~2.19 GiB graph buffer that is the SAME
-                // SIZE at B=2411 and B=8192 (so it is not the piece buffers; identity unconfirmed - see the
-                // residuals in V41_START_HERE).  0.95 MiB a column = columns 0.32 + graph 0.17 + part buffers 0.41,
-                // measured directly.  Per-tensor arithmetic undercounted the tier 2x and let a 2.19 GiB allocation
-                // fail while cudaMemGetInfo still said 6.83 GiB free.  A free card (>= 13 GiB) still gets its full PB.
-                // run20 (2026-10-16) fixes the GRAPH term: the pass-graph buffer is B-INDEPENDENT - the B=16384 leg
-                // OOM'd on "allocating 1424.31 MiB", the very size this comment records for 8192, so "graph 0.17 MiB
-                // a column" is a mis-derivation (1424/8192) and the decomposition is really ~5.7 GiB fixed + 0.78 a
-                // column.  Same line, same fit - but it matters: a wide batch's per-column STATE is what starves the
-                // fixed graph buffer (16384 = 5.14 GiB of state, 1.03 GiB short), not the graph itself.
-                // the fit above was calibrated with the default 1 GiB margin: a smaller --vram-margin (more decode
-                // slots) must not widen the batch past it (a 22K prompt at --vram-margin 0.5 took B=11914 and its
-                // 2.28 GiB graph buffer did not fit, 2026-10-18)
-                // long prompts (2026-10-21, the 524K needle): a dense sub-batch's attention graph grows with the
-                // context (index scores / top-k over every position for S rows): the 4150-column batch at 524K wanted
-                // a 4.66 GiB graph buffer, 2.47 GiB over the ~2.19 GiB the fixed term assumes, and the request failed
-                // ("graph allocation failed").  ~10 B per position per sub-batch row, so the fixed term grows by
-                // S * total * 10 B (0.64 GiB at 131K, 5 GiB at 1M); the fit shrinks the batch instead of failing
-                const double ctx_term = (double) S * (double) total * 10.0;
-                const double room = (double) frb - std::max(1.0, a.vram_margin_gib) * 1073741824.0 - 4.3 * 1073741824.0 - ctx_term;
-                const int fit = (int) std::max<int64_t>(2, (int64_t) (room / (0.95 * 1048576.0)));
-                pb_cap = std::min(PB, std::max(SB, fit));
-                if (vram_trace) std::fprintf(stderr, "vram trace: cap free %.2f GiB room %.2f GiB fit %d -> pb_cap %d\n",
-                                             frb / 1073741824.0, room / 1073741824.0, fit, pb_cap);
-                if (pb_cap < PB) std::fprintf(stderr, "serve: VRAM %.2f GiB free -> prompt batch %d (of %d)\n",
-                                              frb / 1073741824.0, pb_cap, PB);
+            auto size_pb = [&]() {   // (a lambda: run again if a kept cache is released after all, below)
+                pb_cap = PB;
+                if (!by_step && dh >= 2 && PB > 1 && !mc.cpu_only) {
+                    size_t frb = 0, totb = 0;
+                    ggml_backend_dev_memory(ggml_backend_get_device(be), &frb, &totb);
+                    // The layer-major batch's own VRAM, CALIBRATED on four traced points (STRATA_VRAM_TRACE=1, s13
+                    // run9/run13/run14, a 4 GiB foreign process): free 9.28 GiB with B=8192 failed, free 9.26 with
+                    // B=5210 passed, free 5.92 with B=2411 failed, a free card with B=8192 passed - all four fit
+                    //     need(B) ~= 4.3 GiB + 0.95 MiB * B
+                    // 4.3 GiB fixed = the tier's two 1 GiB stage halves + a ~2.19 GiB graph buffer that is the SAME
+                    // SIZE at B=2411 and B=8192 (so it is not the piece buffers; identity unconfirmed - see the
+                    // residuals in V41_START_HERE).  0.95 MiB a column = columns 0.32 + graph 0.17 + part buffers 0.41,
+                    // measured directly.  Per-tensor arithmetic undercounted the tier 2x and let a 2.19 GiB allocation
+                    // fail while cudaMemGetInfo still said 6.83 GiB free.  A free card (>= 13 GiB) still gets its full PB.
+                    // run20 (2026-10-16) fixes the GRAPH term: the pass-graph buffer is B-INDEPENDENT - the B=16384 leg
+                    // OOM'd on "allocating 1424.31 MiB", the very size this comment records for 8192, so "graph 0.17 MiB
+                    // a column" is a mis-derivation (1424/8192) and the decomposition is really ~5.7 GiB fixed + 0.78 a
+                    // column.  Same line, same fit - but it matters: a wide batch's per-column STATE is what starves the
+                    // fixed graph buffer (16384 = 5.14 GiB of state, 1.03 GiB short), not the graph itself.
+                    // the fit above was calibrated with the default 1 GiB margin: a smaller --vram-margin (more decode
+                    // slots) must not widen the batch past it (a 22K prompt at --vram-margin 0.5 took B=11914 and its
+                    // 2.28 GiB graph buffer did not fit, 2026-10-18)
+                    // long prompts (2026-10-21, the 524K needle): a dense sub-batch's attention graph grows with the
+                    // context (index scores / top-k over every position for S rows): the 4150-column batch at 524K wanted
+                    // a 4.66 GiB graph buffer, 2.47 GiB over the ~2.19 GiB the fixed term assumes, and the request failed
+                    // ("graph allocation failed").  ~10 B per position per sub-batch row, so the fixed term grows by
+                    // S * total * 10 B (0.64 GiB at 131K, 5 GiB at 1M); the fit shrinks the batch instead of failing
+                    const double ctx_term = (double) S * (double) total * 10.0;
+                    const double room = (double) frb - std::max(1.0, a.vram_margin_gib) * 1073741824.0 - 4.3 * 1073741824.0 - ctx_term;
+                    const int fit = (int) std::max<int64_t>(2, (int64_t) (room / (0.95 * 1048576.0)));
+                    pb_cap = std::min(PB, std::max(SB, fit));
+                    if (vram_trace) std::fprintf(stderr, "vram trace: cap free %.2f GiB room %.2f GiB fit %d -> pb_cap %d\n",
+                                                 frb / 1073741824.0, room / 1073741824.0, fit, pb_cap);
+                    if (pb_cap < PB) std::fprintf(stderr, "serve: VRAM %.2f GiB free -> prompt batch %d (of %d)\n",
+                                                  frb / 1073741824.0, pb_cap, PB);
+                }
+            };
+            size_pb();
+            if (kept && pb_cap < std::min(dh, PB)) {
+                // keep-cache: the shrink was meant to leave room for the whole batch (the same fit); if the card
+                // says otherwise the kept cache would cost extra expert sweeps - release it, as without keep-cache
+                std::fprintf(stderr, "serve: keep-cache: the kept cache leaves room for %d of %d columns - releasing it after all\n",
+                             pb_cap, std::min(dh, PB));
+                tier.release_cache();
+                cache_open = false;
+                kept = false;
+                info_vram();
+                size_pb();
             }
             const double tph0 = now_ms();
             const double fd0[3] = { fd_dense, fd_tier, fd_logits };   // this request's batch split (stderr)

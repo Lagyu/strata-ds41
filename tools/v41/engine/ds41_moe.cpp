@@ -5975,6 +5975,7 @@ void Ds41MoeTier::release_cache() {
         for (const auto& p : ord) im_->warm.emplace_back((int32_t) (p.second / NX), (int32_t) (p.second % NX));
     }
     im_->gpu->cache.reset();
+    im_->shrunk.clear();   // a shrink whose batch ended without a regrow: nothing to put back into a released cache
     im_->admitted = 0;
     im_->pf_n = 0;             // staged prefetches are keyed by expert, not slot - but they belong to the old decode
     im_->vlast.clear();        // the LRU order restarts from the next seed (lru_seed_order)
@@ -5998,7 +5999,13 @@ int64_t Ds41MoeTier::shrink_cache_for(int64_t need_bytes, std::string& err) {
     if (cudaMemGetInfo(&fr, &tot) != cudaSuccess) { err = "shrink_cache_for: cudaMemGetInfo failed"; return -1; }
     const int64_t deficit = need_bytes - (int64_t) fr;
     if (deficit <= 0) return 0;
-    const int64_t keep_bytes = c.bytes() - deficit;
+    // the batch's room: the deficit plus a reserve (STRATA_SERVE_KEEP_EXTRA_MIB, 1 GiB) for the fit's rounding and the
+    // driver's lag in crediting freed segments, rounded DOWN to a segment boundary so the shrink frees at least that much
+    // (2026-10-24: under-freed by up to a segment and measured too early, the kept batch ran at 512 of 8192 columns)
+    static const int64_t extra = (std::getenv("STRATA_SERVE_KEEP_EXTRA_MIB") ? std::atoll(std::getenv("STRATA_SERVE_KEEP_EXTRA_MIB")) : 1024) << 20;
+    int64_t keep_bytes = c.bytes() - (deficit + extra);
+    const int64_t segb = c.segment_bytes();
+    if (segb > 0 && keep_bytes > 0) keep_bytes = keep_bytes / segb * segb;
     if (keep_bytes <= 0) {   // the whole cache would go: release_cache is the same thing, done properly
         err = "the batch needs the whole cache (deficit " + std::to_string(deficit >> 20) + " MiB, cache " +
               std::to_string(c.bytes() >> 20) + " MiB)";
@@ -6047,10 +6054,26 @@ int64_t Ds41MoeTier::shrink_cache_for(int64_t need_bytes, std::string& err) {
         }
     std::sort(gone.begin(), gone.end());
     const int64_t n = c.evict_from(keep);
-    if (!c.shrink(c.bytes_of(keep), err)) return -1;
+    const int64_t mapped_before = c.mapped_bytes();
+    if (!c.shrink(keep_bytes, err)) return -1;
     im_->admitted = im_->admitted > n ? im_->admitted - n : 0;
     im_->pf_n = 0;   // staged prefetches may point at evicted experts' slots
     im_->shrunk = std::move(gone);
+    // what the shrink gave back, and what the card says is free now (the batch is sized from the latter)
+    // the driver credits freed segments with a lag (measured: still uncredited right after the frees, credited a moment
+    // later): wait for most of them before the batch is sized from the free count, at most 3 s
+    size_t fr2 = 0, tot2 = 0;
+    const int64_t freed = mapped_before - c.mapped_bytes();
+    const double tw0 = now_ms();
+    for (;;) {
+        cudaMemGetInfo(&fr2, &tot2);
+        if ((int64_t) fr2 >= (int64_t) fr + freed - ((int64_t) 256 << 20) || now_ms() - tw0 > 3000.0) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    std::fprintf(stderr, "serve: keep-cache: free %.2f -> %.2f GiB after %.0f ms (need %.2f: deficit %.2f + reserve %.2f), cache %.2f -> %.2f GiB mapped\n",
+                 (double) fr / 1073741824.0, (double) fr2 / 1073741824.0, now_ms() - tw0, (double) need_bytes / 1073741824.0,
+                 (double) deficit / 1073741824.0, (double) extra / 1073741824.0, (double) mapped_before / 1073741824.0,
+                 (double) c.mapped_bytes() / 1073741824.0);
     return n;
 #else
     (void) need_bytes; (void) err;

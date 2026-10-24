@@ -19,6 +19,8 @@
 #endif
 
 #include <thread>
+#include <chrono>
+#include <cstdint>
 #include <mutex>
 #include <cuda_runtime.h>
 #if !defined(STRATA_EC_NO_VMM)
@@ -450,16 +452,81 @@ bool ExpertCache::shrink(int64_t keep_bytes, std::string& err) {
         err = std::string("the device failed before the cache shrank: ") + cudaGetErrorString(cudaGetLastError());
         return false;
     }
+    // (diagnostics, STRATA_EC_SHRINK_TRACE=1: the device's free count around the frees, and a trial allocation of what
+    // was freed - 2026-10-24: inside the engine the freed segments did not come back as free VRAM)
+    static const bool trace = std::getenv("STRATA_EC_SHRINK_TRACE") && std::getenv("STRATA_EC_SHRINK_TRACE")[0] == '1';
+    auto free_mib = []() { size_t f = 0, t = 0; cudaMemGetInfo(&f, &t); return (double) f / 1048576.0; };
+    const double f0 = trace ? free_mib() : 0;
+    const cudaError_t pending = cudaGetLastError();
+    if (trace) std::fprintf(stderr, "shrink: pending error before the frees: %s; free %.0f MiB\n", cudaGetErrorString(pending), f0);
+    int64_t freed = 0;
     for (int64_t i = mapped_segs_ - 1; i >= keep; --i) {
         uint8_t*& p = seg_ptr_[(size_t) i];
-        if (p != nullptr && cudaFree(p) != cudaSuccess) {
-            err = "the driver refused to free an expert-cache segment";
-            live_slots_ = slots_within(mapped_bytes());
-            return false;
+        if (p != nullptr) {
+            const cudaError_t e = cudaFree(p);
+            if (trace && (i == mapped_segs_ - 1 || i == keep))
+                std::fprintf(stderr, "shrink: cudaFree(segment %lld, %lld MiB) -> %s; free %.0f MiB\n", (long long) i,
+                             (long long) (seg_size_[(size_t) i] >> 20), cudaGetErrorString(e), free_mib());
+            if (e != cudaSuccess) {
+                err = std::string("the driver refused to free an expert-cache segment: ") + cudaGetErrorString(e);
+                live_slots_ = slots_within(mapped_bytes());
+                return false;
+            }
+            freed += seg_size_[(size_t) i];
         }
         p = nullptr;
         segs_[(size_t) i] = 0;
         mapped_segs_ = i;
+    }
+    if (trace) {
+        cudaDeviceSynchronize();
+        const double f1 = free_mib();
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        const double f2 = free_mib();
+#if defined(STRATA_USE_HIP)
+        {   // (a) the device's default memory pool: does it hold the freed segments?  (b) a sync of every device
+            int dev = 0; hipGetDevice(&dev);
+            int pools = -1; hipDeviceGetAttribute(&pools, hipDeviceAttributeMemoryPoolsSupported, dev);
+            hipMemPool_t pool = nullptr;
+            const hipError_t pe = hipDeviceGetDefaultMemPool(&pool, dev);
+            std::uint64_t used = 0, reserved = 0, thr = 0;
+            if (pe == hipSuccess && pool) {
+                hipMemPoolGetAttribute(pool, hipMemPoolAttrUsedMemCurrent, &used);
+                hipMemPoolGetAttribute(pool, hipMemPoolAttrReservedMemCurrent, &reserved);
+                hipMemPoolGetAttribute(pool, hipMemPoolAttrReleaseThreshold, &thr);
+            }
+            std::fprintf(stderr, "shrink: mempools supported %d, default pool %s: used %llu MiB reserved %llu MiB threshold %llu; free %.0f MiB\n",
+                         pools, pe == hipSuccess ? "ok" : hipGetErrorString(pe), (unsigned long long) (used >> 20),
+                         (unsigned long long) (reserved >> 20), (unsigned long long) thr, free_mib());
+            if (pe == hipSuccess && pool) {
+                const hipError_t te = hipMemPoolTrimTo(pool, 0);
+                std::fprintf(stderr, "shrink: hipMemPoolTrimTo(default, 0) -> %s; free %.0f MiB\n", hipGetErrorString(te), free_mib());
+            }
+            int nd = 0; hipGetDeviceCount(&nd);
+            for (int d = 0; d < nd; ++d) { hipSetDevice(d); hipDeviceSynchronize(); }
+            hipSetDevice(dev);
+            std::fprintf(stderr, "shrink: after a sync of every device: free %.0f MiB\n", free_mib());
+            // (c) recycling: three allocations of a freed segment's size - served from the freed blocks (free count unchanged) or new VRAM?
+            void* r[3] = {nullptr, nullptr, nullptr};
+            const size_t one = (size_t) (seg_size_.empty() ? 0 : seg_size_[(size_t) keep < seg_size_.size() ? (size_t) keep : 0]);
+            for (int i = 0; i < 3 && one > 0; ++i) {
+                const hipError_t ae = hipMalloc(&r[i], one);
+                std::fprintf(stderr, "shrink: recycle test hipMalloc(%zu MiB) #%d -> %s; free %.0f MiB\n", one >> 20, i, hipGetErrorString(ae), free_mib());
+            }
+            for (int i = 0; i < 3; ++i) if (r[i]) hipFree(r[i]);
+            std::fprintf(stderr, "shrink: recycle test freed; free %.0f MiB\n", free_mib());
+            (void) hipGetLastError();
+        }
+#endif
+        void* trial = nullptr;
+        const size_t want = freed > (int64_t) (64 << 20) ? (size_t) (freed - (64 << 20)) : (size_t) freed;
+        const cudaError_t te = cudaMalloc(&trial, want);
+        const double f3 = free_mib();
+        if (trial) cudaFree(trial);
+        (void) cudaGetLastError();
+        std::fprintf(stderr, "shrink: %lld MiB freed; free %.0f -> %.0f MiB, after a sync %.0f, after 200 ms %.0f; trial cudaMalloc(%zu MiB): %s "
+                     "(free during it %.0f MiB), free after %.0f MiB\n", (long long) (freed >> 20), f0, free_mib(), f1, f2, want >> 20,
+                     cudaGetErrorString(te), f3, free_mib());
     }
     if (keep == 0) base_ = nullptr;
     live_slots_ = slots_within(mapped_bytes());
