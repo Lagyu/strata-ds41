@@ -119,8 +119,8 @@ public:
     /// management) instead of one cudaMalloc, so `shrink` can give the tail's VRAM back to the driver - for another
     /// program - and `grow` can take it again, while every slot keeps its address (the captured graphs, the verify
     /// plan's pointers and the prompt path's loan all hold addresses into it).  0 (the default): one cudaMalloc, as
-    /// always.  CUDA, and HIP since 2026-10-24 (ROCm's virtual memory management; the gfx906 compat build and Metal
-    /// refuse it at open).  The slots past `slots()` after a shrink must hold no
+    /// always.  CUDA; on HIP (2026-10-24) the segments are separate allocations and a slot's ADDRESS changes when its
+    /// segment is freed and allocated again (take it from device_slot at the time of use).  The slots past `slots()` after a shrink must hold no
     /// resident expert and no loan: the CALLER evicts them first (they become CPU misses).
     void set_segment_bytes(int64_t seg_bytes) { seg_req_ = seg_bytes > 0 ? seg_bytes : 0; }
     /// STRATA_MMQ_DIRECT: `open_sized` leaves at least `g` bytes of room after each slot's blob (the prompt MMQ
@@ -244,7 +244,12 @@ public:
     /// STRATA_MMQ_DIRECT: the address `blob` bytes into slot `s` when the slot has room for `need` more bytes there
     /// (null otherwise, or for a bad slot).  Uniform slots too: their stride is the largest blob.
     uint8_t* slot_tail(int32_t s, uint64_t blob, uint64_t need) const {
-        if (s < 0 || s >= slots_ || base_ == nullptr) return nullptr;
+        if (s < 0 || s >= slots_) return nullptr;
+        if (!seg_ptr_.empty()) {   // HIP segments: the slot's own allocation (device_slot)
+            const uint8_t* p = device_slot(s);
+            return p != nullptr && slot_room(s) >= blob + need ? const_cast<uint8_t*>(p) + blob : nullptr;
+        }
+        if (base_ == nullptr) return nullptr;
         return slot_room(s) >= blob + need ? base_ + slot_offset(s) + blob : nullptr;
     }
 
@@ -267,6 +272,13 @@ private:
     std::vector<unsigned long long> segs_;   ///< #533: each segment's physical handle (0: unmapped)
     std::vector<int64_t> seg_size_;     ///< #533: each segment's size (the last one may be shorter)
     int64_t mapped_segs_ = 0;           ///< #533: segments [0, mapped_segs_) are backed
+    // HIP (2026-10-24): the segments as separate device allocations - see open_segmented in the .cpp
+    std::vector<uint8_t*> seg_ptr_;         ///< each segment's allocation (null: freed by shrink)
+    std::vector<uint64_t> seg_begin_;       ///< each segment's first byte offset in the arena
+    std::vector<int32_t> slot_seg_;         ///< each slot's segment (index_segments)
+    std::vector<uint64_t> pending_bounds_;  ///< the segment end offsets for the next open_segmented
+    bool bounds_from_sized_ = false;        ///< open_sized set them: open() must not index its byte-sized "slots"
+    void index_segments();
     std::unique_ptr<VmmRange> vmm_;    ///< the arena's range when it is in VMM (set_vmm)
     std::vector<int32_t> residency_;   ///< [n_layers * n_expert] -> slot or kNotResident
     int64_t slots_ = 0;

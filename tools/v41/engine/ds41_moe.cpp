@@ -45,6 +45,15 @@
 #include <cuda_profiler_api.h>
 #if defined(DS4_MOE_MMQ)
 #include "strata/prefill/moe_mmq.hpp"
+
+// keep-cache (STRATA_SERVE_KEEP_CACHE): the VRAM expert cache's segment size.  CUDA: 64 MiB pieces of one virtual-memory
+// range.  HIP: the segments are separate allocations (ExpertCache, src/core/expert_cache.cpp), so larger ones - fewer pieces
+// for the allocator; the shrink point moves by at most one segment (~14 experts) either way.
+#if defined(STRATA_USE_HIP) || defined(__HIP_PLATFORM_AMD__)
+static constexpr int64_t kKeepCacheSegment = (int64_t) 256 << 20;
+#else
+static constexpr int64_t kKeepCacheSegment = (int64_t) 64 << 20;
+#endif
 #endif
 #endif
 
@@ -2092,7 +2101,7 @@ bool Ds41MoeTier::seed_from_ranked(const std::vector<std::pair<int32_t, int32_t>
         }
         if (!sizes.empty()) {
             im_->gpu->cache.reset(new strata::core::ExpertCache());
-            if (keep_cache_mode()) im_->gpu->cache->set_segment_bytes((int64_t) 64 << 20);   // shrink_cache_for
+            if (keep_cache_mode()) im_->gpu->cache->set_segment_bytes(kKeepCacheSegment);   // shrink_cache_for
             if (!im_->gpu->cache->open_sized(sizes, im_->g.n_layers, im_->g.n_experts, err)) return false;
         }
     }
@@ -2105,7 +2114,7 @@ bool Ds41MoeTier::seed_from_ranked(const std::vector<std::pair<int32_t, int32_t>
         !im_->cfg.no_cache && n_uni > 0) {
         std::vector<int64_t> sizes((size_t) n_uni, im_->blob);
         im_->gpu->cache.reset(new strata::core::ExpertCache());
-        if (keep_cache_mode()) im_->gpu->cache->set_segment_bytes((int64_t) 64 << 20);
+        if (keep_cache_mode()) im_->gpu->cache->set_segment_bytes(kKeepCacheSegment);
         if (!im_->gpu->cache->open_sized(sizes, im_->g.n_layers, im_->g.n_experts, err)) return false;
     }
     if (!im_->gpu || !im_->gpu->cache) {   // no cache: nothing to seed (the peer still mirrors the arena)
