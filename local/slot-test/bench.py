@@ -36,7 +36,14 @@ if rest and rest[0].isdigit():
 extra_env = dict(kv.split('=', 1) for kv in rest)
 R = os.environ.get('BENCH_TREE') or '/home/yuya/llm-src/strata-ds41'
 cfg = json.load(open(f'{R}/local/ds41-yuya-3gpu.json'))
-os.makedirs(f'{out_dir}/rows', exist_ok=True)
+# the row dump goes to RAM (tmpfs): 0.5 MB a decoded row on the model's SSD slowed the dumping arms against production
+rows_dir = f'/dev/shm/slots-bench/{os.path.basename(os.path.abspath(out_dir))}'
+import shutil
+shutil.rmtree(rows_dir, ignore_errors=True)
+os.makedirs(rows_dir, exist_ok=True)
+if os.path.islink(f'{out_dir}/rows') or os.path.exists(f'{out_dir}/rows'):
+    shutil.rmtree(f'{out_dir}/rows', ignore_errors=True) if not os.path.islink(f'{out_dir}/rows') else os.unlink(f'{out_dir}/rows')
+os.symlink(rows_dir, f'{out_dir}/rows')
 pc = {k: np.fromfile(f'{payload}/{k}.i32', np.int32).tolist() for k in json.load(open(f'{payload}/sizes.json'))}
 
 env = dict(os.environ)
