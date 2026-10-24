@@ -1,16 +1,19 @@
 // src/core/expert_cache.cpp - R4's slot storage and residency table.  Read the header first.
 #include "strata/core/expert_cache.hpp"
 
-// #533's segmented cache uses CUDA's virtual memory management (cuMem*): not on HIP, neither the RDNA backend nor
-// the gfx906 compat build (PR #638), which compiles this file as HIP without STRATA_USE_HIP
-#if defined(STRATA_USE_HIP) || defined(STRATA_HIP_GFX906) || defined(STRATA_GPU_METAL)
+// #533's segmented cache uses the driver's virtual memory management: CUDA's cuMem* (looked up through the runtime),
+// and since 2026-10-24 ROCm's hipMem* on the RDNA backend (STRATA_USE_HIP: hipMemAddressReserve / hipMemCreate /
+// hipMemMap / hipMemSetAccess / hipMemUnmap / hipMemRelease, the CUDA driver API's shape; measured on gfx1100 and
+// gfx1201 with ROCm 7.14: 2 MiB recommended granularity, shrink + grow of a mapped range).  Not on the gfx906 compat
+// build (PR #638), which compiles this file as HIP without STRATA_USE_HIP, nor on Metal.
+#if defined(STRATA_HIP_GFX906) || defined(STRATA_GPU_METAL)
 #define STRATA_EC_NO_VMM 1
 #endif
 
 #include <thread>
 #include <mutex>
 #include <cuda_runtime.h>
-#if !defined(STRATA_EC_NO_VMM)
+#if !defined(STRATA_EC_NO_VMM) && !defined(STRATA_USE_HIP)
 #include <cuda.h>   // #533: the virtual memory management types (the functions come through the runtime's entry points)
 #endif
 
@@ -217,6 +220,52 @@ ExpertCache::~ExpertCache() { close(); }
 // runtime (no link against the driver library): one address range for the whole arena, backed by physical segments,
 // and the tail's segments unmapped / mapped again later.  Nothing here runs unless a segment size was set.
 #if !defined(STRATA_EC_NO_VMM)
+#if defined(STRATA_USE_HIP)
+// ROCm: the CUDA driver API's names as aliases of the HIP runtime's, so the code below is the same on both.  CUdeviceptr
+// stays an integer (the address arithmetic below); the wrappers cast at the calls.
+using CUresult = hipError_t;
+using CUdevice = int;
+using CUdeviceptr = unsigned long long;
+using CUdevice_attribute = hipDeviceAttribute_t;
+using CUmemGenericAllocationHandle = hipMemGenericAllocationHandle_t;
+using CUmemAllocationProp = hipMemAllocationProp;
+using CUmemAccessDesc = hipMemAccessDesc;
+using CUmemAllocationGranularity_flags = hipMemAllocationGranularity_flags;
+constexpr CUresult CUDA_SUCCESS = hipSuccess;
+constexpr auto CU_MEM_ALLOCATION_TYPE_PINNED = hipMemAllocationTypePinned;
+constexpr auto CU_MEM_LOCATION_TYPE_DEVICE = hipMemLocationTypeDevice;
+constexpr auto CU_MEM_ACCESS_FLAGS_PROT_READWRITE = hipMemAccessFlagsProtReadWrite;
+constexpr auto CU_MEM_ALLOC_GRANULARITY_RECOMMENDED = hipMemAllocationGranularityRecommended;
+constexpr auto CU_DEVICE_ATTRIBUTE_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED = hipDeviceAttributeVirtualMemoryManagementSupported;
+#ifndef CUDAAPI
+#define CUDAAPI
+#endif
+namespace {
+CUresult hip_device_get(CUdevice* d, int ordinal) { return hipDeviceGet(d, ordinal); }
+CUresult hip_attribute(int* v, CUdevice_attribute a, CUdevice d) { return hipDeviceGetAttribute(v, a, d); }
+CUresult hip_granularity(size_t* g, const CUmemAllocationProp* p, CUmemAllocationGranularity_flags f) {
+    return hipMemGetAllocationGranularity(g, p, f);
+}
+CUresult hip_reserve(CUdeviceptr* p, size_t size, size_t align, CUdeviceptr addr, unsigned long long flags) {
+    void* v = nullptr;
+    const CUresult e = hipMemAddressReserve(&v, size, align, reinterpret_cast<void*>(addr), flags);
+    *p = reinterpret_cast<CUdeviceptr>(v);
+    return e;
+}
+CUresult hip_address_free(CUdeviceptr p, size_t size) { return hipMemAddressFree(reinterpret_cast<void*>(p), size); }
+CUresult hip_create(CUmemGenericAllocationHandle* h, size_t size, const CUmemAllocationProp* p, unsigned long long flags) {
+    return hipMemCreate(h, size, p, flags);
+}
+CUresult hip_release(CUmemGenericAllocationHandle h) { return hipMemRelease(h); }
+CUresult hip_map(CUdeviceptr p, size_t size, size_t off, CUmemGenericAllocationHandle h, unsigned long long flags) {
+    return hipMemMap(reinterpret_cast<void*>(p), size, off, h, flags);
+}
+CUresult hip_unmap(CUdeviceptr p, size_t size) { return hipMemUnmap(reinterpret_cast<void*>(p), size); }
+CUresult hip_set_access(CUdeviceptr p, size_t size, const CUmemAccessDesc* d, size_t n) {
+    return hipMemSetAccess(reinterpret_cast<void*>(p), size, d, n);
+}
+}  // namespace
+#endif
 namespace {
 struct Vmm {
     CUresult (CUDAAPI* device_get)(CUdevice*, int) = nullptr;
@@ -233,6 +282,7 @@ struct Vmm {
     bool ok = false;
 };
 
+#if !defined(STRATA_USE_HIP)
 template <class F> bool entry(const char* name, F& f) {
     void* p = nullptr;
     cudaDriverEntryPointQueryResult q{};
@@ -248,15 +298,31 @@ template <class F> bool entry(const char* name, F& f) {
     f = reinterpret_cast<F>(p);
     return true;
 }
+#endif
 
 const Vmm& vmm() {
     static const Vmm v = [] {
         Vmm x;
+#if defined(STRATA_USE_HIP)
+        // ROCm: the runtime's own functions (no driver library to look up)
+        x.device_get = hip_device_get;
+        x.attribute = hip_attribute;
+        x.granularity = hip_granularity;
+        x.reserve = hip_reserve;
+        x.address_free = hip_address_free;
+        x.create = hip_create;
+        x.release = hip_release;
+        x.map = hip_map;
+        x.unmap = hip_unmap;
+        x.set_access = hip_set_access;
+        x.ok = true;
+#else
         x.ok = entry("cuDeviceGet", x.device_get) && entry("cuDeviceGetAttribute", x.attribute) &&
                entry("cuMemGetAllocationGranularity", x.granularity) && entry("cuMemAddressReserve", x.reserve) &&
                entry("cuMemAddressFree", x.address_free) && entry("cuMemCreate", x.create) &&
                entry("cuMemRelease", x.release) && entry("cuMemMap", x.map) && entry("cuMemUnmap", x.unmap) &&
                entry("cuMemSetAccess", x.set_access);
+#endif
         return x;
     }();
     return v;
@@ -297,7 +363,7 @@ bool map_segment(const Vmm& v, int dev, CUdeviceptr va, size_t bytes, unsigned l
 bool ExpertCache::open_segmented(uint64_t want, std::string& err) {
 #if defined(STRATA_EC_NO_VMM)
     (void) want;
-    err = "ExpertCache: --vram-elastic (a segmented expert cache) is CUDA-only for now";
+    err = "ExpertCache: --vram-elastic (a segmented expert cache) needs CUDA or ROCm (not the gfx906 compat build or Metal)";
     return false;
 #else
     const Vmm& v = vmm();

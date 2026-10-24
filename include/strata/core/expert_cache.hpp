@@ -119,7 +119,8 @@ public:
     /// management) instead of one cudaMalloc, so `shrink` can give the tail's VRAM back to the driver - for another
     /// program - and `grow` can take it again, while every slot keeps its address (the captured graphs, the verify
     /// plan's pointers and the prompt path's loan all hold addresses into it).  0 (the default): one cudaMalloc, as
-    /// always.  CUDA only: a HIP build refuses it at open.  The slots past `slots()` after a shrink must hold no
+    /// always.  CUDA, and HIP since 2026-10-24 (ROCm's virtual memory management; the gfx906 compat build and Metal
+    /// refuse it at open).  The slots past `slots()` after a shrink must hold no
     /// resident expert and no loan: the CALLER evicts them first (they become CPU misses).
     void set_segment_bytes(int64_t seg_bytes) { seg_req_ = seg_bytes > 0 ? seg_bytes : 0; }
     /// STRATA_MMQ_DIRECT: `open_sized` leaves at least `g` bytes of room after each slot's blob (the prompt MMQ
