@@ -3,7 +3,7 @@
 This is the LLM server of one home workstation: the DeepSeek-V4.1 engine of
 [Xolotl](https://github.com/Indras-Mirror/Xolotl) (formerly Strata-DSV4.1) with the AMD work of vincalkr's fork
 ([vincalkr/DS41Engine](https://github.com/vincalkr/DS41Engine)), merged onto [Strata](https://github.com/Niko1221/Strata)
-0.2.0, plus what was done on this machine: the ROCm build on three GPUs, the serving work below and the machine's
+0.2.3.1, plus what was done on this machine: the ROCm build on three GPUs, the serving work below and the machine's
 configuration. The upstream history is kept as it is; the work on top of it is in the commits by `yuya` (2026-10-20
 onwards). MIT licensed, like upstream (`LICENSE`).
 
@@ -41,7 +41,7 @@ The server is Python (`requirements.txt`); `local/run-ds41.sh` takes its virtual
 
 ## What changed on top of upstream
 
-- ROCm: the DeepSeek engine's HIP build on Strata 0.2.0 for gfx1100 (RX 7900 XTX) and gfx1201 (R9700); MXFP4 experts
+- ROCm: the DeepSeek engine's HIP build on Strata 0.2.3.1 for gfx1100 (RX 7900 XTX) and gfx1201 (R9700); MXFP4 experts
   on the multi-entry expert kernels; IQ3_S as a grouped DOWN format.
 - Expert tiers: several peer GPUs as expert stores filled from the file tier (`STRATA_PEER_GIB`,
   `STRATA_PEER_FILL=file`), and the peers compute their experts' rows during prompt reads (4K prefill 81 -> 140
@@ -55,6 +55,9 @@ The server is Python (`requirements.txt`); `local/run-ds41.sh` takes its virtual
 - Serving, for an agent harness that interleaves conversations and subagents: conversation parks, tail resume,
   shared-prefix parks (optionally kept as files), END parks, request slots, STOP during a prompt read. The commit
   `DS41 serve: ...` describes each and its environment variables.
+- From Xolotl's later work (2026-10-23/24): no DMA for a prefetch guess outside the arena (their profile: 246 of 2,874
+  prefetch DMAs were such guesses, sharing the PCIe engine with real misses; routing and tokens unchanged), and an
+  expert-cache admission fix.
 - Models and tools: unsloth's DeepSeek-V4.1-Flash-1017 GGUFs and split model files load; converters for the Lucebox
   drafter (DSpark sidecar) and its routing statistics (expert rank); route counts of the real traffic
   (`STRATA_ROUTE_COUNTS`, `tools/v41/rank_from_counts.py`); a residency-aware expert splice (`tools/v41/splice_b.py`,
