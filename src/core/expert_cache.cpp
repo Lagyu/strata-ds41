@@ -728,7 +728,13 @@ bool ExpertCache::open_sized(const std::vector<int64_t>& slot_bytes, int64_t n_l
 }
 
 bool ExpertCache::swap_slots(int32_t a, int32_t b, std::string& err) {
-    if (!off_.empty()) { err = "ExpertCache::swap_slots: the slots are sized per layer (uniform slots only)"; return false; }
+    // sized slots (open_sized) are fine when both have the same room - the uniform geometry the engine opens through
+    // open_sized (its defer_cache / slot_gib path) - and refused when the sizes differ per layer (MiMo)
+    if (!off_.empty() && (a < 0 || b < 0 || a >= slots_ || b >= slots_ || slot_room(a) != slot_room(b) ||
+                          slot_room(a) < (uint64_t) blob_)) {
+        err = "ExpertCache::swap_slots: the slots are sized per layer (uniform slots only)";
+        return false;
+    }
     uint8_t* pa = device_slot(a);
     uint8_t* pb = device_slot(b);
     if (pa == nullptr || pb == nullptr) {

@@ -6010,8 +6010,8 @@ int64_t Ds41MoeTier::shrink_cache_for(int64_t need_bytes, std::string& err) {
         // 2026-10-23: under the LRU the slots are in replacement order, not rank order, so the tail is not the coldest.
         // Gather the `keep` most recently used experts (vlast = the tick of the last use; the seed's order for the
         // untouched) below the shrink point by swapping their blobs with the cold ones there, then evict the tail as
-        // before - the decode after the batch keeps the set it had.  Uniform slots only (swap_slots refuses sized ones,
-        // and the whole cache is released then, as without keep-cache).
+        // before - the decode after the batch keeps the set it had.  Equal-sized slots only (swap_slots refuses slots
+        // sized per layer, and the whole cache is released then, as without keep-cache).
         struct Ent { int64_t age; int32_t slot, l, e; };
         std::vector<Ent> res;
         for (int64_t l = 0; l < im_->g.n_layers; ++l)
