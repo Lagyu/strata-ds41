@@ -2183,9 +2183,9 @@ int main(int argc, char ** argv) {
         // ---- one batch window (dslots > 1; docs/BATCHING.md): a row of every resident running request through every layer in
         // ONE pass (Ds41Dense::begin_rows: the dense weights, the shared expert and every routed expert two rows share are read
         // once for all of them), each row sampled with its request's own sampler.  No drafts in a window - here a pass is bound
-        // by the expert bytes it streams, and a draft row would cost its experts for ~0.4 tokens - but a DSpark request's
-        // drafter window is kept fed (STRATA_SERVE_WIN_DSPARK=0: not), so it drafts again the moment it runs alone.  A request
-        // that ends in a window is made live first (end_req reads the live state).
+        // by the expert bytes it streams, and a draft row would cost its experts for ~0.4 tokens; a DSpark request's drafter
+        // window is not fed either (STRATA_SERVE_WIN_DSPARK=1: it is), so when it runs alone again its window starts over and
+        // refills within a few passes.  A request that ends in a window is made live first (end_req reads the live state).
         std::vector<Ds41Dense::Row> w_rows;
         std::vector<Req *> w_req;
         std::vector<int> w_want;
@@ -2233,7 +2233,10 @@ int main(int argc, char ** argv) {
                     rowdump(q.id, q.P + 1, q.t, lg);
                     const int tn = sample_p(lg, nv, q.temp, q.tk, q.top_p, q.min_p, q.rng);
 #if defined(DS41_HAVE_DSPARK)
-                    static const bool win_dspark = !(std::getenv("STRATA_SERVE_WIN_DSPARK") && std::getenv("STRATA_SERVE_WIN_DSPARK")[0] == '0');
+                    // STRATA_SERVE_WIN_DSPARK=1 (opt-in): feed the drafter in windows.  Measured off by default: 38 ms a window with 2 slots,
+                    // 125-190 ms with 3-4 (window_in / step / window_out on the drafter's card per request, its graphs rebuilt as the
+                    // conversations' fills differ) - a request that runs alone again starts its window over instead
+                    static const bool win_dspark = std::getenv("STRATA_SERVE_WIN_DSPARK") && std::getenv("STRATA_SERVE_WIN_DSPARK")[0] == '1';
                     if (dsp && win_dspark && !q.dsp_stale) {   // this position into its drafter window, drafts after tn
                         const double td0 = now_ms();
                         const int spos1 = q.P + 1;
