@@ -92,7 +92,9 @@ def dsml(calls):
 
 
 def run_parser(text, thinking, split):
-    p = F.OutputParser(thinking=thinking, tools=TOOLS)
+    # the server hands the parser the flat schemas ({name, description, parameters}); since Strata 0.2.3 a call
+    # counts only for a declared name, so the OpenAI envelope must be unwrapped here as the server does
+    p = F.OutputParser(thinking=thinking, tools=[t["function"] for t in TOOLS])
     ev = []
     for i in range(0, len(text), split):
         ev += p.feed(text[i:i + split])
