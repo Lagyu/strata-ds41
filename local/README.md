@@ -13,7 +13,9 @@ onwards). MIT licensed, like upstream (`LICENSE`).
 - GPU 0: Radeon RX 7900 XTX 24 GB on PCIe x16, the primary (dense layers, attention, the most used experts)
 - GPU 1: Radeon AI PRO R9700 32 GB, an OCuLink eGPU on PCIe 4.0 x4: a peer expert store and the DSpark drafter
 - GPU 2: Radeon RX 7900 XTX 24 GB on a chipset PCIe x4 slot: a peer expert store
-- Model: DeepSeek-V4.1-Flash-1017 with MXFP4 experts (an abliterated build; 15,360 experts, ~269 GiB). The experts are
+- Model: DeepSeek-V4.1-Flash-1017, since 2026-10-25 orcarouter's abliterated Mix-256G GGUF in the engine's layout
+  (15,360 experts at ~3.4 bits: IQ2_S / IQ3_XXS / IQ3_S / MXFP4, ~212 GiB) with `--skip-file 0.10`; until then (and as
+  the rollback) the checkpoint's MXFP4 experts with our own abliteration of 62 dense tensors (~269 GiB). The experts are
   tiered over the primary's VRAM, a 95 GiB pinned host arena, the two peer stores and the model file on NVMe.
 
 ## Build (HIP, gfx1100 + gfx1201)
@@ -42,7 +44,7 @@ The server is Python (`requirements.txt`); `local/run-ds41.sh` takes its virtual
 ## What changed on top of upstream
 
 - ROCm: the DeepSeek engine's HIP build on Strata 0.2.3.1 for gfx1100 (RX 7900 XTX) and gfx1201 (R9700); MXFP4 experts
-  on the multi-entry expert kernels; IQ3_S as a grouped DOWN format.
+  on the multi-entry expert kernels; IQ3_S, IQ2_XXS and IQ2_XS as grouped DOWN formats.
 - Expert tiers: several peer GPUs as expert stores filled from the file tier (`STRATA_PEER_GIB`,
   `STRATA_PEER_FILL=file`), and the peers compute their experts' rows during prompt reads (4K prefill 81 -> 140
   tokens/s); a copy of the model file on a second drive serves part of every file-tier read (`STRATA_BLOB_TWIN`,
@@ -61,12 +63,16 @@ The server is Python (`requirements.txt`); `local/run-ds41.sh` takes its virtual
 - Models and tools: unsloth's DeepSeek-V4.1-Flash-1017 GGUFs and split model files load; converters for the Lucebox
   drafter (DSpark sidecar) and its routing statistics (expert rank); route counts of the real traffic
   (`STRATA_ROUTE_COUNTS`, `tools/v41/rank_from_counts.py`); a residency-aware expert splice (`tools/v41/splice_b.py`,
-  evaluated, not adopted); an Engram hot set built from a local corpus.
+  evaluated, not adopted); an Engram hot set built from a local corpus; converters of other published builds into the
+  engine's layout and their comparison (`local/qtest/`: Maya-S, GSQ-RCO, Mix-256G); `--skip-file` (file-tier experts
+  with a small router weight are not read).
 
 ## Measured on this machine
 
-- Quality on held-out text against the FP8 model: perplexity 8.63 (FP8: 8.56), top-1 agreement 93.6 %, KL 0.045
-  (`local/eval-lucebox/run-eval-3gpu.sh`).
+- Quality on held-out text against the FP8 model (perplexity 8.56): Mix-256G + `--skip-file 0.10` 8.84, top-1
+  agreement 87.6 %, KL 0.100; the MXFP4 build with our abliteration 8.63 / 93.6 % / 0.045 (`local/qtest/README.md`).
+- Bench set after a warm-up (2026-10-25): Mix-256G + skip 12.3-14.6 tokens/s on short prompts and 10.1 after a 4K
+  prompt, read at ~236 tokens/s; the MXFP4 build + skip 9.8-12.1, 7.4 and 105-168.
 - Decode on real agent traffic (2026-10-22): 7.6-8.5 tokens/s; ~10.7 tokens/s on copy-heavy output with lookup
   decoding.
 - Prompt reading: a 6,600-token prompt in ~29 s. A resent prompt resumes in 1.5-3 s and a switch between parked
