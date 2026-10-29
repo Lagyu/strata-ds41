@@ -1825,22 +1825,28 @@ index 6923f35..c435921 100644
      }
  }
 diff --git a/ggml/src/ggml-cuda/mmvf.cu b/ggml/src/ggml-cuda/mmvf.cu
-index bd5c5d4..18bbd67 100644
+index bd5c5d4..36b5501 100644
 --- a/ggml/src/ggml-cuda/mmvf.cu
 +++ b/ggml/src/ggml-cuda/mmvf.cu
-@@ -839,7 +839,11 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, const int64_t * src0
+@@ -838,11 +838,16 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, const int64_t * src0
+                 return ne11 <= 8;
              } else if (GGML_CUDA_CC_IS_AMD(cc)) {
                  if (fp16_mma_hardware_available(cc)) {
++                    // Strata-DS4.1: a skinny F16 matrix (DeepSeek-V4.1's hc mixes, [20480 -> 24]) at up to 8 columns
++                    // otherwise goes to hipBLAS SGEMM behind an F16 -> F32 convert of the weights: 0.66-1.4 ms a
++                    // call against ~15 us here (DSpark's 5-column drafter: ~9 ms a verify pass). RDNA4 too (6-8 columns).
++                    static const bool skinny = !(getenv("GGML_CUDA_MMVF_SKINNY") && getenv("GGML_CUDA_MMVF_SKINNY")[0] == '0');
++                    const bool skinny_mix = skinny && src0_ne[1] <= 64 && ne11 <= 8;
                      if (GGML_CUDA_CC_IS_RDNA3(cc)) {
 -                        return ne11 <= 3;
-+                        // Strata-DS4.1: a skinny F16 matrix (DeepSeek-V4.1's hc mixes, [20480 -> 24]) at 4..8 columns
-+                        // otherwise goes to hipBLAS SGEMM behind an F16 -> F32 convert of the weights: 0.66-1.4 ms a
-+                        // call against ~15 us here (DSpark's 5-column drafter: ~9 ms a verify pass)
-+                        static const bool skinny = !(getenv("GGML_CUDA_MMVF_SKINNY") && getenv("GGML_CUDA_MMVF_SKINNY")[0] == '0');
-+                        return ne11 <= 3 || (skinny && src0_ne[1] <= 64 && ne11 <= 8);
++                        return ne11 <= 3 || skinny_mix;
                      }
                      if (GGML_CUDA_CC_IS_RDNA4(cc)) {
-                         return ne11 <= 5;
+-                        return ne11 <= 5;
++                        return ne11 <= 5 || skinny_mix;
+                     }
+                     return ne11 <= 2;
+                 }
 diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
 index 6305230..1976c03 100644
 --- a/ggml/src/ggml-cuda/mmvq.cu
