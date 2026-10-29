@@ -564,6 +564,7 @@ struct Gpu {
     cudaEvent_t c_xq_ev = nullptr;
     void* c_pbuf = nullptr;
     void* c_pdst = nullptr;
+    void* zc_chk = nullptr;   ///< STRATA_SUM_ZEROCOPY=2: the zero-copy sums' rows (kMaxEnt x n_embd), compared after the sync
     int64_t c_pbuf_rows = 0;
     cudaStream_t s_cp = nullptr;
     cudaEvent_t c_copied[2] = {}, c_used[2] = {};
@@ -618,7 +619,7 @@ struct Gpu {
         if (c_hparts) cudaFreeHost(c_hparts);
         if (c_hxq) cudaFreeHost(c_hxq);
         if (c_xq_ev) cudaEventDestroy(c_xq_ev);
-        for (void* p : {c_pbuf, c_pdst})
+        for (void* p : {c_pbuf, c_pdst, zc_chk})
             if (p) cudaFree(p);
         for (int i = 0; i < 2; ++i) {
             if (c_copied[i]) cudaEventDestroy(c_copied[i]);
@@ -2715,6 +2716,44 @@ static bool peer_admit(Ds41MoeImpl& im, int64_t layer, int32_t e) {
     return true;
 }
 
+/// STRATA_SUM_ZEROCOPY (origin b20620792, opt-in; here for two peers and for the verify pass too): 1 = the decode sums
+/// read the CPU pool's and the peers' rows where they landed - their pinned host pads - and take the weights by value
+/// (decode_rows_sum_src): no per-row (gpu_run) / per-peer (gpu_run_n_ex) deposit copy, no list upload, no scatter, no
+/// weights upload on the stream the sum waits on.  2 = check: the deposit sum runs as before AND the zero-copy one into
+/// a scratch row, compared bit for bit after the sum's sync ("[sum-zc-check]" lines; the deposit result is used).
+int sum_zerocopy_mode() {
+    static const int m = [] {
+        const char* v = std::getenv("STRATA_SUM_ZEROCOPY");
+        const int r = v && (v[0] == '1' || v[0] == '2') ? v[0] - '0' : 0;
+        if (r) std::fprintf(stderr, "decode sum: zero-copy rows%s (STRATA_SUM_ZEROCOPY=%d)\n", r == 2 ? ", checked against the deposit sum" : "", r);
+        return r;
+    }();
+    return m;
+}
+
+float* sum_zerocopy_scratch(Gpu& gp, int64_t H) {
+    if (!gp.zc_chk) ck(cudaMalloc(&gp.zc_chk, (size_t) kMaxEnt * (size_t) H * 4), "zc check rows");
+    return (float*) gp.zc_chk;
+}
+
+/// check mode: n rows of the deposit sum (a) vs the zero-copy sum (b), both on the device and complete (after the sync)
+void sum_zerocopy_compare(const void* a_dev, const void* b_dev, int64_t n, int64_t H, int64_t layer, const char* site) {
+    static int64_t calls = 0, rows = 0, bad = 0;
+    std::vector<float> a((size_t) (n * H)), b((size_t) (n * H));
+    ck(cudaMemcpy(a.data(), a_dev, a.size() * 4, cudaMemcpyDeviceToHost), "zc check a");
+    ck(cudaMemcpy(b.data(), b_dev, b.size() * 4, cudaMemcpyDeviceToHost), "zc check b");
+    int64_t nb = 0;
+    for (int64_t r = 0; r < n; ++r)
+        nb += std::memcmp(a.data() + r * H, b.data() + r * H, (size_t) H * 4) != 0;
+    ++calls; rows += n; bad += nb;
+    if (nb && bad - nb < 20)
+        std::fprintf(stderr, "[sum-zc-check] MISMATCH %s layer %lld: %lld of %lld rows differ\n", site, (long long) layer,
+                     (long long) nb, (long long) n);
+    if (calls % 4000 == 0)
+        std::fprintf(stderr, "[sum-zc-check] %lld calls, %lld rows, %lld differing\n", (long long) calls, (long long) rows,
+                     (long long) bad);
+}
+
 bool gpu_run(Ds41MoeImpl& im, int64_t layer, const int32_t* ids6, const float* w6, const float* x_host,
              const void* x_dev, float* out, void* out_dev = nullptr) {
     static const bool prof = std::getenv("DS4_TIER_PROF") != nullptr;
@@ -3506,12 +3545,19 @@ bool gpu_run(Ds41MoeImpl& im, int64_t layer, const int32_t* ids6, const float* w
         // ---- the weighted sum on the card, straight into the caller's device row (run_to_dev): the pool's rows go
         // up into their routing-index rows of d_parts (beside the card's own), the weights through the metadata
         // block, and decode_rows_sum adds them in k order in double - the host loop below, bit for bit - with no
-        // parts readback and no host -> device trip for the sum
+        // parts readback and no host -> device trip for the sum.  STRATA_SUM_ZEROCOPY: the pool's and the peers' rows
+        // are read where they landed instead (rsrc), the weights by value.
+        const int sum_zc = !peer_check && K <= strata::kernels::kRowSrcMax ? sum_zerocopy_mode() : 0;
+        const float* rsrc[strata::kernels::kRowSrcMax];
+        if (sum_zc)
+            for (int64_t k = 0; k < K; ++k) rsrc[k] = (const float*) gp.d_parts + (size_t) k * (size_t) H;
         for (int i = 0; i < nk; ++i) {
             const int k = cpu_keep[i];
             if (wloc[k] == 0.0f) continue;
             float* hrow = (float*) gp.h_parts + (size_t) k * (size_t) H;
             std::memcpy(hrow, im.parts.data() + (size_t) k * (size_t) H, (size_t) H * 4);
+            if (sum_zc) rsrc[k] = hrow;
+            if (sum_zc == 1) continue;
             ck(cudaMemcpyAsync((float*) gp.d_parts + (size_t) k * (size_t) H, hrow, (size_t) H * 4, cudaMemcpyHostToDevice,
                                gp.s), "cpu row h2d");
         }
@@ -3598,22 +3644,26 @@ bool gpu_run(Ds41MoeImpl& im, int64_t layer, const int32_t* ids6, const float* w
                 bool first = true;
                 for (int j = 0; j < i; ++j) first = first && peer_p[j] != &pg;
                 if (first) { peer_wait(pg); ++pg.launches; }
-                ck(cudaMemcpyAsync((float*) gp.d_parts + (size_t) peer_i[i] * (size_t) H,
-                                   pg.h_parts + (size_t) peer_r[i] * (size_t) H, (size_t) H * 4, cudaMemcpyHostToDevice,
-                                   gp.s), "peer row h2d");
+                if (sum_zc) rsrc[peer_i[i]] = pg.h_parts + (size_t) peer_r[i] * (size_t) H;   // after the wait above
+                if (sum_zc != 1)
+                    ck(cudaMemcpyAsync((float*) gp.d_parts + (size_t) peer_i[i] * (size_t) H,
+                                       pg.h_parts + (size_t) peer_r[i] * (size_t) H, (size_t) H * 4, cudaMemcpyHostToDevice,
+                                       gp.s), "peer row h2d");
                 ++pg.rows;
             }
         }
         // the sum weights live AFTER the captured blocks under STRATA_TIER_GRAPH (the graph's nodes must never see
         // them rewritten), and in the running region otherwise
         size_t o_w = grp_graph ? gp.tier_w_off : ((gt.at + 15) & ~(size_t) 15);
-        if (o_w + sizeof(float) * (size_t) K > kMetaBytes) {
-            ck(cudaStreamSynchronize(gp.s), "meta wrap");
-            o_w = 0;
+        if (sum_zc != 1) {   // zero-copy: the weights go by value
+            if (o_w + sizeof(float) * (size_t) K > kMetaBytes) {
+                ck(cudaStreamSynchronize(gp.s), "meta wrap");
+                o_w = 0;
+            }
+            std::memcpy(gp.h_meta + o_w, wloc, sizeof(float) * (size_t) K);
+            ck(cudaMemcpyAsync((uint8_t*) gp.d_meta + o_w, gp.h_meta + o_w, sizeof(float) * (size_t) K, cudaMemcpyHostToDevice,
+                               gp.s), "sum weights");
         }
-        std::memcpy(gp.h_meta + o_w, wloc, sizeof(float) * (size_t) K);
-        ck(cudaMemcpyAsync((uint8_t*) gp.d_meta + o_w, gp.h_meta + o_w, sizeof(float) * (size_t) K, cudaMemcpyHostToDevice,
-                           gp.s), "sum weights");
         // STRATA_PARTS_HASH=1 (diagnostic): the k rows this call summed, hashed - the first call whose hash differs
         // between two runs is the call whose expert placement diverged
         static const bool parts_hash = std::getenv("STRATA_PARTS_HASH") != nullptr;
@@ -3631,9 +3681,14 @@ bool gpu_run(Ds41MoeImpl& im, int64_t layer, const int32_t* ids6, const float* w
             for (int64_t k = 0; k < K; ++k) std::fprintf(stderr, " %d", slot_i[k]);
             std::fprintf(stderr, " ]\n");
         }
-        strata::kernels::decode_rows_sum((const float*) gp.d_parts, (const float*) ((uint8_t*) gp.d_meta + o_w), (int) K, H,
-                                         (float*) out_dev, gp.s);
+        if (sum_zc == 1)
+            strata::kernels::decode_rows_sum_src(rsrc, wloc, (int) K, H, (float*) out_dev, gp.s);
+        else
+            strata::kernels::decode_rows_sum((const float*) gp.d_parts, (const float*) ((uint8_t*) gp.d_meta + o_w), (int) K, H,
+                                             (float*) out_dev, gp.s);
+        if (sum_zc == 2) strata::kernels::decode_rows_sum_src(rsrc, wloc, (int) K, H, sum_zerocopy_scratch(gp, H), gp.s);
         ck(cudaStreamSynchronize(gp.s), "sum sync");
+        if (sum_zc == 2) sum_zerocopy_compare(out_dev, gp.zc_chk, 1, H, layer, "decode");
     } else {
     ck(cudaMemcpyAsync(gp.h_parts, gp.d_parts, (size_t) std::max<int64_t>(kMaxParts, K) * (size_t) H * 4,
                        cudaMemcpyDeviceToHost, gp.s), "d2h parts");
@@ -4612,12 +4667,20 @@ bool gpu_run_n_ex(Ds41MoeImpl& im, int64_t layer, int nt, const int32_t* ids, co
         }
         // ---- the weighted sum on the card, per token (as run_to_dev): the pool's rows go up into their
         // routing-index rows of d_parts, the pass's weights through the metadata block, and decode_rows_sum
-        // adds one token's K rows in double - the host loop, bit for bit. ----
+        // adds one token's K rows in double - the host loop, bit for bit.  STRATA_SUM_ZEROCOPY: the pool's and the
+        // peers' rows are read where they landed instead (rsrc_n), the weights by value: no pad copies, no list
+        // upload, no scatter, no weights upload. ----
+        const int sum_zc = K <= strata::kernels::kRowSrcMax && NE <= kMaxEnt ? sum_zerocopy_mode() : 0;
+        const float* rsrc_n[kMaxEnt];
+        if (sum_zc)
+            for (int j = 0; j < NE; ++j) rsrc_n[j] = (const float*) gp.d_parts + (size_t) j * (size_t) H;
         for (int j = 0; j < NE; ++j) {
             if (wl[j] == 0.0f) continue;
             if (cls[ent_u[j]] != CPU) continue;
             float* hrow = (float*) gp.h_parts + (size_t) j * (size_t) H;
             std::memcpy(hrow, im.parts_n.data() + (size_t) j * (size_t) H, (size_t) H * 4);
+            if (sum_zc) rsrc_n[j] = hrow;
+            if (sum_zc == 1) continue;
             ck(cudaMemcpyAsync((float*) gp.d_parts + (size_t) j * (size_t) H, hrow, (size_t) H * 4, cudaMemcpyHostToDevice,
                                gp.s), "cpu row h2d");
         }
@@ -4633,6 +4696,11 @@ bool gpu_run_n_ex(Ds41MoeImpl& im, int64_t layer, int nt, const int32_t* ids, co
                 }
                 ++pg.launches;
             }
+            if (sum_zc)   // after the waits above: each entry's row straight from its peer's pad
+                for (int r = 0; r < npe; ++r) rsrc_n[pe_j[r]] = pe_p[r]->h_parts + (size_t) pe_r[r] * (size_t) H;
+            if (sum_zc == 1)
+                for (int r = 0; r < npe; ++r) ++pe_p[r]->rows;
+            else {
             // every peer's pad up in ONE copy (its compact rows, in order) into the staging buffer the chunk helper
             // also uses, then one scatter kernel into the routing-index rows of d_parts.  Before: one 20 KB
             // cudaMemcpyAsync per row, ~25 a layer with two stores holding 70% of the entries - a quarter of the
@@ -4659,7 +4727,13 @@ bool gpu_run_n_ex(Ds41MoeImpl& im, int64_t layer, int nt, const int32_t* ids, co
             // pageable: the driver stages it before returning (as the chunk helper's list)
             ck(cudaMemcpyAsync(gp.c_pdst, pdst, sizeof(int32_t) * (size_t) at, cudaMemcpyHostToDevice, gp.s), "peer rows dst");
             strata::kernels::rows_scatter((const float*) gp.c_pbuf, (const int32_t*) gp.c_pdst, at, H, (float*) gp.d_parts, gp.s);
+            }   // sum_zc != 1
         }
+        if (sum_zc == 1) {
+            for (int t = 0; t < nt; ++t)
+                strata::kernels::decode_rows_sum_src(rsrc_n + (size_t) t * (size_t) K, wl + (size_t) t * (size_t) K, (int) K, H,
+                                                     (float*) out_dev + (size_t) t * (size_t) H, gp.s);
+        } else {
         const size_t o_w = 0;   // [0, kMetaW): the pass's weights (NE <= kMaxEnt floats); the launches' metadata sits above
         static_assert(sizeof(float) * kMaxEnt <= 1024, "the weights must fit below kMetaW");
         std::memcpy(gp.h_meta + o_w, wl, sizeof(float) * (size_t) NE);
@@ -4669,8 +4743,14 @@ bool gpu_run_n_ex(Ds41MoeImpl& im, int64_t layer, int nt, const int32_t* ids, co
             strata::kernels::decode_rows_sum((const float*) gp.d_parts + (size_t) t * (size_t) K * (size_t) H,
                                              (const float*) ((uint8_t*) gp.d_meta + o_w) + (size_t) t * (size_t) K,
                                              (int) K, H, (float*) out_dev + (size_t) t * (size_t) H, gp.s);
+        if (sum_zc == 2)
+            for (int t = 0; t < nt; ++t)
+                strata::kernels::decode_rows_sum_src(rsrc_n + (size_t) t * (size_t) K, wl + (size_t) t * (size_t) K, (int) K, H,
+                                                     sum_zerocopy_scratch(gp, H) + (size_t) t * (size_t) H, gp.s);
+        }   // sum_zc != 1
         if (xprof) { xh[4] += now_ms() - t0; ck(cudaEventRecord(gp.ev_t[3], gp.s), "prof t3"); }
         ck(cudaStreamSynchronize(gp.s), "sum sync");
+        if (sum_zc == 2) sum_zerocopy_compare(out_dev, gp.zc_chk, nt, H, layer, "verify");
         if (xprof) {
             float ms = 0;
             for (int i = 1; i < 4; ++i) { ms = 0; if (cudaEventElapsedTime(&ms, gp.ev_t[0], gp.ev_t[i]) == cudaSuccess) xg[i - 1] += ms; else (void) cudaGetLastError(); }
