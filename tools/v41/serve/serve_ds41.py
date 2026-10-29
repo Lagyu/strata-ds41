@@ -465,6 +465,50 @@ F.OutputParser.feed = _op_feed_ds41
 F.OutputParser.finish = _op_finish_ds41
 S.OutputParser = F.OutputParser
 
+# ---- a forced tool call (tool_choice "required" / a named tool; Xolotl 4b1e05a97 + 34ac0f1aa, the serve part)
+# frontend.forced_call opens the call in Qwen's `<tool_call>\n<function=NAME>` shape, text a DeepSeek prompt never shows
+# the model before a call.  The opening here is exactly what DeepSeek's encoder writes before an assistant message's
+# tool call ("</think>" + content + "\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"X\">\n<｜DSML｜ parameter ..."): with the
+# `calls` wrapper and the line break after the name - without them V4.1-1017 wrote its arguments in another shape and the
+# call parsed with `arguments: {}`.  The parser is fed the same opening (ds41_translate drops the wrapper); without
+# thinking the prompt ends with "</think>", so prepare() puts the encoder's blank line before the opening (prompt only).
+FORCED_HEAD = CALLS_OPEN + "\n" + INVOKE_OPEN + ' name="'
+
+
+def ds41_forced_call(tool_choice, tools):
+    """tool_choice -> the DSML text that opens the call the reply must make (None: the model decides)."""
+    kind, name = F.tool_choice_of(tool_choice)
+    names = {t.get("name") for t in tools or [] if isinstance(t, dict)}
+    if kind in ("auto", "none"):
+        return None
+    if kind == "required" and len(names) == 1:     # one tool to call: name it, the model cannot invent another
+        kind, name = "named", next(iter(names))
+    if kind == "required" and names:
+        return FORCED_HEAD                          # the model names one of the tools
+    if kind == "named" and name in names:
+        return FORCED_HEAD + f'{name}">\n'
+    print(f"[strata] tool_choice {json.dumps(tool_choice)[:200]} is not supported here (or names no tool of the "
+          "request): the model decides, as with \"auto\"", flush=True)
+    return None
+
+
+F.forced_call = ds41_forced_call
+if hasattr(S, "forced_call"):
+    S.forced_call = ds41_forced_call
+_svc_prepare = S.Service.prepare
+
+
+def _prepare_ds41(self, messages, tools, kwargs, max_new=None, force=None, **k):
+    """Without thinking the forced opening ends the prompt (Service.prepare); V4.1's chat prompt ends with "</think>"
+    and its encoder puts a blank line between that and the `calls` block.  Only the prompt gets it: Service.run feeds
+    the parser the opening itself, and a blank line there is no answer text."""
+    if force and kwargs.get("enable_thinking", True) is False and force.startswith(CALLS_OPEN):
+        force = "\n\n" + force
+    return _svc_prepare(self, messages, tools, kwargs, max_new, force=force, **k)
+
+
+S.Service.prepare = _prepare_ds41
+
 # ---- "parallel": N (#465's batch slots) on the DeepSeek-V4.1 engine.  ds41_generate --serve runs Strata's slot protocol
 # itself (BGEN / BADM / BT / BDONE / BSTOP / BYIELD: the server's generate_batched, unchanged) when started with
 # --batch N (= its --batch-slots N): INFO batch_slots=N.  The server's own parallel_args is Strata's: it skips the flag
