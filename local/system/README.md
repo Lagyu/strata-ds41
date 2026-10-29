@@ -11,6 +11,7 @@ Copies of the files outside the repository that the LLM server relies on, at the
 | `etc/default/grub.d/90-maya-iommu.cfg` | `iommu=pt`: with Ubuntu's default translated DMA the x16 RX 7900 XTX read pinned RAM at ~19 GB/s (Windows: ~22-27 GB/s). |
 | `etc/default/grub.d/91-amdgpu-overdrive.cfg` | `amdgpu.ppfeaturemask` with the overdrive bit, which the undervolt needs. |
 | `etc/amdgpu-undervolt.conf`, `usr/local/sbin/amdgpu-undervolt`, `etc/systemd/system/amdgpu-undervolt.service` | Both RX 7900 XTX: core clock cap 2800 MHz and 1040 mV (a -110 mV offset), applied at boot. |
+| `etc/r9700-undervolt.conf`, `usr/local/sbin/r9700-undervolt`, `etc/systemd/system/r9700-undervolt.service` | The R9700 (matched by its Gigabyte subsystem id 1458:242f, so any slot): a -100 mV voltage offset, no clock change, applied at boot and read back; on any mismatch only the offset is restored. Since 2026-10-25. |
 | `usr/local/sbin/amdgpu-fans.sh`, `etc/systemd/system/amdgpu-fans.service` | GPU fan curves with a 50 % floor, for airflow over the M.2 drives that stream the experts. |
 | `usr/local/sbin/fans-max.sh`, `etc/systemd/system/fans-max.service` | The board's fan headers at full speed (cools the OCuLink adapter). |
 | `usr/local/sbin/cpu-power-cap.sh`, `etc/systemd/system/cpu-power-cap.service` | CPU package power cap (PL1 110 W / PL2 140 W). Disabled since 2026-10-21, after a CPU re-paste. |

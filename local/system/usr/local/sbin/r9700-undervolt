@@ -1,0 +1,105 @@
+#!/usr/bin/python3
+"""Apply the configured voltage offset only to the installed Gigabyte R9700."""
+
+import configparser
+from pathlib import Path
+import re
+import sys
+import time
+
+
+IDENTITY = {
+    "vendor": "0x1002",
+    "device": "0x7551",
+    "subsystem_vendor": "0x1458",
+    "subsystem_device": "0x242f",
+}
+OFFSET = re.compile(r"(?m)^OD_VDDGFX_OFFSET:\n(-?\d+)mV$")
+LIMITS = re.compile(r"(?m)^VDDGFX_OFFSET:\s+(-?\d+)mv\s+(-?\d+)mv$")
+
+
+def matching_cards():
+    cards = []
+    for device in sorted(Path("/sys/bus/pci/devices").glob("*")):
+        try:
+            if all((device / key).read_text().strip() == value
+                   for key, value in IDENTITY.items()):
+                cards.append(device)
+        except OSError:
+            continue
+    return cards
+
+
+def wait_for_card():
+    deadline = time.monotonic() + 60
+    while True:
+        cards = matching_cards()
+        if len(cards) > 1:
+            raise RuntimeError("Multiple matching R9700 cards; refusing ambiguous selection")
+        if cards:
+            try:
+                table = (cards[0] / "pp_od_clk_voltage").read_text()
+                if OFFSET.search(table) and LIMITS.search(table):
+                    return cards[0], table
+            except OSError:
+                pass
+        if time.monotonic() >= deadline:
+            raise RuntimeError("Matching R9700 voltage interface not ready after 60 seconds")
+        time.sleep(1)
+
+
+def read_offset(table):
+    match = OFFSET.search(table)
+    if not match:
+        raise RuntimeError("Cannot read the R9700 voltage offset")
+    return int(match.group(1))
+
+
+def main():
+    config = configparser.ConfigParser()
+    with open("/etc/r9700-undervolt.conf") as config_file:
+        config.read_file(config_file)
+    requested = config.getint("undervolt", "voltage_offset_mv")
+    if requested > 0:
+        raise RuntimeError("Undervolt offset must be zero or negative")
+    device, before = wait_for_card()
+    limits = LIMITS.search(before)
+    if not int(limits.group(1)) <= requested <= int(limits.group(2)):
+        raise RuntimeError(f"Offset {requested} mV is outside the card's reported range")
+    previous = read_offset(before)
+    if previous == requested:
+        print(f"{device.name}: verified voltage offset {requested} mV (already applied)")
+        return
+    control_names = ("power/control", "power_dpm_force_performance_level")
+    controls = {name: (device / name).read_text() for name in control_names}
+    overdrive = device / "pp_od_clk_voltage"
+    try:
+        overdrive.write_text(f"vo {requested}\n")
+        overdrive.write_text("c\n")
+        after = overdrive.read_text()
+        if read_offset(after) != requested:
+            raise RuntimeError("Voltage offset readback mismatch")
+        if OFFSET.sub("VOLTAGE_OFFSET", before) != OFFSET.sub("VOLTAGE_OFFSET", after):
+            raise RuntimeError("Unexpected change to another overdrive setting")
+        if any((device / name).read_text() != value for name, value in controls.items()):
+            raise RuntimeError("Unexpected change to a power/performance mode")
+    except Exception:
+        # Restore only the voltage offset; never reset the full overdrive table.
+        try:
+            overdrive.write_text(f"vo {previous}\n")
+            overdrive.write_text("c\n")
+            if read_offset(overdrive.read_text()) != previous:
+                raise RuntimeError("Rollback readback mismatch")
+            print(f"{device.name}: restored previous offset {previous} mV", file=sys.stderr)
+        except Exception as error:
+            print(f"{device.name}: voltage rollback failed: {error}", file=sys.stderr)
+        raise
+    print(f"{device.name}: applied and verified voltage offset {requested} mV")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as error:
+        print(f"r9700-undervolt: {error}", file=sys.stderr)
+        sys.exit(1)

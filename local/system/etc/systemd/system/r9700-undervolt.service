@@ -1,0 +1,12 @@
+[Unit]
+Description=Radeon AI PRO R9700 voltage offset (/etc/r9700-undervolt.conf)
+After=systemd-modules-load.service systemd-udev-trigger.service amdgpu-undervolt.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/r9700-undervolt
+TimeoutStartSec=90
+
+[Install]
+WantedBy=multi-user.target
