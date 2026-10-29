@@ -516,6 +516,29 @@ struct B {
     ggml_tensor * flat2(ggml_tensor * t, int64_t ne0, int64_t ne1) const {
         return ggml_is_contiguous(t) ? ggml_reshape_2d(c, t, ne0, ne1) : ggml_cont_2d(c, t, ne0, ne1);
     }
+    /// The lightning indexer's [nk, nq] scores.  STRATA_INDEXER_NVIS=1 (xolotl 0ca66b79a, opt-in): the queries' visible-row
+    /// counts go to the kernel as they are ([1, nq] f32: row i visible to query t iff i < nvis_t) and it skips the key
+    /// blocks a query cannot see - bit-identical scores (test_ds41_indexer).  Off: the [nk, nq] f16 additive mask built
+    /// from the counts with five ops, as before; *vis = that mask in f32 (null with NVIS: the caller re-derives it).
+    ggml_tensor * indexer(ggml_tensor * q, ggml_tensor * k, ggml_tensor * w, ggml_tensor * nvis, ggml_tensor ** vis) const {
+        static const bool fast = [] {
+            const bool on = env_on("STRATA_INDEXER_NVIS", false);
+            if (on) std::fprintf(stderr, "indexer: per-query visible-row counts, invisible key blocks skipped (STRATA_INDEXER_NVIS=1)\n");
+            return on;
+        }();
+        *vis = nullptr;
+        if (fast) return ggml_lightning_indexer(c, q, k, w, nvis);
+        const int64_t nk = k->ne[2], nq = q->ne[2];
+        ggml_tensor * ramp = ggml_view_2d(c, im->neg_ramp, nk, 1, (size_t) nk * 4, 0);
+        *vis = ggml_log(c, ggml_step(c, ggml_add(c, ggml_repeat(c, ramp, ggml_new_tensor_2d(c, GGML_TYPE_F32, nk, nq)), nvis)));
+        return ggml_lightning_indexer(c, q, k, w, ggml_cast(c, *vis, GGML_TYPE_F16));
+    }
+    /// the visibility mask at the selected rows s1 ([K, nq] i32): from vis when the indexer built it, else from the counts
+    /// (log(step(nvis_t - i)) = 0 / -inf, the same values)
+    ggml_tensor * vis_at(ggml_tensor * vis, ggml_tensor * s1, ggml_tensor * nvis, int64_t nk, int64_t K, int64_t nq) const {
+        if (vis) return ggml_reshape_2d(c, ggml_get_rows(c, ggml_reshape_3d(c, vis, 1, nk, nq), s1), K, nq);
+        return ggml_log(c, ggml_step(c, ggml_add(c, ggml_scale(c, ggml_cast(c, s1, GGML_TYPE_F32), -1.0f), nvis)));
+    }
     ggml_tensor * rms_w(ggml_tensor * x, ggml_tensor * wt) const {
         return ggml_mul(c, ggml_rms_norm(c, x, (float) g->rms_eps), wt);
     }
@@ -827,9 +850,8 @@ static ggml_tensor * attn_core_slab(Ds41Dense::Impl & im, ggml_context * gc, con
                         ggml_tensor * iq_c = wq ? iq : ggml_view_3d(gc, iq, im.ID, im.IH, nq, iq->nb[1], iq->nb[2], (size_t) q0 * iq->nb[2]);
                         ggml_tensor * iw_c = wq ? iw : ggml_view_2d(gc, iw, im.IH, nq, iw->nb[1], (size_t) q0 * iw->nb[1]);
                         ggml_tensor * nvs = ggml_reshape_2d(gc, b.v1(im.i_nvis[r], nq, c0q * 4), 1, nq);
-                        ggml_tensor * ramp = ggml_view_2d(gc, im.neg_ramp, gcap, 1, (size_t) gcap * 4, 0);
-                        ggml_tensor * vis = ggml_log(gc, ggml_step(gc, ggml_add(gc, ggml_repeat(gc, ramp, ggml_new_tensor_2d(gc, GGML_TYPE_F32, gcap, nq)), nvs)));
-                        ggml_tensor * sc = ggml_lightning_indexer(gc, iq_c, ksrc, iw_c, ggml_cast(gc, vis, GGML_TYPE_F16));
+                        ggml_tensor * vis = nullptr;
+                        ggml_tensor * sc = b.indexer(iq_c, ksrc, iw_c, nvs, &vis);
                         sc = ggml_reshape_2d(gc, sc, gcap, nq);
                         if (L.uses_cand) {
                             const int64_t nblk = (gcap + im.CBS - 1) / im.CBS, ncb = std::min<int64_t>(im.CB, nblk);
@@ -854,7 +876,7 @@ static ggml_tensor * attn_core_slab(Ds41Dense::Impl & im, ggml_context * gc, con
                         s1 = ggml_reshape_2d(gc, ggml_get_rows(gc, ggml_reshape_3d(gc, s1, 1, K, nq),
                                                                ggml_argsort(gc, ggml_cast(gc, s1, GGML_TYPE_F32),
                                                                             GGML_SORT_ORDER_ASC)), K, nq);   // canonical order (build_attn)
-                        ggml_tensor * m1 = ggml_reshape_2d(gc, ggml_get_rows(gc, ggml_reshape_3d(gc, vis, 1, gcap, nq), s1), K, nq);
+                        ggml_tensor * m1 = b.vis_at(vis, s1, nvs, gcap, K, nq);
                         outs.push_back(ggml_cpy(gc, s1, ggml_view_2d(gc, L.sel, K, nq, L.sel->nb[1], c0q * L.sel->nb[1])));
                         outs.push_back(ggml_cpy(gc, m1, ggml_view_2d(gc, L.selm, K, nq, L.selm->nb[1], c0q * L.selm->nb[1])));
                     }
@@ -1097,9 +1119,8 @@ static ggml_cgraph * build_attn(Ds41Dense::Impl & im, ggml_context * gc, int il,
                         ggml_tensor * iw_c = wq ? iw : ggml_view_2d(gc, iw, im.IH, nq, iw->nb[1], (size_t) q0 * iw->nb[1]);
                         // visibility: row i visible to query t iff i < nvis_t  -> 0 / -inf
                         ggml_tensor * nvs = ggml_reshape_2d(gc, b.v1(im.i_nvis[r], nq, c0q * 4), 1, nq);
-                        ggml_tensor * ramp = ggml_view_2d(gc, im.neg_ramp, gcap, 1, (size_t) gcap * 4, 0);
-                        ggml_tensor * vis = ggml_log(gc, ggml_step(gc, ggml_add(gc, ggml_repeat(gc, ramp, ggml_new_tensor_2d(gc, GGML_TYPE_F32, gcap, nq)), nvs)));
-                        ggml_tensor * sc = ggml_lightning_indexer(gc, iq_c, ksrc, iw_c, ggml_cast(gc, vis, GGML_TYPE_F16));   // [cap, nq]
+                        ggml_tensor * vis = nullptr;
+                        ggml_tensor * sc = b.indexer(iq_c, ksrc, iw_c, nvs, &vis);   // [cap, nq]
                         sc = ggml_reshape_2d(gc, sc, gcap, nq);
                         if (L.uses_cand) {   // rank only inside cand_layer's candidate blocks
                             const int64_t nblk = (gcap + im.CBS - 1) / im.CBS, ncb = std::min<int64_t>(im.CB, nblk);
@@ -1131,7 +1152,7 @@ static ggml_cgraph * build_attn(Ds41Dense::Impl & im, ggml_context * gc, int il,
                         s1 = ggml_reshape_2d(gc, ggml_get_rows(gc, ggml_reshape_3d(gc, s1, 1, K, nq),
                                                                ggml_argsort(gc, ggml_cast(gc, s1, GGML_TYPE_F32),
                                                                             GGML_SORT_ORDER_ASC)), K, nq);
-                        ggml_tensor * m1 = ggml_reshape_2d(gc, ggml_get_rows(gc, ggml_reshape_3d(gc, vis, 1, gcap, nq), s1), K, nq);   // vis at sel
+                        ggml_tensor * m1 = b.vis_at(vis, s1, nvs, gcap, K, nq);   // vis at sel
                         // the chunk's writes go to outs now, so the graph runs (and frees) this chunk before the next
                         outs.push_back(ggml_cpy(gc, s1, ggml_view_2d(gc, L.sel, K, nq, L.sel->nb[1], c0q * L.sel->nb[1])));
                         outs.push_back(ggml_cpy(gc, m1, ggml_view_2d(gc, L.selm, K, nq, L.selm->nb[1], c0q * L.selm->nb[1])));

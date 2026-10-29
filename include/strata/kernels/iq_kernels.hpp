@@ -80,6 +80,11 @@ void weighted_rows_sum(const float* parts, const float* w, int K, int64_t H, int
 /// One decode token's top-k mix on the card: out[i] = sum_k w[k] * parts[k * H + i] in double, k in order (== the
 /// tier's host loop bit for bit); w[k] == 0 skips row k.
 void decode_rows_sum(const float* parts, const float* w, int K, int64_t H, float* out, void* stream);
+/// decode_rows_sum with row k read from src[k] - device memory, or pinned host memory the card reads over the bus (a
+/// peer's or the CPU pool's landing pad) - and the weights passed by value: no deposit copies, no weights upload.  The
+/// same double accumulation in k order, so bit for bit the sum decode_rows_sum gives over the deposited rows.
+constexpr int kRowSrcMax = 16;
+void decode_rows_sum_src(const float* const* src, const float* w, int K, int64_t H, float* out, void* stream);
 /// The prompt chunk's peer helper: rows [0, n) of `src` (H floats each) to rows dst[r] of `out`.
 void rows_scatter(const float* src, const int32_t* dst, int64_t n, int64_t H, float* out, void* stream);
 
