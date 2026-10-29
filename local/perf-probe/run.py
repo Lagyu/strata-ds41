@@ -109,6 +109,8 @@ for name, piece in (('A1_+150', 'new150'), ('A2_+400', 'new400'), ('A3_+1000', '
 gen('bench_W', pc['W'], 200)
 gen('bench_S1', pc['S1'], 200)
 gen('copy_task', pc['copy_task'], 400)
+if 'L' in pc:   # the payload's optional long fresh read (build_payload.py PROBE_LONG=N)
+    gen('long_read', pc['L'], 40)
 proc.stdin.write('QUIT\n')
 proc.stdin.flush()
 try:

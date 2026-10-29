@@ -60,6 +60,8 @@ pieces = {
     'S1': piece('158', 600000, 2500),
     'copy_task': copy_ids,
 }
+if os.environ.get('PROBE_LONG'):   # opt-in: one long fresh read (prompt-batch / long-context tests), e.g. PROBE_LONG=32768
+    pieces['L'] = piece('135', 1200000, int(os.environ['PROBE_LONG']))
 for k, v in pieces.items():
     np.asarray(v, np.int32).tofile(f'{out}/{k}.i32')
     print(f'{k:10s} {len(v):5d} tokens')
