@@ -172,6 +172,9 @@ inline uint64_t mem_available_bytes() {
     return GlobalMemoryStatusEx(&m) ? (uint64_t) m.ullAvailPhys : 0;
 }
 
+/// O_DIRECT's alignment rules for an open file: unknown here (callers keep page alignment).
+inline bool dio_align(int, uint32_t&, uint32_t&) { return false; }
+
 #else  // POSIX: the calls the engine always made
 
 inline int open(const char* path, int flags, int mode = 0) { return ::open(path, flags, mode); }
@@ -203,6 +206,23 @@ inline uint64_t mem_available_bytes() {
         if (std::sscanf(line, "MemAvailable: %llu kB", (unsigned long long*) &kb) == 1) break;
     std::fclose(f);
     return kb * 1024;
+}
+
+/// O_DIRECT's alignment rules for an open file (statx STATX_DIOALIGN, Linux >= 6.1): the multiple a file offset and a
+/// length must be, and the memory alignment.  False = unknown (callers keep page alignment).
+inline bool dio_align(int fd, uint32_t& off_align, uint32_t& mem_align) {
+#if defined(__linux__) && defined(STATX_DIOALIGN)
+    struct statx sx{};
+    if (::statx(fd, "", AT_EMPTY_PATH, STATX_DIOALIGN, &sx) != 0 || !(sx.stx_mask & STATX_DIOALIGN) ||
+        sx.stx_dio_offset_align == 0 || sx.stx_dio_mem_align == 0)
+        return false;
+    off_align = sx.stx_dio_offset_align;
+    mem_align = sx.stx_dio_mem_align;
+    return true;
+#else
+    (void) fd; (void) off_align; (void) mem_align;
+    return false;
+#endif
 }
 
 #endif

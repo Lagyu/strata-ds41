@@ -240,8 +240,9 @@ public:
 private:
     struct Span { uint64_t off = 0, bytes = 0; int shard = 0; };   ///< shard: which file of a split model holds it
     void spans(int64_t l, int64_t e, Span s[3]) const;
-    /// One 4096-aligned `pread` of [off, off+n) through the O_DIRECT twin fd, sliced out of `scratch`.  False when
-    /// there is no twin fd or the bounce is too small (the caller then falls back to the buffered `read`).
+    /// [off, off+n) through an O_DIRECT fd: straight into dst when the range and dst meet the drive's rules (dio_off_ /
+    /// dio_mem_), else one 4096-aligned `pread` sliced out of `scratch`.  False when there is no O_DIRECT fd or the bounce
+    /// is too small (the caller then falls back to the buffered `read`).
     bool read_direct(uint64_t off, size_t n, uint8_t* dst, uint8_t* scratch, size_t scratch_bytes, int fd = -1) const;
     bool open_mirror(const char* path, std::string& err);
     int mfd_ = -1;                        ///< the mirror (O_DIRECT), -1 = none
@@ -265,6 +266,10 @@ private:
     int fd_ = -1;
     int dfd_ = -1;               ///< O_DIRECT twin of fd_ (-1 where the filesystem refused it)
     size_t scratch_ = 0;         ///< the aligned bounce one read_direct span needs
+    /// read_direct reads straight into dst when the range and dst meet these (the strictest of every O_DIRECT fd's statx
+    /// DIOALIGN: 512 B / 4 B on the NVMe drives here, so the IQ formats' 2 KiB-multiple spans qualify too); 4096 = the
+    /// page rule (no statx, or STRATA_DIO_PAGE=1)
+    uint32_t dio_off_ = 4096, dio_mem_ = 4096;
     Ds41MoeGeom g_;
     size_t max_ = 0;
     std::vector<uint64_t> base_;          ///< [layer * 3 * n_types...] see .cpp

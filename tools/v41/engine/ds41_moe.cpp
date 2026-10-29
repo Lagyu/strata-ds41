@@ -6966,6 +6966,32 @@ bool Ds41FileBlobs::open(std::string& err) {
             std::fprintf(stderr, "blob twin: %s - share %.3f of every blob's parts\n", tp, mshare_ / 1000.0);
         }
     }
+    // O_DIRECT's real alignment rules (statx DIOALIGN) over every direct fd: read_direct then also reads the ranges that
+    // are not page-aligned but meet them straight into dst (the IQ formats' expert spans are 2 KiB multiples, so with the
+    // page rule half of them took the bounce + memcpy).  STRATA_DIO_PAGE=1 = the page rule.
+    const char* dpg = std::getenv("STRATA_DIO_PAGE");
+    if (!(dpg && dpg[0] == '1')) {
+        std::vector<int> dio;
+        for (int f : dfds_) if (f >= 0) dio.push_back(f);
+        if (tfd_ >= 0) dio.push_back(tfd_);
+        if (mfd_ >= 0) dio.push_back(mfd_);
+        uint32_t oa = 0, ma = 0;
+        bool all = !dio.empty();
+        for (int f : dio) {
+            uint32_t o = 0, mm = 0;
+            if (!ds41_sys::dio_align(f, o, mm)) { all = false; break; }
+            oa = std::max(oa, o);
+            ma = std::max(ma, mm);
+        }
+        const auto pow2 = [](uint32_t v) { return v && (v & (v - 1)) == 0; };
+        if (all && pow2(oa) && pow2(ma) && oa <= 4096 && ma <= 4096) {
+            dio_off_ = oa;
+            dio_mem_ = ma;
+            if (oa < 4096 || ma < 4096)
+                std::fprintf(stderr, "blob direct reads: ranges at %u-byte multiples, memory at %u (statx DIOALIGN of %zu files)\n",
+                             oa, ma, dio.size());
+        }
+    }
     return true;
 }
 
@@ -7149,13 +7175,17 @@ bool Ds41FileBlobs::read_direct(uint64_t off, size_t n, uint8_t* dst, uint8_t* s
     // 970 mirror read 5.06 GB/s in the prompt, the same as one drive; 9 MiB O_DIRECT microbench on both drives 8.12 GB/s
     // straight vs 4.92 with the copy.  Same bytes either way; STRATA_READ_BOUNCE=1 = always the bounce (the old path).
     static const bool bounce_only = std::getenv("STRATA_READ_BOUNCE") && std::getenv("STRATA_READ_BOUNCE")[0] == '1';
-    if (!bounce_only && ((off | (uint64_t) n | (uint64_t) (uintptr_t) dst) & (A - 1)) == 0) {
-        for (size_t got = 0; got < n;) {
+    // dio_off_ / dio_mem_: the drives' own O_DIRECT rules (open(): statx DIOALIGN), at most the page
+    if (!bounce_only && (((off | (uint64_t) n) & (dio_off_ - 1)) | ((uint64_t) (uintptr_t) dst & (dio_mem_ - 1))) == 0) {
+        size_t got = 0;
+        while (got < n) {
             const ssize_t k = ds41_sys::pread(fd, dst + got, n - got, (int64_t) (off + got));
-            if (k <= 0) return false;
+            if (k <= 0) break;
             got += (size_t) k;
         }
-        return true;
+        if (got == n) return true;
+        if (got > 0) return false;   // short after a start: the caller's buffered fallback
+        // refused outright (a stricter rule than statx reported): the page-aligned bounce below
     }
     const uint64_t a0 = off & ~(A - 1), a1 = (off + n + A - 1) & ~(A - 1);
     const size_t span = (size_t) (a1 - a0);
