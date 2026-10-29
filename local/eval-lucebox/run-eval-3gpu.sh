@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
-# run-eval-3gpu.sh TAG [ENV=VAL ...] [-- EXTRA ENGINE ARGS] - run-eval.sh with the production residency (3 cards: XTX
-# primary, R9700 28 GiB + XTX 20 GiB peer stores filled from the file tier, 95 GiB arena, arena-adapt, fp4 KV, the
-# blob twin), so a rule that depends on WHICH tier an expert sits on (--skip-file, --route-bias-file with
-# STRATA_BIAS_NOW=1) is scored as decode would apply it.  The chat server must be stopped.
+# run-eval-3gpu.sh TAG [ENV=VAL ...] [-- EXTRA ENGINE ARGS] - run-eval.sh with the production residency (3 cards since
+# 2026-10-29: the R9700 (x16) primary, the two XTX (chipset x4) with 20 GiB peer stores each filled from the file tier,
+# 95 GiB arena, arena-adapt, fp4 KV; until 2026-10-26 an XTX was the primary and the R9700 a 28 GiB peer), so a rule
+# that depends on WHICH tier an expert sits on (--skip-file, --route-bias-file with STRATA_BIAS_NOW=1) is scored as
+# decode would apply it.  The chat server must be stopped.
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 TAG=$1; shift
@@ -16,7 +17,7 @@ import numpy as np
 t = np.load('$E/heldout_8x1024.npy')
 for i, s in enumerate(t): s.astype(np.int32).tofile('$O/seq%d.i32' % i)"
 for i in 0 1 2 3 4 5 6 7; do
-  env HIP_VISIBLE_DEVICES=0,1,2 STRATA_PF_NO_DUMMY=1 STRATA_NO_LARGEPAGES=1 STRATA_PEER_GIB=28,20 STRATA_PEER_FILL=file \
+  env HIP_VISIBLE_DEVICES=0,1,2 STRATA_PF_NO_DUMMY=1 STRATA_NO_LARGEPAGES=1 STRATA_PEER_GIB=20,20 STRATA_PEER_FILL=file \
     "${ENVS[@]}" "${DS41_EXE:-./build-hip/ds41_generate}" \
     -m "${MODEL:-/mnt/win/llm/DeepSeek-V4.1-Flash-1017-MXFP4-ABL.gguf}" --ids-file "$O/seq$i.i32" -n 1 --temp 0 \
     --backend cuda --experts gpu --arena-gib 95 --arena-adapt --peer-device 1,2 --ctx 4096 --kv-fp4 --threads 12 \
