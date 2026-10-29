@@ -165,6 +165,9 @@ inline int setenv(const char* name, const char* value, int overwrite) {
     return _putenv_s(name, value);
 }
 
+/// Free 2 MiB pages of the reserved hugetlb pool (Linux only).
+inline uint64_t hugetlb_2m_free_bytes() { return 0; }
+
 /// Physical memory the OS can hand out now (Linux: MemAvailable).
 inline uint64_t mem_available_bytes() {
     MEMORYSTATUSEX m{};
@@ -197,6 +200,15 @@ inline int posix_memalign(void** p, size_t align, size_t n) { return ::posix_mem
 inline void* aligned_alloc(size_t align, size_t n) { return std::aligned_alloc(align, n); }
 inline void aligned_free(void* p) { std::free(p); }
 inline int setenv(const char* name, const char* value, int overwrite) { return ::setenv(name, value, overwrite); }
+/// Free 2 MiB pages of the reserved hugetlb pool (vm.nr_hugepages), in bytes - memory MemAvailable does not count.
+inline uint64_t hugetlb_2m_free_bytes() {
+    std::FILE* f = std::fopen("/sys/kernel/mm/hugepages/hugepages-2048kB/free_hugepages", "r");
+    if (!f) return 0;
+    unsigned long long n = 0;
+    if (std::fscanf(f, "%llu", &n) != 1) n = 0;
+    std::fclose(f);
+    return (uint64_t) n << 21;
+}
 inline uint64_t mem_available_bytes() {
     std::FILE* f = std::fopen("/proc/meminfo", "r");
     if (!f) return 0;

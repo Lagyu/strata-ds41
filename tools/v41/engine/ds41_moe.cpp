@@ -1736,7 +1736,11 @@ bool Ds41MoeTier::build_arena(const std::vector<std::pair<int32_t, int32_t>>& ra
     }
     const int64_t avail = mem_available_gib();
     const int64_t gib = (int64_t) (gp.arena.bytes / 1073741824ull);
-    if (avail >= 0 && gib + (int64_t) im_->cfg.mem_floor_gib > avail) {
+    // a reserved hugetlb pool that holds the whole arena is where PinnedArena maps it (unless STRATA_NO_LARGEPAGES), and
+    // MemAvailable does not count the pool: the arena then takes none of MemAvailable (Strata 0.2.7 adds the pool the same way)
+    const uint64_t pages_2m = (gp.arena.bytes + (2ull << 20) - 1) & ~((2ull << 20) - 1);
+    const bool from_pool = !std::getenv("STRATA_NO_LARGEPAGES") && ds41_sys::hugetlb_2m_free_bytes() >= pages_2m;
+    if (avail >= 0 && (from_pool ? 0 : gib) + (int64_t) im_->cfg.mem_floor_gib > avail) {
         err = "an arena of " + std::to_string(gib) + " GiB would leave less than " +
               std::to_string((int64_t) im_->cfg.mem_floor_gib) + " GiB free (MemAvailable " +
               std::to_string(avail) + " GiB)";
