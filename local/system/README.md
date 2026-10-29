@@ -10,12 +10,13 @@ Copies of the files outside the repository that the LLM server relies on, at the
 | `home/yuya/.config/strata-ds41/lan.env.example` | Optional LAN mode for `run-ds41.sh`: listen address and API key. The real file is private (mode 600). |
 | `etc/default/grub.d/90-maya-iommu.cfg` | `iommu=pt`: with Ubuntu's default translated DMA the x16 RX 7900 XTX read pinned RAM at ~19 GB/s (Windows: ~22-27 GB/s). |
 | `etc/default/grub.d/91-amdgpu-overdrive.cfg` | `amdgpu.ppfeaturemask` with the overdrive bit, which the undervolt needs. |
-| `etc/default/grub.d/99-badram.cfg` | Reserves one weak 4 KiB DRAM page of this machine's DIMMs. Machine-specific: do not copy. |
 | `etc/amdgpu-undervolt.conf`, `usr/local/sbin/amdgpu-undervolt`, `etc/systemd/system/amdgpu-undervolt.service` | Both RX 7900 XTX: core clock cap 2800 MHz and 1040 mV (a -110 mV offset), applied at boot. |
 | `usr/local/sbin/amdgpu-fans.sh`, `etc/systemd/system/amdgpu-fans.service` | GPU fan curves with a 50 % floor, for airflow over the M.2 drives that stream the experts. |
 | `usr/local/sbin/fans-max.sh`, `etc/systemd/system/fans-max.service` | The board's fan headers at full speed (cools the OCuLink adapter). |
 | `usr/local/sbin/cpu-power-cap.sh`, `etc/systemd/system/cpu-power-cap.service` | CPU package power cap (PL1 110 W / PL2 140 W). Disabled since 2026-10-21, after a CPU re-paste. |
-| `etc/udev/rules.d/80-r9700-no-runpm.rules` | Keeps the R9700 eGPU out of runtime suspend: a failed wake from BACO left it unusable until a reboot. |
+| `etc/udev/rules.d/80-r9700-no-runpm.rules` | Keeps the R9700 out of runtime suspend: a failed wake from BACO (2026-10-21, then an OCuLink eGPU) left it unusable until a reboot. Matches the card's PCI id, so it follows the card to any slot. |
+
+The `99-badram.cfg` memmap (one weak DRAM page) was dropped on 2026-10-26 with the module that had the weak cell.
 
 To install on a similar machine (as root): copy the files to the same paths, then `systemctl daemon-reload`,
 `update-grub` (the kernel command line takes effect at the next boot), `udevadm control --reload`, and

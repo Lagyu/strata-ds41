@@ -10,9 +10,12 @@ onwards). MIT licensed, like upstream (`LICENSE`).
 ## The machine
 
 - Intel Core i7-14700K, 128 GB DDR4; Ubuntu 26.04 (kernel 7.0), ROCm 7.14
-- GPU 0: Radeon RX 7900 XTX 24 GB on PCIe x16, the primary (dense layers, attention, the most used experts)
-- GPU 1: Radeon AI PRO R9700 32 GB, an OCuLink eGPU on PCIe 4.0 x4: a peer expert store and the DSpark drafter
-- GPU 2: Radeon RX 7900 XTX 24 GB on a chipset PCIe x4 slot: a peer expert store
+- GPU 0: Radeon AI PRO R9700 32 GB on PCIe 4.0 x16 (CPU lanes), the primary (dense layers, attention, the most used
+  experts) and the DSpark drafter - since 2026-10-29; until then an XTX was the primary and the R9700 an OCuLink peer
+- GPU 1: Radeon RX 7900 XTX 24 GB, an OCuLink eGPU on a chipset M.2 x4 slot: a 20 GiB peer expert store
+- GPU 2: Radeon RX 7900 XTX 24 GB on a chipset PCIe x4 slot: a 20 GiB peer expert store
+- NVMe: the model file on a WD_BLACK SN8100 (CPU x4 slot) and its byte-identical twin on the system SSD (SK hynix P41,
+  chipset x2) - `STRATA_BLOB_TWIN` reads a share of every file-tier blob from the twin
 - Model: DeepSeek-V4.1-Flash-1017, since 2026-10-25 orcarouter's abliterated Mix-256G GGUF in the engine's layout
   (15,360 experts at ~3.4 bits: IQ2_S / IQ3_XXS / IQ3_S / MXFP4, ~212 GiB) with `--skip-file 0.10`; until then (and as
   the rollback) the checkpoint's MXFP4 experts with our own abliteration of 62 dense tensors (~269 GiB). The experts are
