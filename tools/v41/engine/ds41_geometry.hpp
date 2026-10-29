@@ -222,6 +222,18 @@ inline std::string json_num(const std::string & js, const std::string & key, dou
 }
 }  // namespace detail
 
+/// STRATA_TOPK=N: the MAIN model's experts per token - Strata 0.2.7's "Faster" mode for DeepSeek V4.1 (upstream DS4_TOPK /
+/// --experts N, src/dsv41/ds4_experts_rule.hpp): the router keeps its top N of the model's K and renormalises their weights
+/// (norm_topk), so each token reads and computes N experts.  Upstream measured 5 of 6 on 4 x R9700 (2.25 bpw): reference KL
+/// 0.10987 against 0.10833, decode +4%, an 8K prompt +6%; on a GPU that streams experts from the SSD decode +11..13%.  Only
+/// lowers K; unset = the model's own count.  Applied by the dense router (Ds41Dense) and the expert tier, not the DSpark drafter.
+inline int64_t ds41_topk_override(int64_t model_k) {
+    const char * v = std::getenv("STRATA_TOPK");
+    if (!v || !*v) return model_k;
+    const long n = std::strtol(v, nullptr, 10);
+    return n >= 1 && n < model_k ? (int64_t) n : model_k;
+}
+
 inline std::string ds41_read_geometry(const GgufModel & model, Ds41Geometry & G) {
     const GgufFile & g = model.meta();
     const MetaValue * arch = g.get("general.architecture");

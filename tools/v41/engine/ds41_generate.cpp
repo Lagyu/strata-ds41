@@ -2087,6 +2087,9 @@ int main(int argc, char ** argv) {
         // STRATA_DSPARK_CONF=<tau>, as the one-shot loop: verify only the leading drafts whose confidence-head
         // probability is >= tau (the emitted tokens are still the trunk's - only the verify width changes)
         static const float conf_tau_s = std::getenv("STRATA_DSPARK_CONF") ? (float) std::atof(std::getenv("STRATA_DSPARK_CONF")) : -1.0f;
+        // STRATA_DSPARK_CONF_CUM=1: the cut is on the running product of those probabilities (Strata 0.2.7's cumulative
+        // cut, its default 0.5 on gfx12) - the same as the per-draft cut at depth 1, stricter past it
+        static const bool conf_cum_s = std::getenv("STRATA_DSPARK_CONF_CUM") && std::getenv("STRATA_DSPARK_CONF_CUM")[0] == '1';
         std::vector<int> vt;
         std::vector<std::pair<int, double>> dist;
         auto run_pass = [&](Req & r) -> bool {
@@ -2097,7 +2100,13 @@ int main(int argc, char ** argv) {
             if (k < 0) return false;
             if (conf_tau_s >= 0) {
                 int kk = 0;
-                while (kk < k && 1.0f / (1.0f + std::exp(-r.sp_conf[kk])) >= conf_tau_s) ++kk;
+                float pc = 1.0f;
+                while (kk < k) {
+                    const float p = 1.0f / (1.0f + std::exp(-r.sp_conf[kk]));
+                    pc = conf_cum_s ? pc * p : p;
+                    if (pc < conf_tau_s) break;
+                    ++kk;
+                }
                 k = kk;
             }
             const bool refeed = r.dirty && ((r.P + 1) & 1);
@@ -3282,9 +3291,15 @@ int main(int argc, char ** argv) {
         auto sig = [](float x) { return 1.0f / (1.0f + std::exp(-x)); };
         while (emit(t)) {
             int k = std::min(spec_depth, a.n_predict - gen);   // drafts past the budget are never emitted
-            if (conf_tau >= 0) {
+            if (conf_tau >= 0) {   // STRATA_DSPARK_CONF_CUM=1: on the running product, as the serve loop
+                static const bool conf_cum = std::getenv("STRATA_DSPARK_CONF_CUM") && std::getenv("STRATA_DSPARK_CONF_CUM")[0] == '1';
                 int kk = 0;
-                while (kk < k && sig(sp_conf[kk]) >= conf_tau) ++kk;
+                float pc = 1.0f;
+                while (kk < k) {
+                    pc = conf_cum ? pc * sig(sp_conf[kk]) : sig(sp_conf[kk]);
+                    if (pc < conf_tau) break;
+                    ++kk;
+                }
                 k = kk;
             }
             const bool refeed = dirty && ((P + 1) & 1);

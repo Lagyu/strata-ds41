@@ -1837,6 +1837,11 @@ bool Ds41Dense::init(const std::string & path, const Ds41DenseConfig & cfg, std:
     if (!(err = ds41_read_geometry(*im.model, im.g)).empty()) return false;
     im.layers = ds41_file_layers(*im.model, im.g);
     if (!(err = ds41_check_tensors(*im.model, im.g, im.layers)).empty()) return false;
+    if (const int64_t k = ds41_topk_override(im.g.n_used); k != im.g.n_used) {   // STRATA_TOPK (the expert tier does the same)
+        std::fprintf(stderr, "router: %lld of the model's %lld experts per token (STRATA_TOPK), weights renormalised\n",
+                     (long long) k, (long long) im.g.n_used);
+        im.g.n_used = k;
+    }
     for (size_t i = 0; i < im.layers.size(); ++i)
         if (im.layers[i] != (int64_t) i) { err = "the file's blocks must be 0..k"; return false; }
     im.nl = (int64_t) im.layers.size();

@@ -1183,6 +1183,7 @@ bool ds41_moe_geom_from_gguf(const std::string& gguf, Ds41MoeGeom& g, std::strin
             }
             *k.second = v;
         }
+        g.top_k = ds41_topk_override(g.top_k);   // STRATA_TOPK: the router's N, as Ds41Dense applies it
         // every layer's three expert types; a layer with none of the tensors has no routed experts (MiMo's layer 0)
         const char* roles[3] = {"gate", "up", "down"};
         std::vector<int> ty[3];
@@ -6870,7 +6871,7 @@ bool Ds41FileBlobs::open(std::string& err) {
     g_.n_ff = FF;
     g_.n_layers = NL;
     g_.n_experts = NE;
-    g_.top_k = G.n_used;
+    g_.top_k = ds41_topk_override(G.n_used);   // STRATA_TOPK, as Ds41Dense's router
     g_.swiglu_limit = G.swiglu_limit > 0 ? (float) G.swiglu_limit : std::numeric_limits<float>::infinity();
     g_.eclass.assign((size_t) (NL * NE), 0);
     std::map<std::pair<int, int>, int> cid;
