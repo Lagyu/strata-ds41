@@ -6665,10 +6665,12 @@ void Ds41MoeTier::chunk_hint(int64_t layer, const int32_t* ids, const float* w, 
     // hinted there)
     static const bool skip_read = !(std::getenv("STRATA_CHUNK_SKIP_READ") && std::getenv("STRATA_CHUNK_SKIP_READ")[0] == '0');
     const float skip = (skip_read && w) ? im_->cfg.skip_file : 0.0f;
-    std::vector<std::array<int64_t, 4>> jobs;
+    // the span's new file-tier experts, in ASCENDING id order: run_chunk streams the file tier in that order, and the
+    // readers complete in queue order, so a batch is never stuck waiting for an expert queued behind ones it needs later
+    std::vector<int32_t> fresh;
     for (int64_t j = 0; j < NE; ++j) {
         const int32_t e = ids[j];
-        if (e < 0 || e >= NX || H.idx[(size_t) e] >= 0 || H.used >= H.n_slots) continue;
+        if (e < 0 || e >= NX || H.idx[(size_t) e] >= 0) continue;
         if (skip > 0.0f) {
             const int64_t t = j / K;
             double ws = 0;
@@ -6676,6 +6678,13 @@ void Ds41MoeTier::chunk_hint(int64_t layer, const int32_t* ids, const float* w, 
             if (w[j] < skip * ws) continue;   // this token would drop it; another token may keep it
         }
         if (!chunk_pf_file_tier(*im_, layer, e)) continue;
+        H.idx[(size_t) e] = -2;   // claimed (slot assigned below in id order)
+        fresh.push_back(e);
+    }
+    std::sort(fresh.begin(), fresh.end());
+    std::vector<std::array<int64_t, 4>> jobs;
+    for (const int32_t e : fresh) {
+        if (H.used >= H.n_slots) { H.idx[(size_t) e] = -1; continue; }   // no slab room: the wave reader takes it
         const int slot = H.used++;
         H.idx[(size_t) e] = slot;
         H.slot_e[(size_t) slot] = e;
