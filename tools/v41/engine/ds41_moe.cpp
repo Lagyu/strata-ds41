@@ -6670,7 +6670,7 @@ void Ds41MoeTier::chunk_hint(int64_t layer, const int32_t* ids, const float* w, 
     std::vector<int32_t> fresh;
     for (int64_t j = 0; j < NE; ++j) {
         const int32_t e = ids[j];
-        if (e < 0 || e >= NX || H.idx[(size_t) e] >= 0) continue;
+        if (e < 0 || e >= NX || H.idx[(size_t) e] != -1) continue;   // resident in the slab, or claimed by this span already
         if (skip > 0.0f) {
             const int64_t t = j / K;
             double ws = 0;
