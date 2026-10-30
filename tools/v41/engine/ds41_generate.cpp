@@ -1993,6 +1993,11 @@ int main(int argc, char ** argv) {
             return true;
         };
         // the request is over (it is live): its figures, the conversation's END, the DONE / BDONE line
+        // STRATA_PASS_PROF=1: the live request's verify passes split into verify (pass_v: dense / tier / taps / logits), the
+        // sampler, the drafter step and the rest - printed with the request's DSpark line
+        static const bool pass_prof = std::getenv("STRATA_PASS_PROF") != nullptr;
+        static double pp_v = 0, pp_s = 0, pp_d = 0, pp_all = 0, pp_ts = 0, pp_pv[4] = {0, 0, 0, 0}, pp_pvd[4] = {0, 0, 0, 0};
+        static long pp_n = 0, pp_rows = 0, pp_pvn = 0;
         auto end_req = [&](Req & r, bool at_admission) {
             const double dec_ms = now_ms() - r.td0;
             const Ds41MoeStats st = tier.stats();
@@ -2047,6 +2052,17 @@ int main(int argc, char ** argv) {
                 std::fprintf(stderr, "serve: DSpark %ld passes, %.2f tokens/pass (all requests %.2f)\n", r.rq_pass,
                              1.0 + (double) r.rq_acc / r.rq_pass, 1.0 + (double) sv_acc / std::max(1L, sv_pass));
             }
+            if (pass_prof && pp_n > 0) {
+                const double n = (double) pp_n, pn = (double) std::max(1L, pv_n - pp_pvn);
+                std::fprintf(stderr, "serve: pass prof: %ld passes, %.2f rows/pass, %.1f ms/pass = verify %.1f (dense %.1f [begin %.2f predict %.2f "
+                             "attn_router %.2f finish %.2f], tier %.1f, taps %.1f, logits %.1f) + sample %.2f + draft %.2f + other %.2f; pass_v calls %ld\n",
+                             pp_n, pp_rows / n, pp_all / n, pp_v / n, (pv_ms[0] - pp_pv[0]) / pn, (pvd_ms[0] - pp_pvd[0]) / pn, (pvd_ms[1] - pp_pvd[1]) / pn,
+                             (pvd_ms[2] - pp_pvd[2]) / pn, (pvd_ms[3] - pp_pvd[3]) / pn, (pv_ms[1] - pp_pv[1]) / pn, (pv_ms[2] - pp_pv[2]) / pn,
+                             (pv_ms[3] - pp_pv[3]) / pn, pp_s / n, pp_d / n, (pp_all - pp_v - pp_s - pp_d) / n, pv_n - pp_pvn);
+                pp_v = pp_s = pp_d = pp_all = 0; pp_n = pp_rows = 0;
+                for (int i = 0; i < 4; ++i) { pp_pv[i] = pv_ms[i]; pp_pvd[i] = pvd_ms[i]; }
+                pp_pvn = pv_n;
+            }
 #endif
             r.active = false;
             r.live = false;
@@ -2094,6 +2110,7 @@ int main(int argc, char ** argv) {
         std::vector<std::pair<int, double>> dist;
         auto run_pass = [&](Req & r) -> bool {
             if (r.stop_req) { r.finish = "cancel"; return false; }
+            const double pp_t0 = pass_prof ? now_ms() : 0;
             int k = sp_depth_serve;
             if (r.max_new > 0) k = std::min(k, r.max_new - r.gen);
             k = std::min(k, ctxv - (r.P + 3));   // the pass writes P+1 .. P+1+k
@@ -2144,13 +2161,16 @@ int main(int argc, char ** argv) {
             vt.push_back(r.t);
             for (int i = 0; i < k; ++i) vt.push_back(dr[i]);
             const int r0 = refeed ? 1 : 0, p0 = refeed ? r.P : r.P + 1;
+            const double pp_tv = pass_prof ? now_ms() : 0;
             if (!pass_v(vt.data(), (int) vt.size(), p0)) { r.finish = "error"; return false; }
+            if (pass_prof) { const double t = now_ms(); pp_v += t - pp_tv; pp_ts = t; }
             int acc = 0, tn = -1;
             for (; acc < k; ++acc) {
                 sample_dist(vlog.data() + (size_t) (r0 + acc) * nv, nv, r.temp, r.tk, r.top_p, r.min_p, dist);
                 if (!spec_accept(dist, dr[acc], rng, tn)) break;
             }
             if (acc == k) tn = sample_p(vlog.data() + (size_t) (r0 + k) * nv, nv, r.temp, r.tk, r.top_p, r.min_p, rng);
+            if (pass_prof) pp_s += now_ms() - pp_ts;
             for (int i = 0; i <= acc && rowdump_f; ++i) rowdump(r.id, r.P + 1 + i, vt[(size_t) (r0 + i)], vlog.data() + (size_t) (r0 + i) * nv);
             ++r.rq_pass; r.rq_acc += acc;
             if (is_lk) {
@@ -2162,9 +2182,11 @@ int main(int argc, char ** argv) {
             for (int i = 0; i <= acc; ++i) spos[i] = r.P + 1 + i;
             int drafts[kVerify];
             for (int i = 0; i < k; ++i) drafts[i] = dr[i];
+            const double pp_td = pass_prof ? now_ms() : 0;
             if (!dsp->step(vh.data() + (size_t) r0 * 3 * n_embd, spos, acc + 1, tn, r.sp_ids, r.sp_conf)) {
                 ferr = "DSpark step: " + dsp->last_error(); r.finish = "error"; return false;
             }
+            if (pass_prof) pp_d += now_ms() - pp_td;
             hist.push_back(r.t); pen_record(r.t);
             bool more = true;
             for (int i = 0; i < acc && more; ++i) { hist.push_back(drafts[i]); pen_record(drafts[i]); more = emit_tok(r, drafts[i]); }
@@ -2173,6 +2195,7 @@ int main(int argc, char ** argv) {
             r.P += 1 + acc;
             r.t = tn;
             tier.rebalance_tick();
+            if (pass_prof) { pp_all += now_ms() - pp_t0; ++pp_n; pp_rows += (long) vt.size(); }
             if (!more) return false;
             return emit_tok(r, r.t);
         };

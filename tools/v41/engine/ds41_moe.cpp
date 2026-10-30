@@ -1875,8 +1875,14 @@ bool peer_seed(Ds41MoeImpl& im, const std::vector<std::pair<int32_t, int32_t>>& 
     // holds (neither VRAM nor the arena), read from the blob source - the resident set grows by the store at once,
     // which is what a box whose model is twice its RAM wants (a file-tier read is ~4 ms on the critical path).
     // "any": the ranked walk itself, wherever an expert lives.
-    static const std::string fill = std::getenv("STRATA_PEER_FILL") ? std::getenv("STRATA_PEER_FILL") : "arena";
-    if (fill != "arena" && fill != "file" && fill != "any") { err = "STRATA_PEER_FILL: arena, file or any"; return false; }
+    // "move" (2026-10-30, decprof): "arena", and then the arena slots the stores took over are re-filled with the next
+    // ranked file-tier experts of the same class (read once, at the seed) - the resident set grows by the stores at once,
+    // as "file" does, while the stores hold the hot head.  Without it the arena duplicates the stores (3300 experts at
+    // 22,22) until --arena-adapt has replaced every copy, one file read at a time (~100 passes after a start).
+    static const std::string fill_env = std::getenv("STRATA_PEER_FILL") ? std::getenv("STRATA_PEER_FILL") : "arena";
+    const bool fill_move = fill_env == "move";
+    const std::string fill = fill_move ? std::string("arena") : fill_env;
+    if (fill != "arena" && fill != "file" && fill != "any") { err = "STRATA_PEER_FILL: arena, file, any or move"; return false; }
     const bool from_arena = gp.arena.base && gp.arena.used > 0;
     if (fill == "arena" && !from_arena) {
         std::fprintf(stderr, "peer: the RAM arena is empty, nothing for the peer stores\n");
@@ -1918,6 +1924,7 @@ bool peer_seed(Ds41MoeImpl& im, const std::vector<std::pair<int32_t, int32_t>>& 
             for (size_t k = 0; k < p->slot_of.size(); ++k)
                 if (p->slot_of[k] >= 0) seen[k] = 1;
     size_t at = 0;   // the walk's position: each store continues where the previous one stopped
+    std::vector<std::pair<int32_t, int32_t>> moved;   // fill_move: arena-held experts the stores took (their slots re-fill below)
     for (size_t pi = 0; pi < gp.peers.size(); ++pi) {
         PeerGpu& pg = *gp.peers[pi];
         if (pg.built) continue;
@@ -1968,6 +1975,8 @@ bool peer_seed(Ds41MoeImpl& im, const std::vector<std::pair<int32_t, int32_t>>& 
             pg.off.push_back(pg.off.back() + b);
         }
         pg.used = (int64_t) pick.size();
+        if (fill_move)
+            for (size_t i = 0; i < pick.size(); ++i) if (!from_file[i]) moved.push_back(pick[i]);
         pg.slot_key.resize(pick.size());
         pg.slot_cls.resize(pick.size());
         pg.slot_last.assign(pick.size(), -1);
@@ -2055,6 +2064,55 @@ bool peer_seed(Ds41MoeImpl& im, const std::vector<std::pair<int32_t, int32_t>>& 
                              "copied in %.1f s; the split leaves %lld of card 0's %lld resident experts to card 0\n",
                      pg.dev, (long long) pg.used, pg.bytes / 1073741824.0, budget / 1073741824.0, (long long) n_file,
                      pg.seed_ms / 1000.0, (long long) keep_res, (long long) nres);
+    }
+    if (fill_move && !moved.empty() && gp.arena.base) {
+        // the freed slots by class (a moved expert's slot holds exactly its class's blob size); the next ranked experts on
+        // the file tier take them, same class for same class, read straight into the pinned arena (nothing runs on the
+        // cards yet: this is the seed), then every slot changes hands at once
+        const double t0 = now_ms();
+        const int64_t NX = im.g.n_experts;
+        std::vector<std::vector<std::pair<int32_t, int32_t>>> freed((size_t) im.g.n_classes());
+        for (const auto& le : moved) freed[(size_t) im.g.cls(le.first, le.second)].push_back(le);
+        struct Job { int64_t l, e; int32_t old_l, old_e; };
+        std::vector<Job> jobs;
+        size_t left = moved.size();
+        for (; at < ranked.size() && left > 0; ++at) {
+            const int64_t l = ranked[at].first, e = ranked[at].second;
+            if (l < 0 || l >= im.g.n_layers || e < 0 || e >= NX || !im.g.routed(l)) continue;
+            if (seen[(size_t) (l * NX + e)]) continue;
+            if (gp.cache && !im.cfg.no_cache && gp.cache->slot_of(l, e) >= 0) continue;
+            if (gp.arena.ptr(l, e)) continue;
+            auto& fl = freed[(size_t) im.g.cls(l, e)];
+            if (fl.empty()) continue;
+            seen[(size_t) (l * NX + e)] = 1;
+            jobs.push_back({ l, e, fl.back().first, fl.back().second });
+            fl.pop_back();
+            --left;
+        }
+        std::atomic<size_t> next{0};
+        std::vector<std::thread> th;
+        const int nth = (int) std::min<size_t>(16, jobs.size());
+        for (int t = 0; t < nth; ++t)
+            th.emplace_back([&] {
+                for (;;) {
+                    const size_t k = next.fetch_add(1);
+                    if (k >= jobs.size()) break;
+                    const Job& j = jobs[k];
+                    const int32_t slot = gp.arena.slot_of[(size_t) (j.old_l * NX + j.old_e)];
+                    im.blobs->read(j.l, j.e, (uint8_t*) gp.arena.base + gp.arena.off[(size_t) slot]);
+                }
+            });
+        for (auto& x : th) x.join();
+        for (const Job& j : jobs) {
+            const int32_t slot = gp.arena.slot_of[(size_t) (j.old_l * NX + j.old_e)];
+            gp.arena.slot_of[(size_t) (j.old_l * NX + j.old_e)] = -1;
+            gp.arena.slot_of[(size_t) (j.l * NX + j.e)] = slot;
+        }
+        gp.arena.file_tier -= (int64_t) jobs.size();
+        std::fprintf(stderr, "peer: STRATA_PEER_FILL=move: %zu arena slots the stores took over re-filled with the next ranked "
+                             "file-tier experts in %.1f s (%zu left as they were); the arena now holds %lld, the file tier %lld\n",
+                     jobs.size(), (now_ms() - t0) / 1000.0, moved.size() - jobs.size(), (long long) gp.arena.used,
+                     (long long) gp.arena.file_tier);
     }
     return true;
 }
