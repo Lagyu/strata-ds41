@@ -69,6 +69,12 @@ The server is Python (`requirements.txt`); `local/run-ds41.sh` takes its virtual
   evaluated, not adopted); an Engram hot set built from a local corpus; converters of other published builds into the
   engine's layout and their comparison (`local/qtest/`: Maya-S, GSQ-RCO, Mix-256G); `--skip-file` (file-tier experts
   with a small router weight are not read).
+- Critical paths (2026-10-30/31, `local/crit/report.md`): an RDNA matrix-core kernel for the lightning indexer
+  (`STRATA_INDEXER_WMMA=1`; HIP ran the scalar kernel, so the dense half of a batch slowed 2.5x past 64K context), the
+  prompt chunk's sum queued instead of synced (`STRATA_CHUNK_ASYNC=1`), fused hc-tail / rms_norm+hc-mixes kernels,
+  file-tier experts the skip rule drops no longer read (exact); measured and left off: an async decode tier, a
+  whole-layer prefetch slab, routing-hinted file reads (exact; the PCIe 4.0 root port is the floor once reads hide),
+  a partial VRAM seed (wrong tokens), two copy streams.
 
 ## Measured on this machine
 
@@ -80,6 +86,11 @@ The server is Python (`requirements.txt`); `local/run-ds41.sh` takes its virtual
   decoding.
 - Prompt reading: a 6,600-token prompt in ~29 s. A resent prompt resumes in 1.5-3 s and a switch between parked
   conversations takes 4-8 s, instead of a full re-read (~8 min at 190K tokens).
+- After the critical-path deploy (2026-10-31): a 98K-token read 156 -> ~110 s; +1000 tokens at 98K context 9.8 -> 6.9 s,
+  +2500 16.2 -> 9.8 s, a 3000-token turn 18.5 -> 11.6 s; a 6600-token read at short context 16.6 -> 14.1 s and
+  2500-3000-token turns -5..10 %; decode unchanged; held-out KL 0.1006 / top-1 87.6 % (0.1014 / 87.9 % before).
+  Pinned host -> device copies cap at 27 GB/s on this board (its CPU x16 slot is PCIe 4.0): the ceiling of the decode
+  tier, the batch expert phase and the cache re-seed.
 
 ## Not in this repository
 
