@@ -714,6 +714,7 @@ struct Ds41MoeImpl {
     bool async_out = false;   ///< set_async: gpu_run_n_ex (out_dev) ends with an event record instead of a stream sync
     std::vector<uint8_t*> seed_buf;   ///< seed_from_ranked's file-tier readers' pinned bounces (one blob each), kept across seeds
     std::vector<int32_t> rank_pos;    ///< per (layer, expert): its position in the seed's ranked list (INT32_MAX = unranked)
+    bool seed_left_free = false;      ///< STRATA_SEED_FRAC < 1: the last seed left free slots (gpu_run_n_ex admits misses into them)
     Ds41MoeGeom g;
     Ds41MoeConfig cfg;
     Ds41BlobSource* blobs = nullptr;
@@ -2345,6 +2346,12 @@ bool Ds41MoeTier::seed_from_ranked(const std::vector<std::pair<int32_t, int32_t>
         return true;
     }
     const int64_t want = std::min<int64_t>(im_->cfg.slots, im_->gpu->cache->full_slots());
+    // STRATA_SEED_FRAC=f (default 1): seed only the first f of the slots (the warm set first, then the rank); the rest stay
+    // free and the decode's PCIe misses take them as they happen (gpu_run_n_ex's free-slot admission).  The seed is the
+    // ~16 GB arena -> VRAM DMA of every cache re-open after a batched turn (0.7-1.5 s); the same bytes end up resident
+    // either way, so no result changes.
+    static const double seed_frac = [] { const char* e = std::getenv("STRATA_SEED_FRAC"); const double v = e ? std::atof(e) : 1.0; return v <= 0 ? 1.0 : std::min(v, 1.0); }();
+    const int64_t seed_want = seed_frac < 1.0 ? std::max<int64_t>(1, (int64_t) ((double) want * seed_frac)) : want;
     // the order the slots fill in.  A per-layer-sized cache (MiMo) keeps the rank: its sizes list above pairs slot
     // i with ranked[i].  Everywhere else a preceding release_cache() supplies the warm set.
     const std::vector<std::pair<int32_t, int32_t>> fill_order = im_->mixed_sizes ? ranked : warm_first(*im_, ranked, want);
@@ -2371,7 +2378,7 @@ bool Ds41MoeTier::seed_from_ranked(const std::vector<std::pair<int32_t, int32_t>
         strata::core::ExpertCache& cache = *im_->gpu->cache;
         std::vector<std::array<int64_t, 3>> fjobs;   // slot, layer, expert
         for (const auto& le : fill_order) {
-            if (filled >= want) break;
+            if (filled >= seed_want) break;
             if (!im_->g.routed(le.first) || le.second < 0 || le.second >= im_->g.n_experts) continue;
             if (cache.slot_of(le.first, le.second) >= 0) continue;
             const int32_t s = cache.admit(le.first, le.second);
@@ -2419,6 +2426,7 @@ bool Ds41MoeTier::seed_from_ranked(const std::vector<std::pair<int32_t, int32_t>
                 if (own) cudaFreeHost(buf);
             });
         for (auto& t : th) t.join();
+        im_->seed_left_free = seed_want < want;   // free slots left for the decode's misses (STRATA_SEED_FRAC)
         const double sp3 = seed_prof ? now_ms() : 0;   // the file-tier jobs done
         if (cudaStreamSynchronize((cudaStream_t) 0) != cudaSuccess && !bad) {
             terr = "seed: queued fills failed";
@@ -4696,6 +4704,19 @@ bool gpu_run_n_ex(Ds41MoeImpl& im, int64_t layer, int nt, const int32_t* ids, co
                         src = fg_src[fb];
                     }
                     if (fb >= 0 && fg_pre[fb]) { ptr.push_back((unsigned long long) fg_pre[fb]); dptr[u] = (unsigned long long) fg_pre[fb]; goto entries; }
+                    // STRATA_SEED_FRAC < 1 left free slots: an arena-held miss takes one (the DMA lands there and it stays)
+                    const int32_t fs = (lru && cls[u] == PCIE && im.seed_left_free) ? gp.cache->admit(layer, e) : -1;
+                    if (fs >= 0) {
+                        uint8_t* vs = gp.cache->device_slot(fs);
+                        const double xd0 = xprof ? now_ms() : 0;
+                        ck(cudaMemcpyAsync(vs, src, (size_t) BL, cudaMemcpyHostToDevice, cs), "pcie dma");
+                        if (xprof) xp[8] += now_ms() - xd0;
+                        dptr[u] = (unsigned long long) vs;
+                        ++im.admitted;
+                        goto placed;
+                    }
+                    if (lru && cls[u] == PCIE && im.seed_left_free) im.seed_left_free = false;   // admit() found no free slot: full from here on
+                    {
                     // LRU admission (arena-held PCIe misses only, as gpu_run)
                     int32_t v = (lru && cls[u] == PCIE && admit_ok(e)) ? lru_victim(e) : -1;
                     if (v >= 0 && arena_slot(v) < 0 && arena_slot(e) < 0) v = -1;   // nowhere to demote to
@@ -4736,6 +4757,8 @@ bool gpu_run_n_ex(Ds41MoeImpl& im, int64_t layer, int nt, const int32_t* ids, co
                         lru_dem[n_lru] = dem;
                         lru_new[n_lru++] = e;
                     }
+                    }
+                    placed:;
                 }
                 ptr.push_back(dptr[u]);
                 entries:
