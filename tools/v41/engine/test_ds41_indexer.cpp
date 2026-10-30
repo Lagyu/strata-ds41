@@ -68,6 +68,16 @@ static int check(ggml_backend_t be, int nk, int nq, int ns, bool broadcast, bool
         if (++bad<4) std::printf("  mismatch %zu old %.9g nvis %.9g\n",i,a[i],b[i]);
     }
     auto ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-t0).count();
+    if (const char * dump = std::getenv("LIDX_DUMP")) {   // the nvis-path scores, appended: compare two kernels across runs
+        if (FILE * f = std::fopen(dump, "ab")) { std::fwrite(b.data(), 4, b.size(), f); std::fclose(f); }
+    }
+    if (std::getenv("LIDX_TIME") && nk >= 32768) {   // the nvis path alone, 5 runs: the kernel's time at this size
+        for (int it = 0; it < 5; ++it) {
+            auto t1=std::chrono::steady_clock::now();
+            if (ggml_backend_graph_compute(be,gf) != GGML_STATUS_SUCCESS) std::abort();
+            std::printf("  rerun both paths nk=%d nq=%d: %.3f ms\n", nk, nq, std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-t1).count());
+        }
+    }
     std::printf("%s nk=%d nq=%d streams=%d broadcast=%d scores=%zu differ=%zu ms=%.3f\n", quant?"mxfp4":"f32",nk,nq,ns,broadcast,a.size(),bad,ms);
     ggml_gallocr_free(al); ggml_free(c);
     return bad ? 1 : 0;
@@ -83,6 +93,14 @@ int main(int argc,char **argv) {
     if(cuda && !be) return 77;
     if(!be) {be=ggml_backend_cpu_init(); ggml_backend_cpu_set_n_threads(be,8);}
     int fails=0;
+    if (const char * sh = std::getenv("LIDX_SHAPE")) {   // LIDX_SHAPE=nk,nq[,ns]: one MXFP4 check of that shape (a real span's shape)
+        int nk = 256, nq = 512, ns = 1;
+        std::sscanf(sh, "%d,%d,%d", &nk, &nq, &ns);
+        fails += check(be, nk, nq, ns, true, true);
+        ggml_backend_free(be);
+        std::printf("%s\n", fails ? "FAIL" : "PASS: visibility scores match the additive-mask path bit for bit");
+        return fails ? 1 : 0;
+    }
     for(bool quant:{false,true}) for(int nk:{1,31,32,33,63,64,65,512,1024}) {
         fails+=check(be,nk,13,2,false,quant);
         fails+=check(be,nk,3,2,true,quant);

@@ -501,6 +501,9 @@ struct Gpu {
     /// Off (s_dn null) = the single-stream path, unchanged.  Not s_dc: that is gpu_run's opt-in overlap.
     cudaStream_t s_dn = nullptr;
     cudaEvent_t dn_ev[4] = {};
+    /// set_async: recorded on `s` after an async gpu_run_n_ex call's sum (done_pending = a call's work may still be queued)
+    cudaEvent_t ev_done = nullptr;
+    bool done_pending = false;
     int n_stage = 0;    ///< blobs d_stage holds: max(kMaxParts, STRATA_D3_STAGE_SLOTS); gpu_run uses the first kMaxParts
     int d3_bank = 0;    ///< s_dn on: slots per bank, min(kMaxParts, STRATA_D3_STAGE_SLOTS / 2)
     uint8_t* h_dummy = nullptr;   ///< pinned zero blob: a guess outside the arena still costs its DMA
@@ -601,6 +604,7 @@ struct Gpu {
         if (h_fstage) cudaFreeHost(h_fstage);
         for (void* p : bufs)
             if (p) cudaFree(p);
+        if (ev_done) { if (done_pending) cudaEventSynchronize(ev_done); cudaEventDestroy(ev_done); ev_done = nullptr; done_pending = false; }
         if (ev_pf) cudaEventDestroy(ev_pf);
         if (s_pf) cudaStreamDestroy(s_pf);
         if (ev_dc) cudaEventDestroy(ev_dc);
@@ -697,9 +701,13 @@ std::vector<std::pair<int32_t, int32_t>> rank_routes(const std::string& path, in
 struct Rebal;        ///< STRATA_ARENA_REBAL: the conversation-adaptive arena (defined with rebalance_*; null in a CPU build)
 #if defined(DS4_MOE_CUDA)
 struct ChunkStage;   ///< chunk_prefetch's two pinned slabs (defined below, after `acquire`)
+struct HintStage;    ///< chunk_hint's pinned slab + reader threads (defined below, after the chunk stage)
 #endif
 
 struct Ds41MoeImpl {
+    bool async_out = false;   ///< set_async: gpu_run_n_ex (out_dev) ends with an event record instead of a stream sync
+    std::vector<uint8_t*> seed_buf;   ///< seed_from_ranked's file-tier readers' pinned bounces (one blob each), kept across seeds
+    std::vector<int32_t> rank_pos;    ///< per (layer, expert): its position in the seed's ranked list (INT32_MAX = unranked)
     Ds41MoeGeom g;
     Ds41MoeConfig cfg;
     Ds41BlobSource* blobs = nullptr;
@@ -748,6 +756,7 @@ struct Ds41MoeImpl {
     std::vector<std::pair<int32_t, int32_t>> warm;
 #if defined(DS4_MOE_CUDA)
     std::unique_ptr<ChunkStage> cstage;   ///< chunk_prefetch: the two pinned slabs
+    std::unique_ptr<HintStage> hstage;   ///< chunk_hint: the routing-hinted file-tier reads of the layer being read
 #endif
     std::unique_ptr<Rebal> rebal;         ///< STRATA_ARENA_REBAL (null = off)
     std::vector<std::array<int32_t, 3>> shrunk;   ///< shrink_cache_for: (slot, layer, expert) evicted, for regrow_cache
@@ -856,16 +865,27 @@ int64_t chunk_next_routed(const Ds41MoeImpl& im, int64_t layer) {
     return -1;
 }
 
-/// The bytes `layer`'s file-tier experts occupy (the slab a prefetch of it would need).
+/// STRATA_CHUNK_PF_FRAC (0 < f <= 1, default 1): the share of a layer's file-tier bytes the slab stages, hottest first.
+double chunk_pf_frac() {
+    static const double f = [] { const char* e = std::getenv("STRATA_CHUNK_PF_FRAC"); const double v = e ? std::atof(e) : 1.0; return v <= 0 || v > 1 ? 1.0 : v; }();
+    return f;
+}
+/// A slab candidate: on neither the VRAM cache, the arena nor a peer store (the chunk path computes a peer's experts there,
+/// STRATA_PEER_CHUNK) - what run_chunk reads from the file.
+bool chunk_pf_file_tier(const Ds41MoeImpl& im, int64_t layer, int64_t e) {
+    const Gpu& gp = *im.gpu;
+    if (gp.cache && !im.cfg.no_cache && gp.cache->slot_of(layer, e) >= 0) return false;
+    if (gp.arena.base && gp.arena.ptr(layer, e)) return false;
+    static const bool chunk_peer = !(std::getenv("STRATA_PEER_CHUNK") && std::getenv("STRATA_PEER_CHUNK")[0] == '0');
+    if (chunk_peer && gp.peers_built() && gp.peer_holding(layer, (int32_t) e)) return false;
+    return true;
+}
+/// The bytes `layer`'s file-tier experts occupy, times the staged share (the slab a prefetch of it would need).
 int64_t chunk_stage_want(Ds41MoeImpl& im, int64_t layer) {
-    Gpu& gp = *im.gpu;
     int64_t at = 0;
-    for (int64_t e = 0; e < im.g.n_experts; ++e) {
-        if (gp.cache && !im.cfg.no_cache && gp.cache->slot_of(layer, e) >= 0) continue;
-        if (gp.arena.base && gp.arena.ptr(layer, e)) continue;
-        at += (int64_t) im.bl[(size_t) im.g.cls(layer, e)];
-    }
-    return at;
+    for (int64_t e = 0; e < im.g.n_experts; ++e)
+        if (chunk_pf_file_tier(im, layer, e)) at += (int64_t) im.bl[(size_t) im.g.cls(layer, e)];
+    return (int64_t) (chunk_pf_frac() * (double) at) + (int64_t) im.blob;   // + one blob: the share's rounding
 }
 
 /// The staged expert list for slab `s`: `layer`'s file-tier experts, ascending id = the order run_chunk's own
@@ -878,11 +898,30 @@ int64_t chunk_stage_build(Ds41MoeImpl& im, int s, int64_t layer) {
     cs.len[s].clear();
     if (cs.idx[s].size() != (size_t) im.g.n_experts) cs.idx[s].assign((size_t) im.g.n_experts, -1);
     else std::fill(cs.idx[s].begin(), cs.idx[s].end(), -1);
-    Gpu& gp = *im.gpu;
-    int64_t at = 0;
+    // The slab stages chunk_pf_frac() of the layer's file-tier bytes (chunk_pf_file_tier), the hottest experts (the seed's rank)
+    // first; run_chunk reads the rest of its routed file-tier experts on demand (the wave reader).  A whole-tier slab (1) is
+    // worth it only when the dense half is long enough to hide ~2 GB of reads a layer; a hot half covers most of a small
+    // turn's routed experts for half the bytes.
+    const double frac = chunk_pf_frac();
+    std::vector<int32_t> es;
+    int64_t tier_bytes = 0;
     for (int64_t e = 0; e < im.g.n_experts; ++e) {
-        if (gp.cache && !im.cfg.no_cache && gp.cache->slot_of(layer, e) >= 0) continue;
-        if (gp.arena.base && gp.arena.ptr(layer, e)) continue;
+        if (!chunk_pf_file_tier(im, layer, e)) continue;
+        es.push_back((int32_t) e);
+        tier_bytes += (int64_t) im.bl[(size_t) im.g.cls(layer, e)];
+    }
+    if (frac < 1.0 && !im.rank_pos.empty()) {
+        const int64_t NX = im.g.n_experts;
+        std::stable_sort(es.begin(), es.end(), [&](int32_t a, int32_t b) { return im.rank_pos[(size_t) (layer * NX + a)] < im.rank_pos[(size_t) (layer * NX + b)]; });
+        const int64_t budget = (int64_t) (frac * (double) tier_bytes);
+        int64_t take = 0;
+        size_t n = 0;
+        while (n < es.size() && take + (int64_t) im.bl[(size_t) im.g.cls(layer, es[n])] <= budget) take += (int64_t) im.bl[(size_t) im.g.cls(layer, es[n++])];
+        es.resize(n);
+        std::sort(es.begin(), es.end());   // the consumer walks ascending ids
+    }
+    int64_t at = 0;
+    for (const int32_t e : es) {
         const uint32_t bl = (uint32_t) im.bl[(size_t) im.g.cls(layer, e)];
         if (at + (int64_t) bl > cs.cap) return -1;
         cs.idx[s][(size_t) e] = (int32_t) cs.e[s].size();
@@ -915,20 +954,30 @@ void chunk_stage_run(Ds41MoeImpl& im, int s) {
         const int64_t L = c.layer[s];
         const double t0 = now_ms();
         std::atomic<int64_t> next{0}, got{0};
-        const int nth = (int) std::min<int64_t>(n, (int64_t) chunk_pf_threads());
+        std::vector<std::atomic<int>> pdone((size_t) n);   // parts of each blob done (read_part)
+        for (auto& r : pdone) r.store(0, std::memory_order_relaxed);
+        const int nth = (int) std::min<int64_t>(n * 8, (int64_t) chunk_pf_threads());
         const size_t sc = std::max<size_t>(im.blobs->read_staged_scratch(), 4096);
         std::vector<std::thread> rd;
         for (int k = 0; k < nth; ++k)
             rd.emplace_back([&, k] {
                 void* q = nullptr;
                 uint8_t* scratch = ds41_sys::posix_memalign(&q, 4096, sc) == 0 ? (uint8_t*) q : nullptr;
-                for (int64_t i; (i = next.fetch_add(1)) < n;) {
+                // STRATA_CHUNK_PF_PARTS (default 8): each blob in parts through read_part - the STRATA_BLOB_TWIN share of the
+                // parts comes from the second drive, so the slab fills at both drives' bandwidth (read_staged reads the model
+                // drive alone); 1 = read_staged, as before
+                static const int P = std::getenv("STRATA_CHUNK_PF_PARTS") ? std::max(1, std::min(16, std::atoi(std::getenv("STRATA_CHUNK_PF_PARTS")))) : 8;
+                for (int64_t x; (x = next.fetch_add(1)) < n * P;) {
+                    const int64_t i = x / P;
                     if (c.cancel[s].load(std::memory_order_relaxed)) break;
                     uint8_t* dst = c.slab[s] + c.off[s][(size_t) i];
-                    if (scratch) im.blobs->read_staged(L, c.e[s][(size_t) i], dst, scratch, sc);
+                    if (P > 1) im.blobs->read_part(L, c.e[s][(size_t) i], (int) (x % P), P, dst);
+                    else if (scratch) im.blobs->read_staged(L, c.e[s][(size_t) i], dst, scratch, sc);
                     else im.blobs->read(L, c.e[s][(size_t) i], dst);
-                    got.fetch_add((int64_t) c.len[s][(size_t) i], std::memory_order_relaxed);
-                    c.done[s].fetch_add(1, std::memory_order_release);
+                    if (P == 1 || pdone[(size_t) i].fetch_add(1, std::memory_order_acq_rel) + 1 == P) {
+                        got.fetch_add((int64_t) c.len[s][(size_t) i], std::memory_order_relaxed);
+                        c.done[s].fetch_add(1, std::memory_order_release);
+                    }
                 }
                 ds41_sys::aligned_free(scratch);
             });
@@ -983,8 +1032,8 @@ bool chunk_stage_alloc(Ds41MoeImpl& im) {
     const int64_t avail = mem_available_gib();
     if (avail >= 0) cap = std::min(cap, std::max<int64_t>(0, (avail - (int64_t) im.cfg.mem_floor_gib - 2) * 1073741824LL / 2));
     if (want <= 0 || cap < want) {
-        std::fprintf(stderr, "chunk prefetch: off - a layer's file tier is %.2f GiB, the slab budget is %.2f GiB\n",
-                     want / 1073741824.0, (want <= 0 ? 0.0 : cap / 1073741824.0));
+        std::fprintf(stderr, "chunk prefetch: off - a layer's staged file tier is %.2f GiB (share %.2f), the slab budget is %.2f GiB\n",
+                     want / 1073741824.0, chunk_pf_frac(), (want <= 0 ? 0.0 : cap / 1073741824.0));
         im.cstage.reset();
         return false;
     }
@@ -1064,6 +1113,96 @@ void chunk_stage_close(Ds41MoeImpl& im) {
 
 #endif  // DS4_MOE_CUDA
 
+#if defined(DS4_MOE_CUDA)
+// ---- chunk_hint (STRATA_CHUNK_HINT_GIB): a layer-major batch's file-tier reads start as soon as a dense span has ROUTED
+// (the feed loop hints every span's expert ids right after its attention/router graph), so they run under the rest of the
+// layer's dense half instead of after it; run_chunk then DMAs those experts out of the pinned hint slab and reads only the
+// unhinted rest on demand.  No speculation: only routed experts are read.  The wave reader's geometry (32 threads, 8 parts a
+// blob, both drives through read_part).  The whole-tier prefetch slab (chunk_prefetch) read the next layer's entire file
+// tier with 16 threads under this layer's expert phase; measured 2026-10-31 it lost at every size here.
+struct HintStage {
+    uint8_t* slab = nullptr;
+    int64_t cap = 0, slot_bytes = 0;
+    int n_slots = 0, used = 0;
+    int64_t layer = -1;
+    std::vector<int32_t> idx;                  ///< expert -> slot (-1)
+    std::vector<int32_t> slot_e;               ///< slot -> expert
+    std::unique_ptr<std::atomic<int>[]> ready; ///< slot -> 1 when its blob is home
+    std::unique_ptr<std::atomic<int>[]> pdone; ///< slot -> parts read
+    std::atomic<int64_t> inflight{0};          ///< part reads queued or running
+    std::mutex mu;
+    std::condition_variable cv;
+    std::deque<std::array<int32_t, 3>> q;      ///< (slot, expert, part)
+    bool stop = false;
+    std::vector<std::thread> th;
+    int64_t hinted = 0, served = 0;            ///< MIMO_CHUNK_PROF
+    double wait_ms = 0;
+};
+constexpr int kHintParts = 8;
+int hint_threads() {
+    static const int n = [] { const char* e = std::getenv("STRATA_CHUNK_HINT_THREADS"); const int v = e ? std::atoi(e) : 32; return v < 1 ? 1 : (v > 64 ? 64 : v); }();
+    return n;
+}
+double hint_gib() {
+    static const double g = [] { const char* e = std::getenv("STRATA_CHUNK_HINT_GIB"); return e ? std::atof(e) : 0.0; }();
+    return g;
+}
+bool hint_alloc(Ds41MoeImpl& im) {
+    if (im.hstage) return true;
+    if (hint_gib() <= 0 || !im.gpu || im.cfg.cpu_only) return false;
+    auto hs = std::make_unique<HintStage>();
+    hs->slot_bytes = (int64_t) im.blob;
+    hs->n_slots = (int) std::max<int64_t>(1, (int64_t) (hint_gib() * 1073741824.0) / hs->slot_bytes);
+    hs->cap = (int64_t) hs->n_slots * hs->slot_bytes;
+    if (cudaMallocHost((void**) &hs->slab, (size_t) hs->cap) != cudaSuccess) {
+        std::fprintf(stderr, "chunk hint: off - a pinned slab of %.2f GiB failed\n", hs->cap / 1073741824.0);
+        return false;
+    }
+    hs->idx.assign((size_t) im.g.n_experts, -1);
+    hs->slot_e.assign((size_t) hs->n_slots, -1);
+    hs->ready.reset(new std::atomic<int>[hs->n_slots]);
+    hs->pdone.reset(new std::atomic<int>[hs->n_slots]);
+    for (int i = 0; i < hs->n_slots; ++i) { hs->ready[i].store(0); hs->pdone[i].store(0); }
+    HintStage* H = hs.get();
+    Ds41MoeImpl* imp = &im;
+    for (int k = 0; k < hint_threads(); ++k)
+        hs->th.emplace_back([H, imp]() {
+            for (;;) {
+                std::array<int32_t, 3> job;
+                {
+                    std::unique_lock<std::mutex> lk(H->mu);
+                    H->cv.wait(lk, [&] { return H->stop || !H->q.empty(); });
+                    if (H->stop && H->q.empty()) return;
+                    job = H->q.front();
+                    H->q.pop_front();
+                }
+                const int slot = job[0], e = job[1], part = job[2];
+                imp->blobs->read_part(H->layer, e, part, kHintParts, H->slab + (size_t) slot * (size_t) H->slot_bytes);
+                if (H->pdone[slot].fetch_add(1, std::memory_order_acq_rel) + 1 == kHintParts) {
+                    H->ready[slot].store(1, std::memory_order_release);
+                    H->ready[slot].notify_all();
+                }
+                H->inflight.fetch_sub(1, std::memory_order_acq_rel);
+            }
+        });
+    std::fprintf(stderr, "chunk hint: a %.2f GiB pinned slab (%d expert slots), %d reader threads x %d parts (STRATA_CHUNK_HINT_GIB)\n",
+                 hs->cap / 1073741824.0, hs->n_slots, hint_threads(), kHintParts);
+    im.hstage = std::move(hs);
+    return true;
+}
+void hint_close(Ds41MoeImpl& im) {
+    if (!im.hstage) return;
+    HintStage& H = *im.hstage;
+    {
+        std::lock_guard<std::mutex> lk(H.mu);
+        H.stop = true;
+    }
+    H.cv.notify_all();
+    for (auto& t : H.th) t.join();
+    if (H.slab) cudaFreeHost(H.slab);
+    im.hstage.reset();
+}
+#endif  // DS4_MOE_CUDA
 
 // ---- one input-activation buffer per distinct `gu_act` (the one-dispatch-per-layer path) ----------------------
 /// The buffer for the gate/up activation format `gu_act` (built in `init`), or the single `nact` when the
@@ -1578,6 +1717,7 @@ bool Ds41MoeTier::init(const Ds41MoeGeom& geom, Ds41BlobSource* blobs, const Ds4
     }
     ck(cudaMalloc(&gp.d_stage, (size_t) gp.n_stage * (size_t) im_->blob), "d_stage");
     for (int i = 0; i < 4; ++i) ck(cudaEventCreate(&gp.ev[i]), "event");
+    ck(cudaEventCreateWithFlags(&gp.ev_done, cudaEventDisableTiming), "ev_done");
     ck(cudaMallocHost((void**) &gp.h_x, (size_t) kMaxTok * H4), "h_x");
     ck(cudaMallocHost(&gp.h_parts, (size_t) kMaxEnt * H4), "h_parts");
     ck(cudaMalloc(&gp.d_meta, kMetaBytes), "d_meta");
@@ -2137,6 +2277,16 @@ void Ds41MoeTier::set_cache_enabled(bool on) {
 bool Ds41MoeTier::seed_from_ranked(const std::vector<std::pair<int32_t, int32_t>>& ranked_all, std::string& err) {
     if (im_->cfg.cpu_only) return true;   // a CPU-only tier has neither a cache nor an arena to seed
     const std::vector<std::pair<int32_t, int32_t>> ranked = drop_excluded(*im_, ranked_all);
+    if (im_->rank_pos.empty()) {   // the partial chunk-prefetch slab (STRATA_CHUNK_PF_FRAC) stages the hottest file-tier experts first
+        const int64_t NX = im_->g.n_experts;
+        im_->rank_pos.assign((size_t) (im_->g.n_layers * NX), INT32_MAX);
+        for (size_t i = 0; i < ranked.size(); ++i) {
+            const auto& le = ranked[i];
+            if (le.first < 0 || le.first >= im_->g.n_layers || le.second < 0 || le.second >= NX) continue;
+            int32_t& r = im_->rank_pos[(size_t) (le.first * NX + le.second)];
+            if (r == INT32_MAX) r = (int32_t) std::min<size_t>(i, (size_t) INT32_MAX - 1);
+        }
+    }
     if (!build_arena(arena_order(*im_, ranked), err)) return false;
 #if !defined(DS4_MOE_CUDA)
     (void) ranked;
@@ -2171,6 +2321,8 @@ bool Ds41MoeTier::seed_from_ranked(const std::vector<std::pair<int32_t, int32_t>
     }
     // uniform blobs with defer_cache, or with an auto slot budget: the cache opens now (after the prompt chunks gave
     // their VRAM back), at most `slots` experts and slot_gib bytes of whole 256-aligned slots (open_sized's padding)
+    static const bool seed_prof = std::getenv("STRATA_SEED_PROF") != nullptr;
+    const double sp0 = seed_prof ? now_ms() : 0;
     int64_t n_uni = im_->cfg.slots;
     if (im_->cfg.slot_gib > 0)
         n_uni = std::min<int64_t>(n_uni, (int64_t) (im_->cfg.slot_gib * 1073741824.0 / (double) ((im_->blob + 255) / 256 * 256)));
@@ -2181,6 +2333,7 @@ bool Ds41MoeTier::seed_from_ranked(const std::vector<std::pair<int32_t, int32_t>
         if (keep_cache_mode()) im_->gpu->cache->set_segment_bytes(kKeepCacheSegment);
         if (!im_->gpu->cache->open_sized(sizes, im_->g.n_layers, im_->g.n_experts, err)) return false;
     }
+    const double sp1 = seed_prof ? now_ms() : 0;   // the cache opened (allocated)
     if (!im_->gpu || !im_->gpu->cache) {   // no cache: nothing to seed (the peer still mirrors the arena)
         if (!peer_seed(*im_, ranked, err)) return false;
         return true;
@@ -2230,11 +2383,20 @@ bool Ds41MoeTier::seed_from_ranked(const std::vector<std::pair<int32_t, int32_t>
         std::string terr;
         std::vector<std::thread> th;
         const double t0 = now_ms();
+        const double sp2 = seed_prof ? now_ms() : 0;   // the arena fills queued
         const int nth = (int) std::min<size_t>(8, fjobs.size());
+        // the readers' pinned bounces persist (seed_buf): cudaMallocHost + cudaFreeHost per thread per seed were the bulk of
+        // the ~0.6-0.9 s "file jobs" of every cache re-open (STRATA_SEED_PROF, 2026-10-30), for a few dozen blobs
+        for (int k = (int) im_->seed_buf.size(); k < nth; ++k) {
+            uint8_t* buf = nullptr;
+            if (cudaMallocHost((void**) &buf, (size_t) im_->blob) != cudaSuccess) break;
+            im_->seed_buf.push_back(buf);
+        }
         for (int k = 0; k < nth; ++k)
-            th.emplace_back([&]() {
-                uint8_t* buf = nullptr;
-                if (cudaMallocHost((void**) &buf, (size_t) im_->blob) != cudaSuccess) {
+            th.emplace_back([&, k]() {
+                uint8_t* buf = k < (int) im_->seed_buf.size() ? im_->seed_buf[(size_t) k] : nullptr;
+                const bool own = buf == nullptr;
+                if (own && cudaMallocHost((void**) &buf, (size_t) im_->blob) != cudaSuccess) {
                     bad = true;
                     return;
                 }
@@ -2248,13 +2410,15 @@ bool Ds41MoeTier::seed_from_ranked(const std::vector<std::pair<int32_t, int32_t>
                         bad = true;
                     }
                 }
-                cudaFreeHost(buf);
+                if (own) cudaFreeHost(buf);
             });
         for (auto& t : th) t.join();
+        const double sp3 = seed_prof ? now_ms() : 0;   // the file-tier jobs done
         if (cudaStreamSynchronize((cudaStream_t) 0) != cudaSuccess && !bad) {
             terr = "seed: queued fills failed";
             bad = true;
         }
+        const double sp4 = seed_prof ? now_ms() : 0;   // every queued fill landed
         im_->st.file_tier += (int64_t) fjobs.size();
         im_->st.file_ms += now_ms() - t0;
         lru_seed_order(filled);
@@ -2264,6 +2428,10 @@ bool Ds41MoeTier::seed_from_ranked(const std::vector<std::pair<int32_t, int32_t>
         }
         im_->admitted = filled;
         if (!peer_seed(*im_, ranked, err)) return false;   // the peer mirrors the arena's non-resident head
+        if (seed_prof)
+            std::fprintf(stderr, "seed prof: %lld slots (%zu from the file tier): cache open %.0f ms, queue %.0f, file jobs %.0f, "
+                         "fills landed %.0f, peers %.0f\n", (long long) filled, fjobs.size(), sp1 - sp0, sp2 - sp1, sp3 - sp2, sp4 - sp3,
+                         now_ms() - sp4);
         return true;
     }
     for (const auto& le : fill_order) {
@@ -2350,6 +2518,7 @@ void Ds41MoeTier::prefetch_multi(int64_t layer, const int32_t* ids, int n, int m
     if (!ids || n <= 0 || max_slots <= 0 || !im_->g.routed(layer)) return;
     Gpu& gp = *im_->gpu;
     if (!gp.s_pf || !gp.d_pf) return;   // allocated with pf_b > 0 (the decode default)
+    if (gp.done_pending) ck(cudaStreamWaitEvent(gp.s_pf, gp.ev_done, 0), "pf wait done");   // an async call may still read d_pf
     const int nb = std::min(max_slots, (int) Ds41MoeConfig::kMaxPf);
     for (int i = 0; i < n && im_->pf_n < nb; ++i) {
         const int32_t e = ids[i];
@@ -4104,6 +4273,10 @@ bool gpu_run_n_ex(Ds41MoeImpl& im, int64_t layer, int nt, const int32_t* ids, co
     const double t0 = now_ms();
     Ds41MoeStats st;
     if (peer_adapt_on() && gp.peers_built()) peer_poll(im, layer);
+    if (gp.done_pending) {   // the previous async call's work (its reads of h_x / h_meta / the pads) must be done before this one reuses them
+        ck(cudaEventSynchronize(gp.ev_done), "done wait");
+        gp.done_pending = false;
+    }
     ++im.run_seq;   // spec_read tags its stash slots with the call that will use them (one call per layer per pass)
     im.run_layer = layer;
     if (std::getenv("DS41_DBG_X")) std::fprintf(stderr, "[dbg_x] ENTER gpu_run_n_ex layer=%lld nt=%d nact_multi_n=%zu nfmt=%zu kNativeActBytes=%d\n",
@@ -4812,7 +4985,12 @@ bool gpu_run_n_ex(Ds41MoeImpl& im, int64_t layer, int nt, const int32_t* ids, co
                                                      sum_zerocopy_scratch(gp, H) + (size_t) t * (size_t) H, gp.s);
         }   // sum_zc != 1
         if (xprof) { xh[4] += now_ms() - t0; ck(cudaEventRecord(gp.ev_t[3], gp.s), "prof t3"); }
-        ck(cudaStreamSynchronize(gp.s), "sum sync");
+        if (im.async_out && !xprof && sum_zc != 2) {   // set_async: the caller waits done_event() on its own stream
+            ck(cudaEventRecord(gp.ev_done, gp.s), "done record");
+            gp.done_pending = true;
+        } else {
+            ck(cudaStreamSynchronize(gp.s), "sum sync");
+        }
         if (sum_zc == 2) sum_zerocopy_compare(out_dev, gp.zc_chk, nt, H, layer, "verify");
         if (xprof) {
             float ms = 0;
@@ -4980,7 +5158,8 @@ bool gpu_run_n_ex(Ds41MoeImpl& im, int64_t layer, int nt, const int32_t* ids, co
 // MIMO_CHUNK_PROF=1: run_chunk's time split (host waits on the copy events / final sync, GPU time of the grouped
 // launches by event pairs), printed by release_chunk.  Timing only - the same work runs.
 struct ChunkProf { double file_gb = 0, rd_busy = 0; double wall = 0, file = 0, file_rd = 0, wait_copied = 0, sync = 0, kern = 0, resident_kern = 0; int64_t calls = 0, launches = 0;
-                   double tc = 0, tc_gb = 0; int64_t tc_launches = 0, mmq_subruns = 0; };   // + the PTQ1_0 -> Q2_0 transcode inside MMQ
+                   double tc = 0, tc_gb = 0; int64_t tc_launches = 0, mmq_subruns = 0;   // + the PTQ1_0 -> Q2_0 transcode inside MMQ
+                   int64_t skip_x = 0; };   // file-tier experts left unread (--skip-file: every entry below the cut)
 ChunkProf g_cprof;
 bool chunk_prof() { static const bool on = [] { const char* e = std::getenv("MIMO_CHUNK_PROF"); return e && *e == '1'; }(); return on; }
 
@@ -5185,6 +5364,10 @@ bool gpu_run_chunk(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, co
     const double t0 = now_ms();
     Ds41MoeStats st;
 
+    if (gp.done_pending) {   // an async call (chunk or verify) may still read the buffers below: wait it out once
+        ck(cudaEventSynchronize(gp.ev_done), "chunk done wait");
+        gp.done_pending = false;
+    }
     if (n > gp.c_tok) {   // (re)allocate the DEVICE buffers for n tokens (release_chunk gives them back)
         for (void* p : {gp.c_x, gp.c_xq, gp.c_parts, gp.c_scratch, gp.c_dst, gp.c_tokv, gp.c_w, gp.c_out}) if (p) cudaFree(p);
         gp.c_tok = n;
@@ -5192,6 +5375,7 @@ bool gpu_run_chunk(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, co
         ck(cudaMalloc(&gp.c_x, (size_t) n * (size_t) H * 4), "c_x");
         ck(cudaMalloc(&gp.c_xq, (size_t) n * strata::kernels::native_q8_1_bytes((int) H, 1)), "c_xq");   // its ncols <= 8
         ck(cudaMalloc(&gp.c_parts, (size_t) ne * (size_t) H * 4), "c_parts");
+        ck(cudaMemset(gp.c_parts, 0, (size_t) ne * (size_t) H * 4), "c_parts zero");   // a skipped expert's rows stay finite (x 0 below)
         ck(cudaMalloc(&gp.c_scratch, strata::kernels::native_expert_scratch_bytes(ne, im.g.n_ff)), "c_scratch");
         // + 128 ints of slack: the MMQ down product takes its ids from c_dst + r0 and reads up to J_best - 1 (<= 127)
         // past the run's last row (src/prefill/moe_mmq.cu); without it the last run of a batch read past the end
@@ -5315,6 +5499,29 @@ bool gpu_run_chunk(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, co
     // file-tier blobs, 81 -> 140 tok/s.  STRATA_PEER_CHUNK=0 keeps every peer-held expert on the primary's stream.
     static const bool chunk_peer = !(std::getenv("STRATA_PEER_CHUNK") && std::getenv("STRATA_PEER_CHUNK")[0] == '0');
     const bool peers_on = chunk_peer && gp.peers_built();
+    // --skip-file T: a file-tier expert none of whose entries keeps its weight (every one below T x its row's weight sum) is
+    // left out of the stream - the sum below zeroes exactly those weights anyway, so the result is the same with the read,
+    // the DMA and the kernel saved (c_parts is zeroed at allocation: its stale rows are finite, and 0 x finite = 0).
+    // STRATA_CHUNK_SKIP_READ=0 keeps streaming them (the old path).
+    int64_t n_excl = 0;
+    if (im.cfg.skip_file > 0.0f && !(std::getenv("STRATA_CHUNK_SKIP_READ") && std::getenv("STRATA_CHUNK_SKIP_READ")[0] == '0')) {
+        std::vector<int32_t> kept((size_t) NX, 0);
+        for (int t = 0; t < n; ++t) {
+            double ws = 0;
+            for (int64_t k = 0; k < K; ++k) ws += (double) w[(size_t) t * K + k];
+            for (int64_t k = 0; k < K; ++k) {
+                const int64_t j = (int64_t) t * K + k;
+                if (!in_pass(j)) continue;
+                const int32_t e = ids[(size_t) j];
+                const bool vram = gp.cache && !im.cfg.no_cache && gp.cache->slot_of(layer, e) >= 0;
+                const bool file = !vram && !gp.arena.ptr(layer, e) && !(peers_on && gp.peer_holding(layer, e));
+                if (!(file && (double) w[(size_t) j] < (double) im.cfg.skip_file * ws)) ++kept[(size_t) e];
+            }
+        }
+        for (int64_t e = 0; e < NX; ++e)
+            if (cnt[(size_t) e] && !kept[(size_t) e]) { cnt[(size_t) e] = 0; ++n_excl; }
+    }
+    if (prof) g_cprof.skip_x += n_excl;
     std::vector<int32_t> order[4];
     std::vector<int32_t> slot_e((size_t) NX, -1);
     for (int64_t e = 0; e < NX; ++e) {
@@ -5344,7 +5551,7 @@ bool gpu_run_chunk(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, co
     std::vector<int32_t> dst((size_t) std::max<int64_t>(NEP, 1)), tok((size_t) std::max<int64_t>(NEP, 1)),
         fill(first.begin(), first.end() - 1);
     for (int64_t j = 0; j < NE; ++j) {
-        if (!in_pass(j)) continue;
+        if (!in_pass(j) || !cnt[(size_t) ids[j]]) continue;   // (cnt 0 in this pass: a skipped file-tier expert's entry)
         const int32_t p = fill[(size_t) ids[j]]++;
         dst[(size_t) p] = (int32_t) j;
         tok[(size_t) p] = (int32_t) (j / K);
@@ -5725,21 +5932,28 @@ bool gpu_run_chunk(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, co
     // ---- chunk_prefetch: layer l's file-tier experts may already sit in a pinned slab (read while layer l-1 ran).
     // The slab holds EVERY file-tier expert of the layer, so this pass's own file-tier set is a subset of it; if it
     // is not (a stale slab, or no slab), the on-demand wave reader below runs exactly as before.
+    // A partial slab (STRATA_CHUNK_PF_FRAC) holds the hottest share: the staged experts come out of it and the rest
+    // (wave_e, ascending ids = their order in stream_e) go through the wave reader as before.
     int64_t pf_slab = -1;
-    if (im.cstage && nF && im.cstage->layer[im.cstage->cur] == layer) {
-        const std::vector<int32_t>& si = im.cstage->idx[im.cstage->cur];
-        bool covers = true;
-        for (size_t k = 0; k < nF && covers; ++k) covers = si[(size_t) order[2][k]] >= 0;
-        if (covers) pf_slab = im.cstage->cur;
+    if (im.cstage && nF && im.cstage->layer[im.cstage->cur] == layer) pf_slab = im.cstage->cur;
+    std::vector<int32_t> wave_e;                       // the file-tier experts the wave reader reads
+    std::vector<int32_t> wave_of((size_t) NX, -1);     // expert -> its index in wave_e
+    HintStage* HS = im.hstage && im.hstage->layer == layer ? im.hstage.get() : nullptr;   // chunk_hint: hinted experts
+    for (const int32_t e : order[2]) {
+        if (pf_slab >= 0 && im.cstage->idx[(size_t) pf_slab][(size_t) e] >= 0) continue;
+        if (HS && HS->idx[(size_t) e] >= 0) continue;
+        wave_of[(size_t) e] = (int32_t) wave_e.size();
+        wave_e.push_back(e);
     }
+    const size_t nW = wave_e.size();
     if (im.cstage && nF) {
         g_pf.dmas += (int64_t) nF;
-        if (pf_slab < 0) ++g_pf.off;
+        if (nW) ++g_pf.off;
     }
     const int64_t per_half = std::max<int64_t>(1, gp.c_half / SL);
     const size_t slots_half = (size_t) std::max<int64_t>(1, gp.c_bhalf / BL), cap = 2 * slots_half;
     auto slot_ptr = [&](size_t k) { return gp.c_bounce[(k % cap) / slots_half] + ((k % cap) % slots_half) * (size_t) BL; };
-    std::vector<std::atomic<int>> ready(nF), pdone(nF);   // pdone: parts of a blob read (STRATA_WAVE_PARTS)
+    std::vector<std::atomic<int>> ready(nW), pdone(nW);   // pdone: parts of a blob read (STRATA_WAVE_PARTS)
     for (auto& r : ready) r.store(0, std::memory_order_relaxed);
     for (auto& r : pdone) r.store(0, std::memory_order_relaxed);
     std::atomic<size_t> rnext{0}, rdone{0};
@@ -5750,7 +5964,7 @@ bool gpu_run_chunk(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, co
     auto start_wave = [&]() {   // the next `cap` file blobs (their slots must be free: the caller made sure)
         for (auto& t : readers) t.join();
         readers.clear();
-        const size_t w0 = wave_end, w1 = std::min(nF, wave_end + cap);
+        const size_t w0 = wave_end, w1 = std::min(nW, wave_end + cap);
         wave_end = w1;
         // STRATA_WAVE_THREADS (default 32, was 8): the on-demand reader's threads - small batch turns read only their
         // routed file-tier experts here, so this is their NVMe queue depth.  s11, +272-token turn at 512K: 8 / 16 / 32
@@ -5772,17 +5986,17 @@ bool gpu_run_chunk(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, co
             readers.emplace_back([&, w1]() {
                 for (size_t x; (x = rnext.fetch_add(1)) < w1 * P;) {
                     const size_t q = x / P;
-                    if (P == 1) im.blobs->read(layer, order[2][q], slot_ptr(q));
-                    else im.blobs->read_part(layer, order[2][q], (int) (x % P), (int) P, slot_ptr(q));
+                    if (P == 1) im.blobs->read(layer, wave_e[q], slot_ptr(q));
+                    else im.blobs->read_part(layer, wave_e[q], (int) (x % P), (int) P, slot_ptr(q));
                     if (P == 1 || pdone[q].fetch_add(1, std::memory_order_acq_rel) + 1 == (int) P) {   // the blob's last part
                         ready[q].store(1, std::memory_order_release);
                         ready[q].notify_one();
-                        if (prof && rdone.fetch_add(1) + 1 == nF) t_rd_last.store(now_ms());
+                        if (prof && rdone.fetch_add(1) + 1 == nW) t_rd_last.store(now_ms());
                     }
                 }
             });
     };
-    if (nF && pf_slab < 0) {
+    if (nW) {
         // the bounce slots are shared by every class pass: the previous pass returned (non-last passes do not
         // sync) with its DMAs out of them possibly still queued on s_cp - the readers must not overwrite them yet
         ck(cudaStreamSynchronize(gp.s_cp), "bounce free");
@@ -5800,15 +6014,24 @@ bool gpu_run_chunk(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, co
         std::vector<unsigned long long> ps;
         for (size_t i = b0; i < b1; ++i) {
             const uint8_t* src;
+            const int32_t sq = (i >= nA && pf_slab >= 0) ? im.cstage->idx[(size_t) pf_slab][(size_t) stream_e[i]] : -1;
+            const int32_t hq = (i >= nA && HS) ? HS->idx[(size_t) stream_e[i]] : -1;
             if (i < nA) {
                 src = gp.arena.ptr(layer, stream_e[i]);   // (arena_e: not prestaged)
-            } else if (pf_slab >= 0) {
-                const size_t k = i - nA;
-                const int32_t q = im.cstage->idx[pf_slab][(size_t) order[2][k]];
-                src = im.cstage->slab[pf_slab] + im.cstage->off[pf_slab][(size_t) q];
+            } else if (sq >= 0) {   // staged by the chunk prefetch
+                src = im.cstage->slab[(size_t) pf_slab] + im.cstage->off[(size_t) pf_slab][(size_t) sq];
                 ++g_pf.used;
+            } else if (hq >= 0) {   // read under the dense half (chunk_hint): wait for its last part if it is still coming
+                if (!HS->ready[hq].load(std::memory_order_acquire)) {
+                    const double tw = now_ms();
+                    HS->ready[hq].wait(0, std::memory_order_acquire);
+                    t_file += now_ms() - tw;
+                    HS->wait_ms += now_ms() - tw;
+                }
+                src = HS->slab + (size_t) hq * (size_t) HS->slot_bytes;
+                ++HS->served;
             } else {
-                const size_t k = i - nA;
+                const size_t k = (size_t) wave_of[(size_t) stream_e[i]];
                 if (k >= wave_end) {   // a new wave reuses the slots: every DMA out of them must be done first
                     const double tw = now_ms();
                     ck(cudaStreamSynchronize(gp.s_cp), "wave");
@@ -5846,10 +6069,10 @@ bool gpu_run_chunk(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, co
     }
     for (auto& t : readers) t.join();
     const int64_t n_file = (int64_t) nF;
-    if (prof && nF && pf_slab < 0) {
+    if (prof && nW) {
         g_cprof.file_rd += now_ms() - t_rd0;
         g_cprof.rd_busy += t_rd_last.load() - t_rd0;
-        g_cprof.file_gb += (double) nF * (double) BL / 1e9;
+        g_cprof.file_gb += (double) nW * (double) BL / 1e9;
     }
 
     // ---- chunk_prestage: the next routed layer's arena experts stream in while this layer computes and the caller
@@ -5920,6 +6143,21 @@ bool gpu_run_chunk(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, co
     else
         ck(cudaMemcpyAsync(gp.c_hparts, gp.c_out, (size_t) n * (size_t) H * 4, cudaMemcpyDeviceToHost, gp.s), "out d2h");
     const double ts = now_ms();
+    // STRATA_CHUNK_ASYNC=1: the layer's sum is queued, not waited - the caller's finish graphs wait done_event() on their own
+    // stream and the next layer's dense half runs while this layer's last wave and sum finish on the card.  Off, the
+    // profiler, the saliency readback or a host output: the sync as before.
+    static const bool chunk_async_env = std::getenv("STRATA_CHUNK_ASYNC") && std::getenv("STRATA_CHUNK_ASYNC")[0] == '1';
+    if (chunk_async_env && out_dev && !prof && !im.cfg.saliency) {
+        ck(cudaEventRecord(gp.ev_done, gp.s), "chunk done record");
+        gp.done_pending = true;
+        st.hits = ent_hit;
+        st.pcie = ent_str;
+        st.file_tier = n_file;
+        st.file_ms = t_file;
+        st.wall_ms = now_ms() - t0;
+        im.st.add(st);
+        return true;
+    }
     ck(cudaStreamSynchronize(gp.s), "chunk sync");
     if (!out_dev) std::memcpy(out, gp.c_hparts, (size_t) n * (size_t) H * 4);
     if (im.cfg.saliency) {   // REAP calibration: every entry's unweighted output row, back to the host
@@ -6077,6 +6315,16 @@ bool Ds41MoeTier::run_multi(int64_t layer, int nt, const int32_t* ids, const flo
     return gpu_run_n(*im_, layer, nt, ids, w, x, out);
 #else
     return false;
+#endif
+}
+
+void Ds41MoeTier::set_async(bool on) { im_->async_out = on; }
+bool Ds41MoeTier::async_mode() const { return im_->async_out; }
+void* Ds41MoeTier::done_event() const {
+#if defined(DS4_MOE_CUDA)
+    return im_->gpu && im_->gpu->done_pending ? (void*) im_->gpu->ev_done : nullptr;
+#else
+    return nullptr;
 #endif
 }
 
@@ -6343,6 +6591,69 @@ bool Ds41MoeTier::release_prestage() {
 #endif
 }
 
+void Ds41MoeTier::chunk_hint_begin(int64_t layer) {
+#if defined(DS4_MOE_CUDA)
+    if (!im_->inited || !im_->gpu || im_->cfg.cpu_only) return;
+    if (!hint_alloc(*im_)) return;
+    HintStage& H = *im_->hstage;
+    if (H.layer == layer) return;
+    // the previous layer's slab must be free: its reads done (a hinted expert a class pass never consumed) and the DMAs out
+    // of it landed (run_chunk copies from the slab on s_cp)
+    while (H.inflight.load(std::memory_order_acquire) > 0) std::this_thread::yield();
+    if (im_->gpu->s_cp) cudaStreamSynchronize(im_->gpu->s_cp);
+    for (int i = 0; i < H.used; ++i) {
+        if (H.slot_e[(size_t) i] >= 0) H.idx[(size_t) H.slot_e[(size_t) i]] = -1;
+        H.slot_e[(size_t) i] = -1;
+        H.ready[i].store(0, std::memory_order_relaxed);
+        H.pdone[i].store(0, std::memory_order_relaxed);
+    }
+    H.used = 0;
+    H.layer = layer;
+#else
+    (void) layer;
+#endif
+}
+
+void Ds41MoeTier::chunk_hint(int64_t layer, const int32_t* ids, const float* w, int n) {
+#if defined(DS4_MOE_CUDA)
+    if (!im_->hstage || !ids || n <= 0) return;
+    HintStage& H = *im_->hstage;
+    if (H.layer != layer) return;
+    const int64_t NX = im_->g.n_experts, K = im_->g.top_k, NE = (int64_t) n * K;
+    // the skip rule of run_chunk (STRATA_CHUNK_SKIP_READ): a file-tier expert no token of the batch keeps is never read;
+    // hinting only the experts some token of this span keeps reads exactly that set (an expert kept by a later span is
+    // hinted there)
+    static const bool skip_read = !(std::getenv("STRATA_CHUNK_SKIP_READ") && std::getenv("STRATA_CHUNK_SKIP_READ")[0] == '0');
+    const float skip = (skip_read && w) ? im_->cfg.skip_file : 0.0f;
+    std::vector<std::array<int32_t, 3>> jobs;
+    for (int64_t j = 0; j < NE; ++j) {
+        const int32_t e = ids[j];
+        if (e < 0 || e >= NX || H.idx[(size_t) e] >= 0 || H.used >= H.n_slots) continue;
+        if (skip > 0.0f) {
+            const int64_t t = j / K;
+            double ws = 0;
+            for (int64_t k = 0; k < K; ++k) ws += w[t * K + k];
+            if (w[j] < skip * ws) continue;   // this token would drop it; another token may keep it
+        }
+        if (!chunk_pf_file_tier(*im_, layer, e)) continue;
+        const int slot = H.used++;
+        H.idx[(size_t) e] = slot;
+        H.slot_e[(size_t) slot] = e;
+        for (int p = 0; p < kHintParts; ++p) jobs.push_back({slot, e, p});
+    }
+    if (jobs.empty()) return;
+    H.inflight.fetch_add((int64_t) jobs.size(), std::memory_order_acq_rel);
+    H.hinted += (int64_t) jobs.size() / kHintParts;
+    {
+        std::lock_guard<std::mutex> lk(H.mu);
+        for (const auto& jb : jobs) H.q.push_back(jb);
+    }
+    H.cv.notify_all();
+#else
+    (void) layer; (void) ids; (void) w; (void) n;
+#endif
+}
+
 void Ds41MoeTier::release_chunk() {
 #if defined(DS4_MOE_CUDA)
     if (!im_->gpu) return;
@@ -6350,14 +6661,20 @@ void Ds41MoeTier::release_chunk() {
         const ChunkProf& c = g_cprof;
         std::fprintf(stderr, "chunk prof: %lld calls, %lld launches: wall %.0f ms = waits on reads %.0f + wave/copy waits "
                              "%.0f + final sync %.0f + other host %.0f; reader wall %.0f ms; GPU grouped kernels %.0f ms "
-                             "(resident %.0f); file tier %.1f GB read in %.0f ms of reader time = %.2f GB/s\n",
+                             "(resident %.0f); file tier %.1f GB read in %.0f ms of reader time = %.2f GB/s; %lld file-tier experts left unread (skip rule)\n",
                      (long long) c.calls, (long long) c.launches, c.wall, c.file, c.wait_copied, c.sync,
                      c.wall - c.file - c.wait_copied - c.sync, c.file_rd, c.kern, c.resident_kern, c.file_gb, c.rd_busy,
-                     c.rd_busy > 0 ? c.file_gb / (c.rd_busy / 1000.0) : 0.0);
+                     c.rd_busy > 0 ? c.file_gb / (c.rd_busy / 1000.0) : 0.0, (long long) c.skip_x);
         std::fprintf(stderr, "chunk prof MMQ: %lld sub-runs; PTQ1_0 -> Q2_0 transcode %.0f ms GPU (inside the grouped "
                              "kernels) over %lld sub-runs, %.1f GB of ternary read = %.0f GB/s\n",
                      (long long) c.mmq_subruns, c.tc, (long long) c.tc_launches, c.tc_gb, c.tc > 0 ? c.tc_gb / (c.tc / 1000.0) : 0.0);
         g_cprof = ChunkProf{};
+    }
+    if (chunk_prof() && im_->hstage && (im_->hstage->hinted || im_->hstage->served)) {
+        std::fprintf(stderr, "chunk hint: %lld file-tier experts read under the dense half, %lld of run_chunk's file-tier DMAs served from the slab, "
+                             "%.0f ms waited on them\n", (long long) im_->hstage->hinted, (long long) im_->hstage->served, im_->hstage->wait_ms);
+        im_->hstage->hinted = im_->hstage->served = 0;
+        im_->hstage->wait_ms = 0;
     }
     if (chunk_prof() && (g_pf.blobs || g_pf.used)) {
         const ChunkPfProf& p = g_pf;
@@ -6836,6 +7153,9 @@ void Ds41MoeTier::close() {
     if (!im_) return;
 #if defined(DS4_MOE_CUDA)
     chunk_stage_close(*im_);   // join the prefetch readers, free the pinned slabs
+    hint_close(*im_);
+    for (uint8_t* b : im_->seed_buf) cudaFreeHost(b);
+    im_->seed_buf.clear();
 #endif
     if (im_->gpu) im_->gpu->close();
     im_->gpu.reset();

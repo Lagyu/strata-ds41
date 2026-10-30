@@ -972,6 +972,82 @@ int main(int argc, char ** argv) {
         constexpr int kD3PfRows = 8;
         static_assert(kD3PfRows <= Ds41MoeTier::kMaxMulti, "the prefetch is consumed by ONE tier call per layer");
         const bool pf_now = rdev1 && !no_tier_batch && d3_pf > 0 && m <= kD3PfRows && !tier_skip;
+        // STRATA_TIER_ASYNC=1: the async layer sequence - the tier call returns once queued (Ds41MoeTier::set_async), the
+        // finish (+ next prediction) and the NEXT layer's attention graph are queued behind it, and the host waits once per
+        // layer, for the router ids.  The same graphs and tier calls in the same stream order (bit for bit); the host's
+        // graph queueing (~0.7 ms a layer of 59 launches) runs under the tier's DMA instead of after it.
+        static const bool tier_async_env = std::getenv("STRATA_TIER_ASYNC") && std::getenv("STRATA_TIER_ASYNC")[0] == '1';
+        static const int d3_spec_now = std::getenv("STRATA_D3_SPEC") ? std::atoi(std::getenv("STRATA_D3_SPEC")) : 0;
+        const bool async_now = tier_async_env && rdev1 && !no_tier_batch && !tier_skip && !d3_fpred && d3_spec_now <= 0 && dense.async_ready();
+        tier.set_async(async_now);
+        if (async_now) {
+            auto rank_prefetch = [&](int l) {   // the predicted union, ranked, into the prefetch slots (as the loop below)
+                pv_score.clear();
+                for (int t = 0; t < m; ++t)
+                    for (int i = 0; i < 16; ++i) {
+                        const int e = pv_pred[(size_t) t * 16 + i];
+                        if (e < 0) continue;
+                        auto it = std::find_if(pv_score.begin(), pv_score.end(), [&](const std::pair<int, int> & p) { return p.first == e; });
+                        if (it == pv_score.end()) pv_score.push_back({ e, 16 - i }); else it->second += 16 - i;
+                    }
+                std::stable_sort(pv_score.begin(), pv_score.end(), [](const std::pair<int, int> & a, const std::pair<int, int> & b) { return a.second > b.second; });
+                pv_rank.clear();
+                for (const auto & p : pv_score) pv_rank.push_back(p.first);
+                tier.prefetch_multi(l, pv_rank.data(), (int) pv_rank.size(), d3_pf);
+            };
+            pv_pred.resize((size_t) m * 16);
+            if (pf_now && dense.predict_multi(0, pv_pred.data())) rank_prefetch(0);   // layer 0: before its attention (as the sync loop)
+            lapd(1);
+            if (!dense.attn_router_begin(0)) { ferr = dense.last_error(); return false; }
+            bool pred_queued = false;
+            for (int l = 0; l < n_layer; ++l) {
+                if (l > 0 && pf_now && pred_queued && dense.predict_wait(pv_pred.data())) rank_prefetch(l);   // under attention l
+                pred_queued = false;
+                lapd(1);
+                const float * fn = nullptr;
+                if (!dense.attn_router_end(l, mids.data(), mw.data(), &fn)) { ferr = dense.last_error(); return false; }
+                lapd(2);
+                g_routes.add(l, mids.data(), m);
+                lap(0);
+                constexpr int kMM = Ds41MoeTier::kMaxMulti;
+                for (int off = 0; off < m; off += kMM) {
+                    const int chunk = std::min(kMM, m - off);
+                    if (!tier.run_multi_to_dev(l, chunk, mids.data() + (size_t) off * top_k, mw.data() + (size_t) off * top_k,
+                                               fn + (size_t) off * n_embd, rdev1 + (size_t) off * n_embd)) {
+                        ferr = "tier.run_multi_to_dev failed"; return false;
+                    }
+                }
+                lap(1);
+                tqd = tq;
+                void * done_ev = tier.done_event();
+                if (l + 1 < n_layer) {
+                    if (pf_now && dense.finish_predict_multi_async(l, l + 1, done_ev)) pred_queued = true;
+                    else {
+                        if (!dense.finish_async(l, done_ev)) { ferr = dense.last_error(); return false; }
+                        if (pf_now && dense.predict_multi(l + 1, pv_pred.data())) rank_prefetch(l + 1);   // (syncs; the fused graph is off)
+                    }
+                    if (!dense.attn_router_begin(l + 1)) { ferr = dense.last_error(); return false; }
+                } else if (!dense.finish_async(l, done_ev)) { ferr = dense.last_error(); return false; }
+                lap(0);
+                lapd(3);
+                for (int j = 0; j < 3; ++j) {
+                    if (l != dm_layers[j]) continue;
+                    if (!dense.read_state(vx, vpre)) { ferr = dense.last_error(); return false; }
+                    const size_t HC = vx.size() / ((size_t) m * n_embd);
+                    for (int t = 0; t < m; ++t)
+                        for (size_t h = 0; h < HC; ++h) {
+                            const float * xs = vx.data() + ((size_t) t * HC + h) * n_embd;
+                            float * dst = vh.data() + (size_t) t * 3 * n_embd + (size_t) j * n_embd;
+                            for (int64_t d = 0; d < n_embd; ++d) dst[d] += xs[d] / (float) HC;
+                        }
+                    lap(2);
+                }
+            }
+            vlog.resize((size_t) m * nv);
+            if (!dense.logits(0, m, vlog.data())) { ferr = dense.last_error(); return false; }
+            lap(3);
+            return true;
+        }
         bool have_pred = false;   // this layer's prediction came with the previous layer's finish (finish_predict_multi)
         for (int l = 0; l < n_layer; ++l) {
             if (pf_now) {
@@ -1164,8 +1240,11 @@ int main(int argc, char ** argv) {
                     (long long) (tier.vram_bytes() >> 20));
         std::fflush(stdout);
     };
+    static const bool seed_prof = std::getenv("STRATA_SEED_PROF") != nullptr;
     auto open_cache = [&]() -> bool {
+        const double oc0 = seed_prof ? now_ms() : 0;
         dense.release_pass();
+        if (seed_prof) std::fprintf(stderr, "seed prof: release_pass %.0f ms\n", now_ms() - oc0);
 #if defined(DS41_HAVE_DSPARK)
         if (dsp_path && !dsp) {
             Ds41DSparkConfig sc;
@@ -1357,9 +1436,11 @@ int main(int argc, char ** argv) {
                             if (!dense.attn_router_span_kv(l, s, sn)) { ferr = dense.last_error(); return false; }
                         }
                     }
+                    tier.chunk_hint_begin(l);   // STRATA_CHUNK_HINT_GIB: this layer's file-tier reads start span by span
                     for (int s = d0; s < B; s += SB) {   // sub-batches in order: the layer's KV state advances as today
                         const int sn = std::min(SB, B - s);
                         if (!dense.attn_router_span(l, s, sn)) { ferr = dense.last_error(); return false; }
+                        tier.chunk_hint(l, dense.batch_ids() + (size_t) s * top_k, dense.batch_wts() + (size_t) s * top_k, sn);
                     }
                     if (B > d0) g_routes.add(l, dense.batch_ids() + (size_t) d0 * top_k, B - d0);
                     const double t1 = now_ms();
@@ -1383,9 +1464,11 @@ int main(int argc, char ** argv) {
                     t0 = now_ms();
                     fd_tier += t0 - t1;
                     if (!rdev && !dense.upload_routed(brouted.data(), B)) { ferr = dense.last_error(); return false; }
+                    void * chunk_ev = rdev ? tier.done_event() : nullptr;   // STRATA_CHUNK_ASYNC: the sum still queued on the tier's stream
                     for (int s = d0; s < B; s += SB) {
                         const int sn = std::min(SB, B - s);
-                        if (!dense.finish_span(l, s, sn)) { ferr = dense.last_error(); return false; }
+                        if (!dense.finish_span(l, s, sn, chunk_ev)) { ferr = dense.last_error(); return false; }
+                        chunk_ev = nullptr;   // one wait: the later spans are stream-ordered behind the first
                     }
                     // serve DSpark seed (bcap_n > 0): the main_hidden rows of the batch's last bcap_n tokens - pass_v's
                     // HC-mean of the state leaving dm_layers[j] - read here, so the tail need not re-run as passes
@@ -2052,6 +2135,7 @@ int main(int argc, char ** argv) {
                 std::fprintf(stderr, "serve: DSpark %ld passes, %.2f tokens/pass (all requests %.2f)\n", r.rq_pass,
                              1.0 + (double) r.rq_acc / r.rq_pass, 1.0 + (double) sv_acc / std::max(1L, sv_pass));
             }
+            dense.prof_report("decode");   // STRATA_DENSE_PROF=1: the verify passes' dense split (no-op otherwise)
             if (pass_prof && pp_n > 0) {
                 const double n = (double) pp_n, pn = (double) std::max(1L, pv_n - pp_pvn);
                 std::fprintf(stderr, "serve: pass prof: %ld passes, %.2f rows/pass, %.1f ms/pass = verify %.1f (dense %.1f [begin %.2f predict %.2f "

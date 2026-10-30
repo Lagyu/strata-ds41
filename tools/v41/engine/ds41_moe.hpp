@@ -516,6 +516,14 @@ public:
     void trace_mark(const float* v, int n);
     /// cudaProfilerStart / Stop (nsys --capture-range=cudaProfilerApi); a no-op without CUDA.
     static void profiler(bool on);
+    /// STRATA_TIER_ASYNC (the verify passes): run_multi_to_dev returns once its copies and kernels are QUEUED on the tier's
+    /// stream, without the host sync that ends the call otherwise; done_event() is a cudaEvent_t (as void*) recorded after
+    /// its last kernel, which the caller's next device work on out_dev waits on (Ds41Dense::finish_async).  The pinned
+    /// buffers the call reads stay the tier's until the next call, which waits the event first; prefetch_multi waits it
+    /// too.  The same copies and kernels in the same order - only the host wait moves.  Off = the synchronous call.
+    void set_async(bool on);
+    bool async_mode() const;
+    void* done_event() const;
     /// A prompt chunk: `n` tokens (any count) of one layer, `ids`/`w` n*top_k token-major, `x`/`out` n*n_embd.  GPU
     /// tier: every expert on the card - resident from its slot, the rest streamed once per chunk (MiMo prefill;
     /// MIMO_CHUNK_STAGE_MIB sizes the two streaming halves, default 1024).  CPU tier: token by token.
@@ -523,6 +531,12 @@ public:
     /// run_chunk writing the n * n_embd sums to device memory `out_dev` (same device, e.g. the dense half's chunk
     /// tensor) instead of the host.  GPU tier only.
     bool run_chunk_dev(int64_t layer, int n, const int32_t* ids, const float* w, const float* x, void* out_dev);
+    /// STRATA_CHUNK_HINT_GIB=G (0 = off): a layer-major batch's file-tier reads start as each dense span has routed.  The
+    /// feed loop calls chunk_hint_begin(layer) before the layer's spans and chunk_hint(layer, ids, n) with every span's routed
+    /// ids right after its router; run_chunk then takes those experts out of a G GiB pinned slab (read by 32 threads under
+    /// the remaining spans) and reads only the rest on demand.  Only routed experts are read; a hint changes no result.
+    void chunk_hint_begin(int64_t layer);
+    void chunk_hint(int64_t layer, const int32_t* ids, const float* w, int n);
     /// The arena alone from a routing profile (the order `seed_from_routes` would give it, incl. arena_skip_resident),
     /// WITHOUT opening the VRAM cache - so prompt chunks can run first and `release_chunk` can give their buffers back
     /// before the cache takes the VRAM.  A later `seed_from_routes` keeps this arena and only seeds the cache.

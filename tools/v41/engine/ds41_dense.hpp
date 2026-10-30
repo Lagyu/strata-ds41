@@ -155,7 +155,9 @@ public:
     /// The routed-sum input tensor's device memory (columns of n_embd floats; null on the CPU backend): the tier can
     /// write a layer-major batch's routed sums straight into it (run_chunk_dev) instead of upload_routed's host trip.
     float * routed_dev();
-    bool finish_span(int il, int col0, int n);
+    /// done_event (STRATA_CHUNK_ASYNC): the expert tier's cudaEvent_t (as void*) its queued sum recorded - the finish graph
+    /// waits it on the backend's stream before it reads the routed sums; null = the sums are already home.
+    bool finish_span(int il, int col0, int n, void * done_event = nullptr);
     /// STRATA_DENSE_PROF=1: print + reset the batch dense split (build / alloc / compute / Engram / readback) - diagnostic
     void prof_report(const char * tag);
     /// Give the prompt passes' compute buffer back to the device (rebuilt by the next multi-token pass): the deferred
@@ -204,6 +206,19 @@ public:
     /// top_ids: 16 * n ids (token-major).  False (nothing done) when the merged graph is disabled (STRATA_DENSE_FUSED
     /// bit 1024 off, DS41_PASS_GRAPH_CACHE=0): the caller then runs finish() and predict_multi() as before.
     bool finish_predict_multi(int il, int next_il, int * top_ids);
+    /// The async layer sequence (STRATA_TIER_ASYNC, the verify passes): attn_router_begin(il) QUEUES layer il's
+    /// attention+router graph and returns; attn_router_end(il, ...) waits for it and reads ids / wts / fn back (=
+    /// attn_router's outputs).  finish_async / finish_predict_multi_async queue the finish (+ the next layer's prediction)
+    /// behind a wait on `done_event` (the expert tier's cudaEvent_t as void*, null = none), and predict_wait returns the
+    /// prediction the last finish_predict_multi_async queued (false: none).  The same graphs in the same stream order as
+    /// the synchronous calls - only the host waits move, so the caller can queue the next layer's attention while the
+    /// tier's copies and kernels still run.  async_ready(): the backend has events (CUDA / HIP).
+    bool async_ready() const;
+    bool attn_router_begin(int il);
+    bool attn_router_end(int il, int * ids, float * wts, const float ** fn_host);
+    bool finish_async(int il, void * done_event);
+    bool finish_predict_multi_async(int il, int next_il, void * done_event);
+    bool predict_wait(int * top_ids);
     /// finish_predict + the routing predictions of the `ahead` layers after next_il, from the same state, in the same
     /// graph: ahead_ids[a * 16 ..] = layer next_il + 1 + a's top 16 (-1 past the last layer).  For speculative
     /// file-tier reads; a hint only.

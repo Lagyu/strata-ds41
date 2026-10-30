@@ -557,10 +557,10 @@ index 651524b..57c5b8a 100644
  
 diff --git a/ggml/src/ggml-cuda/ds41-fused.cu b/ggml/src/ggml-cuda/ds41-fused.cu
 new file mode 100644
-index 0000000..fd741e1
+index 0000000..d2662ec
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/ds41-fused.cu
-@@ -0,0 +1,660 @@
+@@ -0,0 +1,820 @@
 +// Strata-DS4.1 fused decode-layer glue (GGML_OP_DS41_FUSED).  Each sub-op repeats, step for step and in the same
 +// reduction order, the stock-op composite tools/v41/engine/ds41_dense.cpp built before it (the kernels it replaces are
 +// named at each one), so the values are the same bits.  The gate: ds41_generate --dense-bench rows compared with cmp,
@@ -583,6 +583,7 @@ index 0000000..fd741e1
 +    DS41F_FFN_MIX         = 8,   // pre / post / comb of the FFN mixes into the state  (dsv41_hc_mixes + dsv4_hc_comb + 3 cpy)
 +    DS41F_HC_PRE_NORM_MIX = 9,   // DS41F_HC_PRE_NORM with the pre mix taken from the attention mixes
 +    DS41F_FINISH          = 10,  // x_state = hc_post(shexp + routed, hap, post_f, comb_f)   (add + dsv4_hc_post + cpy)
++    DS41F_HC_MIXES        = 11,  // mixes [24, n] = hc_fn (F16 [HC*D, 24]) x rms_norm(x [D, HC, n])   (rms_norm + mul_mat; the prompt's wide spans)
 +};
 +
 +static constexpr int DS41F_HC  = 4;                           // hc_mult (dsv4-hc.cu's DSV4_HC)
@@ -723,25 +724,62 @@ index 0000000..fd741e1
 +
 +// dsv4_hc_post_f32<true> with the post mix and the comb computed per block from the attention mixes.  A block never
 +// spans two tokens (n_embd * HC % blockDim == 0: checked by the host).
++// A wide pass (the prompt's 512-column spans) ran the per-token post / comb above on thread 0 of EVERY block - 80 blocks a
++// token at D = 5120, each a serial 20-iteration Sinkhorn - 1.7 ms a span (rocprofv3 2026-10-30, 5.5% of the prefill's GPU
++// time).  ds41f_hc_tail_prep_f32 computes them once per token (the same device functions, the same bits) into pc [20, n]
++// (post[4] | comb[16]); the main kernel reads them from there when pc is given.
++static __global__ void ds41f_hc_tail_prep_f32(
++        const float * mixes, int64_t sm0, int64_t sm1, const float * scale, int64_t ss0, const float * base, int64_t sb0,
++        float * pc, int64_t n_tokens, float hc_eps, int32_t n_iter) {
++    const int64_t it = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
++    if (it >= n_tokens) {
++        return;
++    }
++    float post[DS41F_HC], comb[DS41F_HC*DS41F_HC];
++    for (int h = 0; h < DS41F_HC; ++h) {
++        post[h] = ds41f_mix_post(mixes, sm1, scale, base, it, h);
++    }
++    ds41f_comb(mixes, sm0, sm1, scale, ss0, base, sb0, it, hc_eps, n_iter, comb);
++    float * o = pc + it * (DS41F_HC + DS41F_HC*DS41F_HC);
++    for (int h = 0; h < DS41F_HC; ++h) {
++        o[h] = post[h];
++    }
++    for (int i = 0; i < DS41F_HC*DS41F_HC; ++i) {
++        o[DS41F_HC + i] = comb[i];
++    }
++}
++
++template <bool from_pc>
 +static __global__ void ds41f_hc_tail_f32(
 +        const float * mixes, int64_t sm0, int64_t sm1, const float * scale, int64_t ss0, const float * base, int64_t sb0,
 +        const float * attn, int64_t sa0, int64_t sa1,
 +        const float * res, int64_t sr0, int64_t sr1, int64_t sr2,
 +        float * dst, int64_t sd0, int64_t sd1, int64_t sd2,
-+        int64_t n_embd, int64_t n_tokens, float hc_eps, int32_t n_iter) {
++        int64_t n_embd, int64_t n_tokens, float hc_eps, int32_t n_iter, const float * pc) {
 +    __shared__ float s_post[DS41F_HC];
 +    __shared__ float s_comb[DS41F_HC*DS41F_HC];
 +    const int64_t ir     = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
 +    const int64_t nr     = n_embd * DS41F_HC * n_tokens;
 +    const int64_t it_blk = ((int64_t) blockIdx.x * blockDim.x) / (n_embd * DS41F_HC);
-+    // thread 0 alone, as dsv4_hc_comb_f32 (a 4-lane version with the same operation order measured 33 -> 21 us but
-+    // not the same bits: the single-thread code lets the compiler fuse `comb *= inv_sum` into the next phase's
-+    // `sum += comb` across statements, which values passing through shuffles cannot reproduce; ~0.2% of a decode)
-+    if (threadIdx.x == 0 && it_blk < n_tokens) {
-+        for (int h = 0; h < DS41F_HC; ++h) {
-+            s_post[h] = ds41f_mix_post(mixes, sm1, scale, base, it_blk, h);
++    if constexpr (from_pc) {
++        if (threadIdx.x < DS41F_HC + DS41F_HC*DS41F_HC && it_blk < n_tokens) {
++            const float v = pc[it_blk * (DS41F_HC + DS41F_HC*DS41F_HC) + threadIdx.x];
++            if (threadIdx.x < DS41F_HC) {
++                s_post[threadIdx.x] = v;
++            } else {
++                s_comb[threadIdx.x - DS41F_HC] = v;
++            }
 +        }
-+        ds41f_comb(mixes, sm0, sm1, scale, ss0, base, sb0, it_blk, hc_eps, n_iter, s_comb);
++    } else {
++        // thread 0 alone, as dsv4_hc_comb_f32 (a 4-lane version with the same operation order measured 33 -> 21 us but
++        // not the same bits: the single-thread code lets the compiler fuse `comb *= inv_sum` into the next phase's
++        // `sum += comb` across statements, which values passing through shuffles cannot reproduce; ~0.2% of a decode)
++        if (threadIdx.x == 0 && it_blk < n_tokens) {
++            for (int h = 0; h < DS41F_HC; ++h) {
++                s_post[h] = ds41f_mix_post(mixes, sm1, scale, base, it_blk, h);
++            }
++            ds41f_comb(mixes, sm0, sm1, scale, ss0, base, sb0, it_blk, hc_eps, n_iter, s_comb);
++        }
 +    }
 +    __syncthreads();
 +    if (ir >= nr) {
@@ -1056,13 +1094,134 @@ index 0000000..fd741e1
 +    GGML_ASSERT((D * DS41F_HC) % 256 == 0);
 +    const int64_t nr = D * DS41F_HC * n;
 +    const dim3 grid((nr + 255) / 256, 1, 1);
-+    ds41f_hc_tail_f32<<<grid, 256, 0, ctx.stream()>>>(
++    if (n >= 16) {   // a wide pass: the per-token post / comb once, in pc
++        ggml_cuda_pool_alloc<float> pc(ctx.pool(), (size_t) n * (DS41F_HC + DS41F_HC*DS41F_HC));
++        ds41f_hc_tail_prep_f32<<<(unsigned) ((n + 255) / 256), 256, 0, ctx.stream()>>>(
++            (const float *) mixes->data, ds41f_s(mixes, 0), ds41f_s(mixes, 1), (const float *) scale->data, ds41f_s(scale, 0),
++            (const float *) base->data, ds41f_s(base, 0), pc.get(), n, ds41f_pf(dst, 1), ds41f_pi(dst, 2));
++        CUDA_CHECK(cudaGetLastError());
++        ds41f_hc_tail_f32<true><<<grid, 256, 0, ctx.stream()>>>(
++            (const float *) mixes->data, ds41f_s(mixes, 0), ds41f_s(mixes, 1), (const float *) scale->data, ds41f_s(scale, 0),
++            (const float *) base->data, ds41f_s(base, 0),
++            (const float *) attn->data, ds41f_s(attn, 0), ds41f_s(attn, 1),
++            (const float *) res->data, ds41f_s(res, 0), ds41f_s(res, 1), ds41f_s(res, 2),
++            (float *) dst->data, ds41f_s(dst, 0), ds41f_s(dst, 1), ds41f_s(dst, 2),
++            D, n, ds41f_pf(dst, 1), ds41f_pi(dst, 2), pc.get());
++        CUDA_CHECK(cudaGetLastError());
++        return;
++    }
++    ds41f_hc_tail_f32<false><<<grid, 256, 0, ctx.stream()>>>(
 +        (const float *) mixes->data, ds41f_s(mixes, 0), ds41f_s(mixes, 1), (const float *) scale->data, ds41f_s(scale, 0),
 +        (const float *) base->data, ds41f_s(base, 0),
 +        (const float *) attn->data, ds41f_s(attn, 0), ds41f_s(attn, 1),
 +        (const float *) res->data, ds41f_s(res, 0), ds41f_s(res, 1), ds41f_s(res, 2),
 +        (float *) dst->data, ds41f_s(dst, 0), ds41f_s(dst, 1), ds41f_s(dst, 2),
-+        D, n, ds41f_pf(dst, 1), ds41f_pi(dst, 2));
++        D, n, ds41f_pf(dst, 1), ds41f_pi(dst, 2), nullptr);
++    CUDA_CHECK(cudaGetLastError());
++}
++
++// ---------------------------------------------------------------- 11: the hc mixes of a wide pass
++
++// mixes [24, n] = fn (F16 [HC*D, 24]) x rms_norm(x [D, HC, n] as [HC*D, n], eps).  The composite (rms_norm_f32 + the F16
++// mul_mat, which hipBLAS ran as an SGEMM of M = 24 behind an F16 -> F32 convert of the weights) took ~1.1 ms per 512-column
++// span - 11% of the prefill's GPU time (rocprofv3 2026-10-30) for 0.25 GFLOP.  One block per DS41F_MIX_NT tokens: the
++// sum of squares per token, then every output's dot product over the block's strided k pairs, reduced over the block.
++// F32 accumulation in another order than the SGEMM's - the last-ulp class of the chunked vector path (STRATA_HC_MIX_CHUNK).
++static constexpr int DS41F_MIX_NT = 4;
++static __global__ void __launch_bounds__(256) ds41f_hc_mixes_f32(
++        const float * x, int64_t sx0, int64_t sx1, int64_t sx2, const half * w, float * dst,
++        int64_t D, int64_t n_tokens, float eps) {
++    constexpr int NT = DS41F_MIX_NT, NO = DS41F_MIX, BS = 256;
++    const int64_t K = D * DS41F_HC;
++    const int64_t t0 = (int64_t) blockIdx.x * NT;
++    const int tid = threadIdx.x, lane = tid & 31, wp = tid >> 5;
++    const int nt = (int) min<int64_t>(NT, n_tokens - t0);
++    __shared__ float s_red[8][NT * NO];
++    __shared__ float s_inv[NT];
++    auto xat = [&](int t, int64_t k) {   // x[d, ih, t0 + t] for the flat k = ih*D + d
++        const int64_t ih = k / D, d = k - ih * D;
++        return x[d*sx0 + ih*sx1 + (t0 + t)*sx2];
++    };
++    float ss[NT];
++#pragma unroll
++    for (int t = 0; t < NT; ++t) ss[t] = 0.0f;
++    for (int64_t k = tid; k < K; k += BS) {
++#pragma unroll
++        for (int t = 0; t < NT; ++t) {
++            if (t < nt) { const float v = xat(t, k); ss[t] = fmaf(v, v, ss[t]); }
++        }
++    }
++#pragma unroll
++    for (int t = 0; t < NT; ++t) ss[t] = warp_reduce_sum(ss[t]);
++    if (lane == 0) {
++#pragma unroll
++        for (int t = 0; t < NT; ++t) s_red[wp][t] = ss[t];
++    }
++    __syncthreads();
++    if (tid < NT) {
++        float a = 0.0f;
++#pragma unroll
++        for (int q = 0; q < 8; ++q) a += s_red[q][tid];
++        s_inv[tid] = rsqrtf(a / (float) K + eps);
++    }
++    __syncthreads();
++    float inv[NT];
++#pragma unroll
++    for (int t = 0; t < NT; ++t) inv[t] = s_inv[t];
++    float acc[NT][NO];
++#pragma unroll
++    for (int t = 0; t < NT; ++t)
++#pragma unroll
++        for (int h = 0; h < NO; ++h) acc[t][h] = 0.0f;
++    // k pairs: a half2 of the weights and the two activations per token
++    for (int64_t k = 2 * tid; k < K; k += 2 * BS) {
++        float xv[NT][2];
++#pragma unroll
++        for (int t = 0; t < NT; ++t) {
++            xv[t][0] = t < nt ? xat(t, k) * inv[t] : 0.0f;
++            xv[t][1] = t < nt ? xat(t, k + 1) * inv[t] : 0.0f;
++        }
++#pragma unroll
++        for (int h = 0; h < NO; ++h) {
++            const float2 wv = __half22float2(*(const half2 *) (w + (int64_t) h * K + k));
++#pragma unroll
++            for (int t = 0; t < NT; ++t) acc[t][h] = fmaf(xv[t][1], wv.y, fmaf(xv[t][0], wv.x, acc[t][h]));
++        }
++    }
++#pragma unroll
++    for (int t = 0; t < NT; ++t)
++#pragma unroll
++        for (int h = 0; h < NO; ++h) acc[t][h] = warp_reduce_sum(acc[t][h]);
++    __syncthreads();   // s_red is reused
++    if (lane == 0) {
++#pragma unroll
++        for (int t = 0; t < NT; ++t)
++#pragma unroll
++            for (int h = 0; h < NO; ++h) s_red[wp][t * NO + h] = acc[t][h];
++    }
++    __syncthreads();
++    if (tid < NT * NO) {
++        const int t = tid / NO, h = tid - t * NO;
++        if (t < nt) {
++            float a = 0.0f;
++#pragma unroll
++            for (int q = 0; q < 8; ++q) a += s_red[q][tid];
++            dst[(t0 + t) * NO + h] = a;
++        }
++    }
++}
++
++static void ds41f_hc_mixes(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
++    // srcs: x [D, HC, n] F32 (any strides), w [HC*D, 24] F16 contiguous; dst [24, n] F32 contiguous.  params: 1 = eps (f32)
++    const ggml_tensor * x = dst->src[0], * w = dst->src[1];
++    GGML_ASSERT(x->type == GGML_TYPE_F32 && w->type == GGML_TYPE_F16 && dst->type == GGML_TYPE_F32 && ggml_is_contiguous(dst) && ggml_is_contiguous(w));
++    GGML_ASSERT(x->ne[1] == DS41F_HC && w->ne[0] == x->ne[0] * DS41F_HC && w->ne[1] == DS41F_MIX && dst->ne[0] == DS41F_MIX && dst->ne[1] == x->ne[2]);
++    GGML_ASSERT(x->nb[0] == sizeof(float) && (x->ne[0] * DS41F_HC) % 2 == 0);
++    const int64_t D = x->ne[0], n = x->ne[2];
++    const dim3 grid((unsigned) ((n + DS41F_MIX_NT - 1) / DS41F_MIX_NT), 1, 1);
++    ds41f_hc_mixes_f32<<<grid, 256, 0, ctx.stream()>>>(
++        (const float *) x->data, ds41f_s(x, 0), ds41f_s(x, 1), ds41f_s(x, 2), (const half *) w->data, (float *) dst->data,
++        D, n, ds41f_pf(dst, 1));
 +    CUDA_CHECK(cudaGetLastError());
 +}
 +
@@ -1214,6 +1373,7 @@ index 0000000..fd741e1
 +        case DS41F_HC_TAIL:         ds41f_hc_tail(ctx, dst);  break;
 +        case DS41F_FFN_MIX:         ds41f_ffn_mix(ctx, dst);  break;
 +        case DS41F_FINISH:          ds41f_finish(ctx, dst);   break;
++        case DS41F_HC_MIXES:        ds41f_hc_mixes(ctx, dst); break;
 +        case DS41F_ROUTER:          ds41f_router(ctx, dst);   break;
 +        case DS41F_ATTN_K:          ds41f_attn_k(ctx, dst);   break;
 +        case DS41F_ATTN_MASK:       ds41f_attn_mask(ctx, dst); break;
@@ -1805,7 +1965,7 @@ index a9038f1..d6d4528 100644
              return ggml_cuda_flash_attn_ext_supported(dev_ctx->device, op);
          case GGML_OP_CROSS_ENTROPY_LOSS:
 diff --git a/ggml/src/ggml-cuda/lightning-indexer.cu b/ggml/src/ggml-cuda/lightning-indexer.cu
-index 5edc967..5b9f205 100644
+index 5edc967..14ead5f 100644
 --- a/ggml/src/ggml-cuda/lightning-indexer.cu
 +++ b/ggml/src/ggml-cuda/lightning-indexer.cu
 @@ -24,7 +24,7 @@ static __global__ void lightning_indexer_kernel_wmma(
@@ -1922,7 +2082,7 @@ index 5edc967..5b9f205 100644
                  const void * k_base = (const void *) ((const char *) K + i_kv*nbk2 + i_stream*nbk3);
                  dequantize_k(k_base, &k_reg_f[k], i_lane * 4);
              } else {
-@@ -375,9 +391,9 @@ static __global__ void lightning_indexer_kernel_vec(
+@@ -375,13 +391,210 @@ static __global__ void lightning_indexer_kernel_vec(
      if (tid < K_VECS_PER_BLOCK) {
          int i_kv = start_kv_block + tid;
          if (i_kv < n_kv) {
@@ -1931,10 +2091,211 @@ index 5edc967..5b9f205 100644
              float * dst_base = (float *) ((char *) dst + i_batch*nb1 + i_stream*nb3);
 -            dst_base[i_kv] = dst_shared[tid] + __half2float(m_base[i_kv]);
 +            dst_base[i_kv] = i_kv < nvis ? dst_shared[tid] + (NV ? 0.0f : __half2float(m_base[i_kv])) : -INFINITY;
++        }
++    }
++}
++
++
++#if defined(GGML_USE_HIP)
++// STRATA_INDEXER_WMMA=1 (opt-in; =2 also on RDNA3): the lightning indexer on the RDNA matrix cores (the WMMA kernel above
++// is CUDA-only, so this shape ran the vector kernel: 32 heads x 128 dims per key as 32 warp reductions).  A block = one
++// query x 256 keys (8 warps x 2 tiles of 16 keys).  Per warp and 16-dim step: A = 16 heads x 16 dims of the query (the Q
++// tile staged once per block in shared memory), B = 16 dims x 16 keys (each lane's key read straight from its row), FP32
++// accumulators; then relu, the head weights and the head sum in FP32.  MXFP4 keys and the model's FP4-grid queries are
++// exact in BF16, so the MXFP4 path multiplies BF16 operands (every product exact; only the FP32 summation order differs
++// from the vector kernel); F16 keys take the F16 path (Q rounded to F16, as the CUDA WMMA kernel does).
++namespace lidx_wmma {
++constexpr int D = 128, KT = 16, NW = 8, TPW = 2, KB = NW * TPW * KT, LD = D + 8;
++#if defined(__gfx1200__) || defined(__gfx1201__)
++constexpr int KPL = 8;    // the k values a lane gives the 16x16x16 product: gfx12 takes its half of the 16
++#else
++constexpr int KPL = 16;
++#endif
++using f8v = float __attribute__((ext_vector_type(8)));
++using bfv = __bf16 __attribute__((ext_vector_type(KPL)));
++using hfv = _Float16 __attribute__((ext_vector_type(KPL)));
++
++static __device__ __forceinline__ f8v mma(const bfv a, const bfv b, const f8v c) {
++#if defined(__gfx1200__) || defined(__gfx1201__)
++    return __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(a, b, c);
++#elif defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1103__) || \
++    defined(__gfx1150__) || defined(__gfx1151__) || defined(__gfx1152__)
++    return __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a, b, c);
++#else
++    GGML_UNUSED(a); GGML_UNUSED(b);
++    __builtin_trap();
++    return c;
++#endif
++}
++static __device__ __forceinline__ f8v mma(const hfv a, const hfv b, const f8v c) {
++#if defined(__gfx1200__) || defined(__gfx1201__)
++    return __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a, b, c);
++#elif defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1103__) || \
++    defined(__gfx1150__) || defined(__gfx1151__) || defined(__gfx1152__)
++    return __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b, c);
++#else
++    GGML_UNUSED(a); GGML_UNUSED(b);
++    __builtin_trap();
++    return c;
++#endif
++}
++// the C tile row (head) a lane (hi = lane / 16) holds in accumulator register r; its column (key) is lane % 16
++static __device__ __forceinline__ int c_row(const int r, const int hi) {
++#if defined(__gfx1200__) || defined(__gfx1201__)
++    return 8 * hi + r;
++#else
++    return 2 * r + hi;
++#endif
++}
++static __device__ __forceinline__ uint16_t f32_to_bf16_bits(const float x) {   // round to nearest even
++    uint32_t u = __float_as_uint(x);
++    if ((u & 0x7f800000u) == 0x7f800000u) return (uint16_t) (u >> 16);
++    u += 0x7fffu + ((u >> 16) & 1u);
++    return (uint16_t) (u >> 16);
++}
++template <ggml_type TYPE_K> struct op;
++template <> struct op<GGML_TYPE_MXFP4> {
++    using vec = bfv;
++    static __device__ __forceinline__ uint16_t q_bits(const float x) { return f32_to_bf16_bits(x); }
++    // KPL values of the key row at dims [d0, d0 + KPL): one MXFP4 block (32 values: E8M0 scale, then nibbles i / i+16 a byte)
++    static __device__ __forceinline__ vec load_k(const char * kr, const int d0, const bool valid) {
++        union { uint16_t u[KPL]; vec v; } out;
++        if (!valid) {
++#pragma unroll
++            for (int i = 0; i < KPL; ++i) out.u[i] = 0;
++            return out.v;
++        }
++        const uint8_t * b = (const uint8_t *) kr + (d0 / 32) * (1 + QK_MXFP4 / 2);
++        const int within = d0 % 32;
++        const float d = ggml_cuda_e8m0_to_fp32(b[0]) * 0.5f;
++        uint8_t q[KPL];
++        __builtin_memcpy(q, b + 1 + (within % 16), KPL);
++        const bool high = within >= 16;
++#pragma unroll
++        for (int i = 0; i < KPL; ++i) out.u[i] = f32_to_bf16_bits(d * (float) kvalues_mxfp4[high ? (q[i] >> 4) : (q[i] & 0x0F)]);
++        return out.v;
++    }
++};
++template <> struct op<GGML_TYPE_F16> {
++    using vec = hfv;
++    static __device__ __forceinline__ uint16_t q_bits(const float x) { const _Float16 h = (_Float16) x; return __builtin_bit_cast(uint16_t, h); }
++    static __device__ __forceinline__ vec load_k(const char * kr, const int d0, const bool valid) {
++        vec v;
++        if (!valid) {
++#pragma unroll
++            for (int i = 0; i < KPL; ++i) v[i] = (_Float16) 0.0f;
++            return v;
++        }
++        __builtin_memcpy(&v, (const _Float16 *) kr + d0, sizeof(vec));
++        return v;
++    }
++};
++
++template <int N_HEAD, ggml_type TYPE_K>
++static __global__ void __launch_bounds__(NW * 32, 1) indexer_kernel(
++        const float * __restrict__ Q, const char * __restrict__ K, const float * __restrict__ W, const half * __restrict__ M,
++        const float * __restrict__ NV, float * __restrict__ dst, const int n_kv, const int64_t nem3,
++        const size_t nb1, const size_t nb3, const size_t nbq1, const size_t nbq2, const size_t nbq3,
++        const size_t nbk2, const size_t nbk3, const size_t nbw1, const size_t nbw3, const size_t nbm1, const size_t nbm3) {
++    using O = op<TYPE_K>;
++    using vec = typename O::vec;
++    constexpr int HT = N_HEAD / 16;
++    const int i_batch = blockIdx.y, i_stream = blockIdx.z;
++    const int tid = threadIdx.x, wp = tid >> 5, lane = tid & 31, l16 = lane & 15, hi = lane >> 4;
++    const int kofs = KPL == 8 ? 8 * hi : 0;
++    const int kv0 = blockIdx.x * KB;
++    const char * q_base = (const char *) Q + i_batch * nbq2 + i_stream * nbq3;
++    const float * w_base = (const float *) ((const char *) W + i_batch * nbw1 + i_stream * nbw3);
++    float * dst_base = (float *) ((char *) dst + i_batch * nb1 + i_stream * nb3);
++    const float nvis = NV ? *(const float *) ((const char *) NV + i_batch * nbm1 + (i_stream % nem3) * nbm3) : (float) n_kv;
++    if (!(kv0 < nvis)) {   // uniform across the block: no scores
++        for (int i = tid; i < KB && kv0 + i < n_kv; i += NW * 32) dst_base[kv0 + i] = -INFINITY;
++        return;
++    }
++    __shared__ __align__(16) uint16_t qs[N_HEAD * LD];
++    __shared__ float ws[N_HEAD];
++    for (int i = tid; i < N_HEAD * D; i += NW * 32) {
++        const int h = i / D, d = i % D;
++        qs[h * LD + d] = O::q_bits(((const float *) (q_base + h * nbq1))[d]);
++    }
++    if (tid < N_HEAD) ws[tid] = w_base[tid];
++    __syncthreads();
++    const int wk0 = kv0 + wp * TPW * KT;
++    const char * k_base = K + i_stream * nbk3;
++    f8v acc[TPW][HT];
++#pragma unroll
++    for (int t = 0; t < TPW; ++t)
++#pragma unroll
++        for (int ht = 0; ht < HT; ++ht)
++#pragma unroll
++            for (int r = 0; r < 8; ++r) acc[t][ht][r] = 0.0f;
++#pragma unroll
++    for (int ks = 0; ks < D / 16; ++ks) {
++        vec b[TPW];
++#pragma unroll
++        for (int t = 0; t < TPW; ++t) {
++            const int key = wk0 + t * KT + l16;
++            b[t] = O::load_k(k_base + (size_t) key * nbk2, ks * 16 + kofs, key < n_kv);
          }
++#pragma unroll
++        for (int ht = 0; ht < HT; ++ht) {
++            vec a;
++            __builtin_memcpy(&a, qs + (ht * 16 + l16) * LD + ks * 16 + kofs, sizeof(vec));
++#pragma unroll
++            for (int t = 0; t < TPW; ++t) acc[t][ht] = mma(a, b[t], acc[t][ht]);
++        }
++    }
++    const half * m_base = M ? (const half *) ((const char *) M + i_batch * nbm1 + (i_stream % nem3) * nbm3) : nullptr;
++#pragma unroll
++    for (int t = 0; t < TPW; ++t) {
++        float s = 0.0f;
++#pragma unroll
++        for (int ht = 0; ht < HT; ++ht)
++#pragma unroll
++            for (int r = 0; r < 8; ++r) s += ws[ht * 16 + c_row(r, hi)] * fmaxf(acc[t][ht][r], 0.0f);
++        s += __shfl_xor(s, 16, 32);   // the other half of the heads (the lane with the same key, hi ^ 1)
++        const int key = wk0 + t * KT + l16;
++        if (hi == 0 && key < n_kv) dst_base[key] = key < nvis ? s + (m_base ? __half2float(m_base[key]) : 0.0f) : -INFINITY;
      }
  }
-@@ -393,7 +409,7 @@ static __global__ void lightning_indexer_kernel_vec(
+ 
++static bool applies(const int cc, const ggml_tensor * q, const ggml_tensor * k) {
++    static const int mode = [] { const char * e = getenv("STRATA_INDEXER_WMMA"); return e ? atoi(e) : 0; }();
++    if (mode <= 0) return false;
++    if (!GGML_CUDA_CC_IS_RDNA4(cc) && !(mode >= 2 && GGML_CUDA_CC_IS_RDNA3(cc))) return false;
++    if (q->ne[0] != D || (q->ne[1] != 32 && q->ne[1] != 64) || q->nb[0] != sizeof(float)) return false;
++    if (k->type != GGML_TYPE_MXFP4 && k->type != GGML_TYPE_F16) return false;
++    if (k->ne[1] != 1 || k->nb[2] != ggml_row_size(k->type, D)) return false;   // contiguous key rows
++    static bool said = false;
++    if (!said) { said = true; fprintf(stderr, "indexer: RDNA matrix-core kernel (STRATA_INDEXER_WMMA=%d)\n", mode); }
++    return true;
++}
++template <int N_HEAD, ggml_type TYPE_K>
++static void launch_t(cudaStream_t stream, const dim3 grid, const float * q, const char * k, const float * w, const half * m,
++                     const float * nv, float * dst, const int n_kv, const int64_t nem3, const size_t nb1, const size_t nb3,
++                     const size_t nbq1, const size_t nbq2, const size_t nbq3, const size_t nbk2, const size_t nbk3,
++                     const size_t nbw1, const size_t nbw3, const size_t nbm1, const size_t nbm3) {
++    indexer_kernel<N_HEAD, TYPE_K><<<grid, NW * 32, 0, stream>>>(q, k, w, m, nv, dst, n_kv, nem3, nb1, nb3, nbq1, nbq2, nbq3,
++                                                                  nbk2, nbk3, nbw1, nbw3, nbm1, nbm3);
++}
++static void launch(cudaStream_t stream, const int n_head, const ggml_type type_k, const int n_batch, const int n_stream,
++                   const float * q, const char * k, const float * w, const half * m, const float * nv, float * dst,
++                   const int n_kv, const int64_t nem3, const size_t nb1, const size_t nb3, const size_t nbq1, const size_t nbq2,
++                   const size_t nbq3, const size_t nbk2, const size_t nbk3, const size_t nbw1, const size_t nbw3,
++                   const size_t nbm1, const size_t nbm3) {
++    const dim3 grid((n_kv + KB - 1) / KB, n_batch, n_stream);
++    if (n_head == 32 && type_k == GGML_TYPE_MXFP4) launch_t<32, GGML_TYPE_MXFP4>(stream, grid, q, k, w, m, nv, dst, n_kv, nem3, nb1, nb3, nbq1, nbq2, nbq3, nbk2, nbk3, nbw1, nbw3, nbm1, nbm3);
++    else if (n_head == 32 && type_k == GGML_TYPE_F16) launch_t<32, GGML_TYPE_F16>(stream, grid, q, k, w, m, nv, dst, n_kv, nem3, nb1, nb3, nbq1, nbq2, nbq3, nbk2, nbk3, nbw1, nbw3, nbm1, nbm3);
++    else if (n_head == 64 && type_k == GGML_TYPE_MXFP4) launch_t<64, GGML_TYPE_MXFP4>(stream, grid, q, k, w, m, nv, dst, n_kv, nem3, nb1, nb3, nbq1, nbq2, nbq3, nbk2, nbk3, nbw1, nbw3, nbm1, nbm3);
++    else launch_t<64, GGML_TYPE_F16>(stream, grid, q, k, w, m, nv, dst, n_kv, nem3, nb1, nb3, nbq1, nbq2, nbq3, nbk2, nbk3, nbw1, nbw3, nbm1, nbm3);
++}
++}  // namespace lidx_wmma
++#endif  // defined(GGML_USE_HIP)
++
+ #define LIGHTNING_INDEXER_CASE(lightning_indexer_kernel, n_embd, n_head, K, type_K)         \
+     if (K->type == (type_K)) {                                                              \
+         lightning_indexer_kernel<WARPS_PER_BLOCK, K_VECS_PER_BLOCK, n_embd, n_head, type_K> \
+@@ -393,7 +606,7 @@ static __global__ void lightning_indexer_kernel_vec(
              nbk1, nbk2, nbk3,                                                               \
              nbw1, nbw2, nbw3,                                                               \
              nbm1, nbm2, nbm3,                                                               \
@@ -1943,7 +2304,7 @@ index 5edc967..5b9f205 100644
          );                                                                                  \
      } else
  
-@@ -406,7 +422,7 @@ void ggml_cuda_lightning_indexer(ggml_backend_cuda_context & ctx, ggml_tensor *
+@@ -406,7 +619,7 @@ void ggml_cuda_lightning_indexer(ggml_backend_cuda_context & ctx, ggml_tensor *
      GGML_ASSERT(dst->type == GGML_TYPE_F32);
      GGML_ASSERT(  q->type == GGML_TYPE_F32);
      GGML_ASSERT(  w->type == GGML_TYPE_F32);
@@ -1952,7 +2313,7 @@ index 5edc967..5b9f205 100644
  
      GGML_TENSOR_LOCALS(int64_t, neq,  q, ne)
      GGML_TENSOR_LOCALS(size_t,  nbq,  q, nb)
-@@ -440,7 +456,8 @@ void ggml_cuda_lightning_indexer(ggml_backend_cuda_context & ctx, ggml_tensor *
+@@ -440,15 +653,23 @@ void ggml_cuda_lightning_indexer(ggml_backend_cuda_context & ctx, ggml_tensor *
      const float *   q_d = (const float *)   q->data;
      const char  *   k_d = (const char  *)   k->data;
      const float *   w_d = (const float *)   w->data;
@@ -1962,8 +2323,15 @@ index 5edc967..5b9f205 100644
      float       * dst_d = (      float *) dst->data;
  
      const int device = ggml_cuda_get_device();
-@@ -448,7 +465,7 @@ void ggml_cuda_lightning_indexer(ggml_backend_cuda_context & ctx, ggml_tensor *
+     const int cc     = ggml_cuda_info().devices[device].cc;
  
++#if defined(GGML_USE_HIP)
++    if (n_embd == 128 && lidx_wmma::applies(cc, q, k)) {
++        lidx_wmma::launch(ctx.stream(), n_head, k->type, n_batch, n_stream, q_d, k_d, w_d, m_d, nv_d, dst_d, n_kv, nem3,
++                          nb1, nb3, nbq1, nbq2, nbq3, nbk2, nbk3, nbw1, nbw3, nbm1, nbm3);
++        return;
++    }
++#endif
      if (n_embd == 128 && n_head == 64) {
  #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 -        if (GGML_CUDA_CC_IS_NVIDIA(cc) && turing_mma_available(cc) && k->type != GGML_TYPE_F32 && k->type != GGML_TYPE_BF16) {
@@ -1971,7 +2339,7 @@ index 5edc967..5b9f205 100644
              // use wmma kernel
              constexpr int K_VECS_PER_BLOCK = 32;
              constexpr int WARPS_PER_BLOCK = 8;
-@@ -484,12 +501,14 @@ void ggml_cuda_lightning_indexer(ggml_backend_cuda_context & ctx, ggml_tensor *
+@@ -484,12 +705,14 @@ void ggml_cuda_lightning_indexer(ggml_backend_cuda_context & ctx, ggml_tensor *
              LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_vec, 128, 64, k, GGML_TYPE_Q5_1)
              LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_vec, 128, 64, k, GGML_TYPE_Q8_0)
              LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_vec, 128, 64, k, GGML_TYPE_BF16)
@@ -1987,7 +2355,7 @@ index 5edc967..5b9f205 100644
              // use wmma kernel
              constexpr int K_VECS_PER_BLOCK = 32;
              constexpr int WARPS_PER_BLOCK = 8;
-@@ -525,6 +544,8 @@ void ggml_cuda_lightning_indexer(ggml_backend_cuda_context & ctx, ggml_tensor *
+@@ -525,6 +748,8 @@ void ggml_cuda_lightning_indexer(ggml_backend_cuda_context & ctx, ggml_tensor *
              LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_vec, 128, 32, k, GGML_TYPE_Q5_1)
              LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_vec, 128, 32, k, GGML_TYPE_Q8_0)
              LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_vec, 128, 32, k, GGML_TYPE_BF16)
@@ -1996,7 +2364,7 @@ index 5edc967..5b9f205 100644
              LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_vec, 128, 32, k, GGML_TYPE_F32)
              GGML_ABORT("fatal error");
          }
-@@ -581,6 +602,7 @@ bool ggml_cuda_lightning_indexer_supported(int device, const ggml_tensor * dst)
+@@ -581,6 +806,7 @@ bool ggml_cuda_lightning_indexer_supported(int device, const ggml_tensor * dst)
          case GGML_TYPE_Q5_0:
          case GGML_TYPE_Q4_1:
          case GGML_TYPE_Q4_0:
