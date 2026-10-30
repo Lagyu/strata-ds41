@@ -82,6 +82,12 @@ constexpr int kBatch = 512;    ///< a `ds4routes.bin` ubatch, in tokens (what ro
     return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 
+/// STRATA_CHUNK_HINT_ARENA=1: see Ds41MoeTier::chunk_hint_begin (the spans' routed arena experts into the prestage region)
+bool hint_arena_on() {
+    static const bool on = std::getenv("STRATA_CHUNK_HINT_ARENA") && std::getenv("STRATA_CHUNK_HINT_ARENA")[0] == '1';
+    return on;
+}
+
 [[maybe_unused]] int64_t mem_available_gib() {
     const uint64_t b = ds41_sys::mem_available_bytes();   // Linux: /proc/meminfo MemAvailable; Windows: ullAvailPhys
     return b == 0 ? -1 : (int64_t) (b >> 30);
@@ -552,6 +558,11 @@ struct Gpu {
     /// layer - no other - gets the lazy fill, so the set of region-served layers (and so every kernel) is production's.
     /// Cleared wherever p_layer is reset by a release.
     int p_lazy_layer = -1;
+    /// STRATA_CHUNK_HINT_ARENA (chunk_hint): the layer whose region fill is driven by the dense spans' routing, and the
+    /// fill cursor; run_chunk records p_copied for it (the DMAs are issued span by span, the last one just before the call)
+    int p_hint_layer = -1;
+    size_t p_hint_off = 0;
+    int64_t p_hint_n = 0, p_hint_full = 0;   ///< MIMO_CHUNK_PROF: experts put in the region by hints / left out (no room)
     bool p_off = false, p_used_rec = false;
     std::vector<unsigned long long> p_ptr;
     cudaEvent_t p_copied = nullptr, p_used = nullptr;
@@ -2397,14 +2408,67 @@ bool Ds41MoeTier::seed_from_ranked(const std::vector<std::pair<int32_t, int32_t>
         std::vector<std::thread> th;
         const double t0 = now_ms();
         const double sp2 = seed_prof ? now_ms() : 0;   // the arena fills queued
-        const int nth = (int) std::min<size_t>(8, fjobs.size());
+        // STRATA_SEED_PARTS (default 8; 1 = the old whole-blob reads) x STRATA_SEED_THREADS (default 32): the file-tier blobs
+        // of the seed are read in parts by a pool, so both drives serve them (read_part's twin share) and ~4 blobs are in
+        // flight at once - the 8 whole-blob readers ran ~2-3 GB/s on the model drive alone; the wave reader's geometry
+        // reaches ~9 GB/s.  Waves of kW blobs share the kW pinned bounces (seed_buf); the thread that lands a blob's last
+        // part copies it into its slot.  Same slots, same bytes: nothing about the result changes.
+        static const int seed_parts = [] { const char* e = std::getenv("STRATA_SEED_PARTS"); const int v = e ? std::atoi(e) : 8; return v < 1 ? 1 : (v > 16 ? 16 : v); }();
+        static const int seed_threads = [] { const char* e = std::getenv("STRATA_SEED_THREADS"); const int v = e ? std::atoi(e) : 32; return v < 1 ? 1 : (v > 64 ? 64 : v); }();
+        constexpr int kW = 8;   // blobs (pinned bounces) in flight per wave
+        const int nth = (int) std::min<size_t>((size_t) (seed_parts > 1 ? seed_threads : 8), fjobs.size() * (size_t) seed_parts);
         // the readers' pinned bounces persist (seed_buf): cudaMallocHost + cudaFreeHost per thread per seed were the bulk of
         // the ~0.6-0.9 s "file jobs" of every cache re-open (STRATA_SEED_PROF, 2026-10-30), for a few dozen blobs
-        for (int k = (int) im_->seed_buf.size(); k < nth; ++k) {
+        for (int k = (int) im_->seed_buf.size(); k < kW; ++k) {
             uint8_t* buf = nullptr;
             if (cudaMallocHost((void**) &buf, (size_t) im_->blob) != cudaSuccess) break;
             im_->seed_buf.push_back(buf);
         }
+        if (seed_parts > 1 && (int) im_->seed_buf.size() >= kW && nth > 0) {
+            // part jobs: wave w covers blobs [w*kW, w*kW+kW); job index = (blob - w*kW) * parts + part within the wave
+            std::atomic<size_t> nq{0};
+            std::vector<std::atomic<int>> left((size_t) fjobs.size());
+            for (auto& x : left) x.store(seed_parts);
+            const size_t n_waves = (fjobs.size() + kW - 1) / kW;
+            std::atomic<size_t> wave_done{0};   // blobs fully landed (bounce free again) - a wave waits for the previous one
+            std::mutex wmu;
+            std::condition_variable wcv;
+            std::atomic<size_t> landed{0};
+            const size_t n_jobs = fjobs.size() * (size_t) seed_parts;
+            for (int k = 0; k < nth; ++k)
+                th.emplace_back([&]() {
+                    for (size_t q; !bad && (q = nq.fetch_add(1)) < n_jobs;) {
+                        const size_t b = q / (size_t) seed_parts;
+                        const int part = (int) (q % (size_t) seed_parts);
+                        const size_t w = b / kW;
+                        // this blob's bounce (b % kW) must be free: every blob of wave w-1 has landed
+                        if (w > 0) {
+                            std::unique_lock<std::mutex> lk(wmu);
+                            wcv.wait(lk, [&] { return bad || landed.load() >= w * kW; });
+                            if (bad) return;
+                        }
+                        const auto& j = fjobs[b];
+                        uint8_t* buf = im_->seed_buf[b % kW];
+                        im_->blobs->read_part(j[1], j[2], part, seed_parts, buf);
+                        if (left[b].fetch_sub(1, std::memory_order_acq_rel) == 1) {   // the blob's last part: into its slot
+                            {
+                                std::lock_guard<std::mutex> lk(mu);   // the cache's counters; the copy is ~0.4 ms of a ~2 ms read
+                                std::string e;
+                                if (!cache.fill_slot_blocking((int32_t) j[0], buf, e, im_->bl[(size_t) im_->g.cls(j[1], j[2])])) {
+                                    terr = e;
+                                    bad = true;
+                                }
+                            }
+                            {
+                                std::lock_guard<std::mutex> lk(wmu);
+                                ++landed;
+                            }
+                            wcv.notify_all();
+                        }
+                    }
+                    (void) n_waves; (void) wave_done;
+                });
+        } else
         for (int k = 0; k < nth; ++k)
             th.emplace_back([&, k]() {
                 uint8_t* buf = k < (int) im_->seed_buf.size() ? im_->seed_buf[(size_t) k] : nullptr;
@@ -5881,6 +5945,16 @@ bool gpu_run_chunk(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, co
     // numerics, without DMAing the ~40% of a small turn's layer it never uses
     // (first_pass: once per layer, marking the routed arena experts of EVERY format class - the eager fill covers all
     // classes too, and a later class pass must find its experts in the region exactly as it would have)
+    if (gp.p_hint_layer == (int) layer && first_pass && gp.p_buf) {   // chunk_hint's arena fill: its last DMAs were just issued
+        gp.p_hint_layer = -1;
+        bool any = false;
+        for (int32_t e : arena_e) if (gp.p_ptr[(size_t) e]) { any = true; break; }
+        if (any) {
+            ck(cudaEventRecord(gp.p_copied, gp.s_cp), "hint arena copied");
+            gp.p_layer = (int) layer;
+        }
+        gp.p_lazy_layer = -1;
+    }
     if (gp.p_lazy_layer == (int) layer && first_pass && gp.s_cp && gp.arena.base && !gp.p_off && chunk_pstage_alloc(im)) {
         gp.p_lazy_layer = -1;
         std::vector<int32_t> routed((size_t) NX, 0);
@@ -6277,8 +6351,12 @@ void chunk_pstage_next(Ds41MoeImpl& im, int64_t layer, int n) {
             im.gpu->p_layer = -1;
             // what chunk_pstage_issue would have filled (it returns early on these conditions, so then nothing)
             const Gpu& g = *im.gpu;
-            im.gpu->p_lazy_layer = (!g.p_off && g.s_cp && g.arena.base && im.g.routed(nl)) ? (int) nl : -1;
+            im.gpu->p_lazy_layer = (!g.p_off && g.s_cp && g.arena.base && im.g.routed(nl) && !hint_arena_on()) ? (int) nl : -1;
         }
+        return;
+    }
+    if (hint_arena_on()) {   // the hinted fill drives the region from the dense spans' routing (chunk_hint)
+        if (im.gpu) { im.gpu->p_layer = -1; im.gpu->p_lazy_layer = -1; }
         return;
     }
     chunk_pstage_issue(im, nl);
@@ -6631,9 +6709,25 @@ bool Ds41MoeTier::release_prestage() {
 #endif
 }
 
+/// STRATA_CHUNK_HINT_ARENA=1: chunk_hint also DMAs the spans' routed ARENA experts (not VRAM-resident, not peer-held) into the
+/// layer-prestage region (STRATA_PRESTAGE_GIB, default 3 GiB) on s_cp while the dense half runs; run_chunk launches them from
+/// there ("layer prestage") and streams only the rest.  The arena experts are ~2/3 of a batch's PCIe traffic (the PCIe 4.0
+/// floor of the expert phase, 2026-10-31): their copies move under the dense half.  Same bytes, same kernels as the lazy
+/// prestage (MMVQ from the region): exact.  The eager / lazy prestage paths stand down for a hinted layer.
+
 void Ds41MoeTier::chunk_hint_begin(int64_t layer) {
 #if defined(DS4_MOE_CUDA)
     if (!im_->inited || !im_->gpu || im_->cfg.cpu_only) return;
+    Gpu& gpa = *im_->gpu;
+    if (hint_arena_on() && gpa.s_cp && gpa.arena.base && !gpa.p_off && gpa.p_hint_layer != (int) layer && chunk_pstage_alloc(*im_)) {
+        // the region is free once the previous layer's launches from it are done (p_used, recorded after them on gp.s)
+        if (gpa.p_used_rec) ck(cudaStreamWaitEvent(gpa.s_cp, gpa.p_used, 0), "hint arena wait used");
+        gpa.p_ptr.assign((size_t) im_->g.n_experts, 0ull);
+        gpa.p_hint_off = 0;
+        gpa.p_hint_layer = (int) layer;
+        gpa.p_layer = -1;        // consumable once run_chunk records p_copied (gpu_run_chunk)
+        gpa.p_lazy_layer = -1;   // the lazy fill stands down for this layer
+    }
     if (!hint_alloc(*im_)) return;
     HintStage& H = *im_->hstage;
     if (H.layer == layer) return;
@@ -6656,10 +6750,29 @@ void Ds41MoeTier::chunk_hint_begin(int64_t layer) {
 
 void Ds41MoeTier::chunk_hint(int64_t layer, const int32_t* ids, const float* w, int n) {
 #if defined(DS4_MOE_CUDA)
-    if (!im_->hstage || !ids || n <= 0) return;
+    if (!ids || n <= 0 || !im_->gpu) return;
+    const int64_t NX = im_->g.n_experts, K = im_->g.top_k, NE = (int64_t) n * K;
+    Gpu& gpa = *im_->gpu;
+    if (gpa.p_hint_layer == (int) layer && gpa.p_buf) {   // the span's new arena experts -> the prestage region, now
+        static const bool chunk_peer = !(std::getenv("STRATA_PEER_CHUNK") && std::getenv("STRATA_PEER_CHUNK")[0] == '0');
+        for (int64_t j = 0; j < NE; ++j) {
+            const int32_t e = ids[j];
+            if (e < 0 || e >= NX || gpa.p_ptr[(size_t) e]) continue;
+            const uint8_t* src = gpa.arena.ptr(layer, e);
+            if (!src) continue;
+            if (gpa.cache && !im_->cfg.no_cache && gpa.cache->slot_of(layer, e) >= 0) continue;
+            if (chunk_peer && gpa.peers_built() && gpa.peer_holding(layer, e)) continue;
+            const size_t bl = (size_t) im_->bl[(size_t) (im_->g.per_expert() ? im_->g.cls(layer, e) : layer)];
+            if (gpa.p_hint_off + bl > gpa.p_cap) { ++gpa.p_hint_full; continue; }
+            ck(cudaMemcpyAsync((uint8_t*) gpa.p_buf + gpa.p_hint_off, src, bl, cudaMemcpyHostToDevice, gpa.s_cp), "hint arena dma");
+            gpa.p_ptr[(size_t) e] = (unsigned long long) gpa.p_buf + gpa.p_hint_off;
+            gpa.p_hint_off = (gpa.p_hint_off + bl + 255) & ~(size_t) 255;
+            ++gpa.p_hint_n;
+        }
+    }
+    if (!im_->hstage) return;
     HintStage& H = *im_->hstage;
     if (H.layer != layer) return;
-    const int64_t NX = im_->g.n_experts, K = im_->g.top_k, NE = (int64_t) n * K;
     // the skip rule of run_chunk (STRATA_CHUNK_SKIP_READ): a file-tier expert no token of the batch keeps is never read;
     // hinting only the experts some token of this span keeps reads exactly that set (an expert kept by a later span is
     // hinted there)
@@ -6718,6 +6831,11 @@ void Ds41MoeTier::release_chunk() {
                              "kernels) over %lld sub-runs, %.1f GB of ternary read = %.0f GB/s\n",
                      (long long) c.mmq_subruns, c.tc, (long long) c.tc_launches, c.tc_gb, c.tc > 0 ? c.tc_gb / (c.tc / 1000.0) : 0.0);
         g_cprof = ChunkProf{};
+    }
+    if (chunk_prof() && im_->gpu && (im_->gpu->p_hint_n || im_->gpu->p_hint_full)) {
+        std::fprintf(stderr, "chunk hint arena: %lld arena experts DMA'd into the prestage region under the dense half, %lld left out (region full)\n",
+                     (long long) im_->gpu->p_hint_n, (long long) im_->gpu->p_hint_full);
+        im_->gpu->p_hint_n = im_->gpu->p_hint_full = 0;
     }
     if (chunk_prof() && im_->hstage && (im_->hstage->hinted || im_->hstage->served)) {
         std::fprintf(stderr, "chunk hint: %lld file-tier experts read under the dense half, %lld of run_chunk's file-tier DMAs served from the slab, "
