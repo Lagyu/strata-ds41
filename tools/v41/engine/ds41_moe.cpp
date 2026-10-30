@@ -570,7 +570,13 @@ struct Gpu {
     void* zc_chk = nullptr;   ///< STRATA_SUM_ZEROCOPY=2: the zero-copy sums' rows (kMaxEnt x n_embd), compared after the sync
     int64_t c_pbuf_rows = 0;
     cudaStream_t s_cp = nullptr;
+    cudaStream_t s_cp2 = nullptr;              ///< STRATA_CHUNK_DMA_STREAMS=2: every other streamed expert's copy (a second copy engine)
+    cudaEvent_t c_join = nullptr;              ///< s_cp2's copies joined into s_cp before c_copied
     cudaEvent_t c_copied[2] = {}, c_used[2] = {};
+    void cp_sync() const {                     ///< every queued copy out of the host slots / slabs done
+        cudaStreamSynchronize(s_cp);
+        if (s_cp2) cudaStreamSynchronize(s_cp2);
+    }
     /// run_chunk's MMQ products (Ds41MoeConfig::chunk_mmq): up to `m_rows` sorted entries per launch.  `m_ok[l]`:
     /// layer l's types are covered (-1 = not checked yet).
     int64_t m_rows = 0;
@@ -1132,7 +1138,7 @@ struct HintStage {
     std::atomic<int64_t> inflight{0};          ///< part reads queued or running
     std::mutex mu;
     std::condition_variable cv;
-    std::deque<std::array<int32_t, 3>> q;      ///< (slot, expert, part)
+    std::deque<std::array<int64_t, 4>> q;      ///< (layer, slot, expert, part)
     bool stop = false;
     std::vector<std::thread> th;
     int64_t hinted = 0, served = 0;            ///< MIMO_CHUNK_PROF
@@ -1168,7 +1174,7 @@ bool hint_alloc(Ds41MoeImpl& im) {
     for (int k = 0; k < hint_threads(); ++k)
         hs->th.emplace_back([H, imp]() {
             for (;;) {
-                std::array<int32_t, 3> job;
+                std::array<int64_t, 4> job;
                 {
                     std::unique_lock<std::mutex> lk(H->mu);
                     H->cv.wait(lk, [&] { return H->stop || !H->q.empty(); });
@@ -1176,8 +1182,8 @@ bool hint_alloc(Ds41MoeImpl& im) {
                     job = H->q.front();
                     H->q.pop_front();
                 }
-                const int slot = job[0], e = job[1], part = job[2];
-                imp->blobs->read_part(H->layer, e, part, kHintParts, H->slab + (size_t) slot * (size_t) H->slot_bytes);
+                const int slot = (int) job[1], part = (int) job[3];
+                imp->blobs->read_part(job[0], job[2], part, kHintParts, H->slab + (size_t) slot * (size_t) H->slot_bytes);
                 if (H->pdone[slot].fetch_add(1, std::memory_order_acq_rel) + 1 == kHintParts) {
                     H->ready[slot].store(1, std::memory_order_release);
                     H->ready[slot].notify_all();
@@ -5436,6 +5442,12 @@ bool gpu_run_chunk(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, co
             ck(cudaEventRecord(gp.c_used[h], gp.s), "ev");
         }
         ck(cudaStreamCreateWithFlags(&gp.s_cp, cudaStreamNonBlocking), "s_cp");
+        static const int dma_streams = std::getenv("STRATA_CHUNK_DMA_STREAMS") ? std::atoi(std::getenv("STRATA_CHUNK_DMA_STREAMS")) : 1;
+        if (dma_streams >= 2) {
+            ck(cudaStreamCreateWithFlags(&gp.s_cp2, cudaStreamNonBlocking), "s_cp2");
+            ck(cudaEventCreateWithFlags(&gp.c_join, cudaEventDisableTiming), "ev");
+            std::fprintf(stderr, "chunk: the streamed experts' copies alternate over two streams (STRATA_CHUNK_DMA_STREAMS)\n");
+        }
         gp.c_ready = true;
     }
     im.pf_n = 0;   // a chunk does not use the decode prefetch staging
@@ -5999,7 +6011,7 @@ bool gpu_run_chunk(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, co
     if (nW) {
         // the bounce slots are shared by every class pass: the previous pass returned (non-last passes do not
         // sync) with its DMAs out of them possibly still queued on s_cp - the readers must not overwrite them yet
-        ck(cudaStreamSynchronize(gp.s_cp), "bounce free");
+        gp.cp_sync();   // "bounce free"
         t_rd0 = now_ms();
         start_wave();
     }
@@ -6010,6 +6022,7 @@ bool gpu_run_chunk(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, co
         h_last = h;
         // the half is free once the kernel that last read it is done
         ck(cudaStreamWaitEvent(gp.s_cp, gp.c_used[h], 0), "wait used");
+        if (gp.s_cp2) ck(cudaStreamWaitEvent(gp.s_cp2, gp.c_used[h], 0), "wait used 2");
         std::vector<int32_t> es;
         std::vector<unsigned long long> ps;
         for (size_t i = b0; i < b1; ++i) {
@@ -6034,7 +6047,7 @@ bool gpu_run_chunk(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, co
                 const size_t k = (size_t) wave_of[(size_t) stream_e[i]];
                 if (k >= wave_end) {   // a new wave reuses the slots: every DMA out of them must be done first
                     const double tw = now_ms();
-                    ck(cudaStreamSynchronize(gp.s_cp), "wave");
+                    gp.cp_sync();   // "wave"
                     if (prof) g_cprof.wait_copied += now_ms() - tw;
                     start_wave();
                 }
@@ -6046,9 +6059,13 @@ bool gpu_run_chunk(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, co
                 src = slot_ptr(k);
             }
             uint8_t* d = (uint8_t*) gp.c_stage[h] + (i - b0) * (size_t) SL;
-            ck(cudaMemcpyAsync(d, src, (size_t) BL, cudaMemcpyHostToDevice, gp.s_cp), "stream dma");
+            ck(cudaMemcpyAsync(d, src, (size_t) BL, cudaMemcpyHostToDevice, (gp.s_cp2 && (i & 1)) ? gp.s_cp2 : gp.s_cp), "stream dma");
             es.push_back(stream_e[i]);
             ps.push_back((unsigned long long) d);
+        }
+        if (gp.s_cp2) {   // join the second stream's copies into s_cp before the half is declared copied
+            ck(cudaEventRecord(gp.c_join, gp.s_cp2), "join");
+            ck(cudaStreamWaitEvent(gp.s_cp, gp.c_join, 0), "join wait");
         }
         ck(cudaEventRecord(gp.c_copied[h], gp.s_cp), "copied");
         ck(cudaStreamWaitEvent(gp.s, gp.c_copied[h], 0), "wait copied");
@@ -6600,7 +6617,7 @@ void Ds41MoeTier::chunk_hint_begin(int64_t layer) {
     // the previous layer's slab must be free: its reads done (a hinted expert a class pass never consumed) and the DMAs out
     // of it landed (run_chunk copies from the slab on s_cp)
     while (H.inflight.load(std::memory_order_acquire) > 0) std::this_thread::yield();
-    if (im_->gpu->s_cp) cudaStreamSynchronize(im_->gpu->s_cp);
+    if (im_->gpu->s_cp) im_->gpu->cp_sync();
     for (int i = 0; i < H.used; ++i) {
         if (H.slot_e[(size_t) i] >= 0) H.idx[(size_t) H.slot_e[(size_t) i]] = -1;
         H.slot_e[(size_t) i] = -1;
@@ -6625,7 +6642,7 @@ void Ds41MoeTier::chunk_hint(int64_t layer, const int32_t* ids, const float* w, 
     // hinted there)
     static const bool skip_read = !(std::getenv("STRATA_CHUNK_SKIP_READ") && std::getenv("STRATA_CHUNK_SKIP_READ")[0] == '0');
     const float skip = (skip_read && w) ? im_->cfg.skip_file : 0.0f;
-    std::vector<std::array<int32_t, 3>> jobs;
+    std::vector<std::array<int64_t, 4>> jobs;
     for (int64_t j = 0; j < NE; ++j) {
         const int32_t e = ids[j];
         if (e < 0 || e >= NX || H.idx[(size_t) e] >= 0 || H.used >= H.n_slots) continue;
@@ -6639,7 +6656,7 @@ void Ds41MoeTier::chunk_hint(int64_t layer, const int32_t* ids, const float* w, 
         const int slot = H.used++;
         H.idx[(size_t) e] = slot;
         H.slot_e[(size_t) slot] = e;
-        for (int p = 0; p < kHintParts; ++p) jobs.push_back({slot, e, p});
+        for (int p = 0; p < kHintParts; ++p) jobs.push_back({layer, (int64_t) slot, (int64_t) e, (int64_t) p});
     }
     if (jobs.empty()) return;
     H.inflight.fetch_add((int64_t) jobs.size(), std::memory_order_acq_rel);
@@ -6689,7 +6706,7 @@ void Ds41MoeTier::release_chunk() {
     }
     Gpu& gp = *im_->gpu;
     if (gp.s) cudaStreamSynchronize(gp.s);
-    if (gp.s_cp) cudaStreamSynchronize(gp.s_cp);
+    if (gp.s_cp) gp.cp_sync();
     // The DEVICE buffers go back (the deferred VRAM seed wants the memory).  The PINNED landing pads (c_bounce,
     // c_hparts) and the chunk_prefetch slabs stay: cudaMallocHost was 13 calls / 3.4 s per prompt (nsys), and a
     // pinned slab's pages must not be churned.  Only close() (or a manual release) frees them.
@@ -6702,6 +6719,10 @@ void Ds41MoeTier::release_chunk() {
         if (gp.c_used[i]) cudaEventDestroy(gp.c_used[i]);
     }
     if (gp.s_cp) cudaStreamDestroy(gp.s_cp);
+    if (gp.s_cp2) cudaStreamDestroy(gp.s_cp2);
+    if (gp.c_join) cudaEventDestroy(gp.c_join);
+    gp.s_cp2 = nullptr;
+    gp.c_join = nullptr;
     gp.c_x = gp.c_xq = gp.c_parts = gp.c_scratch = gp.c_ptr = gp.c_start = gp.c_ng = gp.c_dst = gp.c_tokv = nullptr;
     gp.c_w = gp.c_out = nullptr;
     gp.c_stage[0] = gp.c_stage[1] = nullptr;
