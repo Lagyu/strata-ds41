@@ -211,3 +211,38 @@ last-ulp).  Window 3 results so far (c3 binary a70df23a, same-window baseline B3
   11.86 (16.99).  B3_long (the same-window long baseline) exited early (see below); window 2's B2_long / C2_long stand in.
 - HO_all (the deploy gate, full candidate): KL 0.10059 / top-1 87.59% / PPL 8.873 against zcnvis-deploy's 0.10137 / 87.90% /
   8.851 and the indexer-only run's 0.10055 / 87.65% - the fused hc-mixes kernel adds nothing measurable; PASSED.
+
+## 8. After the deploy: the live workload (numeric log lines) and the candidates prepared for the next window
+
+The production log's per-turn summary lines (no content), the new binary's segment (02:26-05:17, 40 turns, one session at
+night) against the previous binary's last segments (2026-10-30 evening, 183 turns, several sessions - a confounded comparison):
+
+| new tokens | turns | now: median wall | feed (dense + experts) | cache re-open | DSpark tail | before: median wall |
+|---|---|---|---|---|---|---|
+| <= 96 (tail passes only) | 10 | 2.2 s | - | (warm-up turns only) | 2.0 s | 2.8-3.1 s |
+| 97-500 | 12 | 4.2 s | 3.0 (1.5 + 1.5) | 0.67 s | 0.49 s | 9.1 s |
+| 501-2000 | 8 | 6.2 s | 5.9 (2.9 + 2.9) | 0.83 s | - | 17.5 s |
+| 2001-8000 | 9 | 11.2 s | 11.5 (6.0 + 5.2) | 0.85 s | - | 27.5 s |
+
+Decode: median 18.1 tok/s per request (p25 17.2, p75 20.1), expert routes 74.5% VRAM hits / 24.1% PCIe / 1.3% file.  Short
+turns are the majority of the user's turns (25% here, 80% in the older history) and consist of 16-row DSpark tail passes
+(~0.7 s a pass, PCIe-bound).  In a batched turn the dense half and the expert phase are about equal, and the cache
+re-open is 7-16% of the turn.
+
+Prepared (implemented, built, NOT deployed, NOT measured - production was serving the user; window6.sh runs them):
+
+- **STRATA_CHUNK_HINT_ARENA=1 (c7)** with STRATA_PRESTAGE_GIB=4: as each 512-column dense span routes, its arena-held
+  experts (not VRAM-resident, not peer-held) are DMA'd into the existing layer-prestage region on the copy stream while
+  the dense half runs; run_chunk launches them from VRAM (the existing "layer prestage" path, MMVQ kernels) and streams
+  only the rest.  The arena experts are ~2/3 of the expert phase's PCIe traffic (6b), so up to that share of the
+  phase can hide under the dense half; exact (same bytes, the eager / lazy prestage stand down).  The region's VRAM
+  (4 GiB) comes out of the batch's free VRAM; the OOM hook releases it if a pass does not fit.
+- **STRATA_SEED_PARTS=8 x STRATA_SEED_THREADS=32 (c6, default on in c6/c7; =1 is the old reader)**: the re-seed's
+  file-tier blobs read in 8 parts by a 32-thread pool over both drives (read_part's twin share) instead of 8 whole-blob
+  readers on the model drive; exact.  Aims at the "file jobs" part of the 0.7-0.85 s re-open.
+- **STRATA_SERVE_KEEP_CACHE=1** (existing, off): continuation turns keep the VRAM cache across the batch (shrunk by the
+  batch's needs) - no re-seed, VRAM hits during the batch.  Measured 2026-10-24 as a wash on a different profile; the
+  live profile (re-open 7-16% of a batched turn, the expert phase at the PCIe floor) says re-measure it.
+- Evaluated and not pursued: wider DSpark tail passes (kMaxMulti 32): the user's short turns average ~42 new tokens, so
+  two wider passes cost about what three narrow ones do; the gain appears only above ~90 tokens.  Engram reads are
+  already parallel, coalesced and cached (2M rows); the hot pack is the only lever and costs 4 GB of RAM.
