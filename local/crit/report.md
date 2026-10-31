@@ -276,3 +276,9 @@ medium turns: +150 tokens 3.69 -> 4.81 s, +400 4.84 -> 6.32, +1000 6.50 -> 7.91,
 0.2-1.1 s cannot hide 1.5 GB of arena copies a layer, and the copies queue ahead of the expert phase's own stream copies.
 VERDICT: not deployed in either form; the idea would need to be conditional on wide batches and would still cost the dense
 half.  The file-tier reads, not the arena copies, bound the expert phase of big reads on this box.
+HA2_long (98K context) vs B6_long: the read 108.1 vs 107.7 s (expert phase 44.1 vs 46.6, dense 60.5 vs 57.6), +150 4.88 vs 3.73,
++400 6.47 vs 4.91, +1000 8.01 vs 6.79, +2500 10.13 vs 10.02, the 3000-token bench 11.19 vs 11.27 - the same picture at long
+context: what the expert phase gains the dense half loses, and small turns lose outright.
+
+Production after windows 6-7 (11:58): unchanged binary a70df23a with STRATA_INDEXER_WMMA=1 + STRATA_CHUNK_ASYNC=1, now with the
+user's --batch-slots 4 (4 conversation slots of 901 MiB each on the card); smoke 42; dsh-web resumed 12:00.
