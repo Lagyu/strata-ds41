@@ -246,3 +246,33 @@ Prepared (implemented, built, NOT deployed, NOT measured - production was servin
 - Evaluated and not pursued: wider DSpark tail passes (kMaxMulti 32): the user's short turns average ~42 new tokens, so
   two wider passes cost about what three narrow ones do; the gain appears only above ~90 tokens.  Engram reads are
   already parallel, coalesced and cached (2M rows); the hot pack is the only lever and costs 4 GB of RAM.
+
+## 9. Window 6 / 7 (2026-10-31 09:51-): the prepared candidates measured
+
+Production was stopped for this (dsh-web stopped at the user's request); the baseline B6 already runs with the user's new
+`--batch-slots 4` (the restart at the window's end applies it to production).
+
+- **Arena hint, first form (HA_std, c7)**: exact (the one-shot's 24 tokens identical; 9664 experts into the 4 GiB region, none
+  left out) but 15-25% SLOWER on every batched turn (6600-token read 14.48 -> 17.51 s, expert phase 8.21 -> 10.62).  The
+  region-served experts went through the layer-prestage launch path = the grouped (decode-style) kernels, and the host side
+  of the expert phase grew to 2.8 s a batch.  Reworked (c8, window 7): the region's experts are copied device-to-device into
+  the MMQ staging slots - the same kernels and run grouping as a streamed expert, the PCIe copy replaced by a ~500 GB/s one.
+- **Seed parts (SEEDP_std, c7)**: the engine died at the first re-seed with "malloc(): unaligned tcache chunk detected" (heap
+  corruption in the part reader).  STRATA_SEED_PARTS defaults back to 1; opt-in until the bug is found.  Not deployed.
+- **Keep-cache (KC_std)**: never engaged - "ExpertCache::swap_slots: the slots are sized per layer (uniform slots only)": the
+  Mix-256G cache opens with per-class slot sizes and the shrink needs uniform slots.  Numbers identical to B6.  Not applicable
+  without a sized-slot shrink.
+- B6_std (deployed set, 4 slots): 6600-token read 14.48 s, +1000 6.50, +2500 9.53, 3000-token bench 10.52, copy task 6.93 -
+  the same as window 3's 2-slot numbers within noise.  B6_long (4 slots): the 98K read 107.7 s (2 slots: 109.8-111.9), +1000
+  6.79, +2500 10.02, the 3000-token bench 11.27 - no 4-slot penalty visible on this payload.
+- The three combined arms (ALL6_*) ran the crashing seed reader and HUNG to the 30-minute cap each (the engine did not exit);
+  window 6 therefore ended at 11:44 instead of ~10:35.
+
+**Arena hint, re-routed (HA2_std, c8, window 7)**: exact again (identical one-shot tokens; 5288-5927 arena experts a batch copied
+device-to-device out of the region).  Big read (6600 tokens): the expert phase 8.21 -> 7.68 s but the dense half 5.08 -> 5.70 -
+the hint's ~90 GB of PCIe copies under the dense half slow the dense half's own small transfers; the batch's read waits
+stay 5.4 s (49 GB of file-tier reads at 8.7 GB/s were the longer pole at this size, not the arena copies).  Small and
+medium turns: +150 tokens 3.69 -> 4.81 s, +400 4.84 -> 6.32, +1000 6.50 -> 7.91, the copy task 6.93 -> 8.63 - a dense half of
+0.2-1.1 s cannot hide 1.5 GB of arena copies a layer, and the copies queue ahead of the expert phase's own stream copies.
+VERDICT: not deployed in either form; the idea would need to be conditional on wide batches and would still cost the dense
+half.  The file-tier reads, not the arena copies, bound the expert phase of big reads on this box.

@@ -119,4 +119,13 @@ probe ALL6_std  $STD  $PL   $DEP $HA
 probe ALL6_sec  $STD  $SEC  $DEP $HA
 probe B6_long   $LONG $S/payload-long  $DEP STRATA_PRESTAGE_GIB=0 STRATA_SEED_PARTS=1
 probe ALL6_long $LONG $S/payload-long  $DEP $HA
+# ---- HO: only if the arena hint changed the one-shot's tokens (region-served experts run the MMVQ kernels, streamed ones MMQ)
+if [ -f "$T/ALL6_long.done" ] && ! cmp -s "$T/SM6_off.out" "$T/SM6_ha.out" && [ ! -f "$T/HO_ha.done" ]; then
+  echo "$(date +%T) held-out eval crit-ha (the arena hint's outputs differed)"
+  BIN=$BIN MODEL=/mnt/fast/llm/orca/DS41-1017-Mix256G.gguf TMO=1500 bash /home/yuya/ds41/s027/ho-eval.sh crit-ha \
+      STRATA_BLOB_TWIN=/home/yuya/twin/DS41-1017-Mix256G.gguf STRATA_BLOB_MIRROR_SHARE=0.40 \
+      STRATA_FA_WMMA512=1 STRATA_INDEXER_NVIS=1 STRATA_INDEXER_WMMA=1 STRATA_CHUNK_ASYNC=1 $HA -- --skip-file 0.10 > "$T/HO_ha.out" 2>&1
+  echo "$(date +%T) held-out exit $?: $(cat local/eval-lucebox/crit-ha/score.json 2>/dev/null | tr -d '\n')"
+  wait_free; touch "$T/HO_ha.done"
+fi
 echo "$(date +%T) arms done"
