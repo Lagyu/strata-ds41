@@ -2413,7 +2413,7 @@ bool Ds41MoeTier::seed_from_ranked(const std::vector<std::pair<int32_t, int32_t>
         // flight at once - the 8 whole-blob readers ran ~2-3 GB/s on the model drive alone; the wave reader's geometry
         // reaches ~9 GB/s.  Waves of kW blobs share the kW pinned bounces (seed_buf); the thread that lands a blob's last
         // part copies it into its slot.  Same slots, same bytes: nothing about the result changes.
-        static const int seed_parts = [] { const char* e = std::getenv("STRATA_SEED_PARTS"); const int v = e ? std::atoi(e) : 8; return v < 1 ? 1 : (v > 16 ? 16 : v); }();
+        static const int seed_parts = [] { const char* e = std::getenv("STRATA_SEED_PARTS"); const int v = e ? std::atoi(e) : 1; return v < 1 ? 1 : (v > 16 ? 16 : v); }();   // default 1: the part reader crashed the engine at a re-seed (window 6, 2026-10-31) - opt-in until fixed
         static const int seed_threads = [] { const char* e = std::getenv("STRATA_SEED_THREADS"); const int v = e ? std::atoi(e) : 32; return v < 1 ? 1 : (v > 64 ? 64 : v); }();
         constexpr int kW = 8;   // blobs (pinned bounces) in flight per wave
         const int nth = (int) std::min<size_t>((size_t) (seed_parts > 1 ? seed_threads : 8), fjobs.size() * (size_t) seed_parts);
@@ -5252,7 +5252,8 @@ bool gpu_run_n_ex(Ds41MoeImpl& im, int64_t layer, int nt, const int32_t* ids, co
 // launches by event pairs), printed by release_chunk.  Timing only - the same work runs.
 struct ChunkProf { double file_gb = 0, rd_busy = 0; double wall = 0, file = 0, file_rd = 0, wait_copied = 0, sync = 0, kern = 0, resident_kern = 0; int64_t calls = 0, launches = 0;
                    double tc = 0, tc_gb = 0; int64_t tc_launches = 0, mmq_subruns = 0;   // + the PTQ1_0 -> Q2_0 transcode inside MMQ
-                   int64_t skip_x = 0; };   // file-tier experts left unread (--skip-file: every entry below the cut)
+                   int64_t skip_x = 0;      // file-tier experts left unread (--skip-file: every entry below the cut)
+                   int64_t hint_d2d = 0; };  // streamed arena experts copied device-to-device out of the hint region
 ChunkProf g_cprof;
 bool chunk_prof() { static const bool on = [] { const char* e = std::getenv("MIMO_CHUNK_PROF"); return e && *e == '1'; }(); return on; }
 
@@ -5945,16 +5946,12 @@ bool gpu_run_chunk(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, co
     // numerics, without DMAing the ~40% of a small turn's layer it never uses
     // (first_pass: once per layer, marking the routed arena experts of EVERY format class - the eager fill covers all
     // classes too, and a later class pass must find its experts in the region exactly as it would have)
-    if (gp.p_hint_layer == (int) layer && first_pass && gp.p_buf) {   // chunk_hint's arena fill: its last DMAs were just issued
-        gp.p_hint_layer = -1;
-        bool any = false;
-        for (int32_t e : arena_e) if (gp.p_ptr[(size_t) e]) { any = true; break; }
-        if (any) {
-            ck(cudaEventRecord(gp.p_copied, gp.s_cp), "hint arena copied");
-            gp.p_layer = (int) layer;
-        }
-        gp.p_lazy_layer = -1;
-    }
+    // chunk_hint's arena fill (STRATA_CHUNK_HINT_ARENA): the region holds this layer's routed arena experts (DMA'd on s_cp under
+    // the dense half).  They are NOT launched from the region (the layer-prestage path runs the grouped kernels, a loss on
+    // wide batches: window 6 HA_std +15-25%); the half loop below copies them device-to-device into its staging slots instead
+    // of host-to-device from the arena - the same slots, kernels and run grouping as a streamed expert, at ~500 GB/s.
+    const bool hint_dev = gp.p_hint_layer == (int) layer && gp.p_buf && !gp.p_ptr.empty();
+    if (hint_dev) gp.p_lazy_layer = -1;
     if (gp.p_lazy_layer == (int) layer && first_pass && gp.s_cp && gp.arena.base && !gp.p_off && chunk_pstage_alloc(im)) {
         gp.p_lazy_layer = -1;
         std::vector<int32_t> routed((size_t) NX, 0);
@@ -6128,6 +6125,15 @@ bool gpu_run_chunk(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, co
             const int32_t hq = (i >= nA && HS) ? HS->idx[(size_t) stream_e[i]] : -1;
             if (i < nA) {
                 src = gp.arena.ptr(layer, stream_e[i]);   // (arena_e: not prestaged)
+                if (hint_dev && gp.p_ptr[(size_t) stream_e[i]]) {   // already on the card (chunk_hint): a device copy
+                    uint8_t* d = (uint8_t*) gp.c_stage[h] + (i - b0) * (size_t) SL;
+                    ck(cudaMemcpyAsync(d, (const void*) gp.p_ptr[(size_t) stream_e[i]], (size_t) BL, cudaMemcpyDeviceToDevice,
+                                       (gp.s_cp2 && (i & 1)) ? gp.s_cp2 : gp.s_cp), "hint d2d");
+                    if (prof) ++g_cprof.hint_d2d;
+                    es.push_back(stream_e[i]);
+                    ps.push_back((unsigned long long) d);
+                    continue;
+                }
             } else if (sq >= 0) {   // staged by the chunk prefetch
                 src = im.cstage->slab[(size_t) pf_slab] + im.cstage->off[(size_t) pf_slab][(size_t) sq];
                 ++g_pf.used;
@@ -6720,7 +6726,9 @@ void Ds41MoeTier::chunk_hint_begin(int64_t layer) {
     if (!im_->inited || !im_->gpu || im_->cfg.cpu_only) return;
     Gpu& gpa = *im_->gpu;
     if (hint_arena_on() && gpa.s_cp && gpa.arena.base && !gpa.p_off && gpa.p_hint_layer != (int) layer && chunk_pstage_alloc(*im_)) {
-        // the region is free once the previous layer's launches from it are done (p_used, recorded after them on gp.s)
+        // the region is free once the previous layer's copies out of it are done: the device-to-device copies into the staging
+        // halves (s_cp / s_cp2, possibly still queued under STRATA_CHUNK_ASYNC) and any launches from it (p_used)
+        gpa.cp_sync();
         if (gpa.p_used_rec) ck(cudaStreamWaitEvent(gpa.s_cp, gpa.p_used, 0), "hint arena wait used");
         gpa.p_ptr.assign((size_t) im_->g.n_experts, 0ull);
         gpa.p_hint_off = 0;
@@ -6827,6 +6835,7 @@ void Ds41MoeTier::release_chunk() {
                      (long long) c.calls, (long long) c.launches, c.wall, c.file, c.wait_copied, c.sync,
                      c.wall - c.file - c.wait_copied - c.sync, c.file_rd, c.kern, c.resident_kern, c.file_gb, c.rd_busy,
                      c.rd_busy > 0 ? c.file_gb / (c.rd_busy / 1000.0) : 0.0, (long long) c.skip_x);
+        if (c.hint_d2d) std::fprintf(stderr, "chunk prof: %lld streamed arena experts copied device-to-device out of the hint region\n", (long long) c.hint_d2d);
         std::fprintf(stderr, "chunk prof MMQ: %lld sub-runs; PTQ1_0 -> Q2_0 transcode %.0f ms GPU (inside the grouped "
                              "kernels) over %lld sub-runs, %.1f GB of ternary read = %.0f GB/s\n",
                      (long long) c.mmq_subruns, c.tc, (long long) c.tc_launches, c.tc_gb, c.tc > 0 ? c.tc_gb / (c.tc / 1000.0) : 0.0);
